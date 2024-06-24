@@ -8,7 +8,7 @@ use std::mem::ManuallyDrop;
 use std::ops::{Coroutine, CoroutineState, Deref};
 use std::os::raw::c_void;
 use std::pin::Pin;
-use std::ptr::{addr_of, null_mut, NonNull};
+use std::ptr::{addr_of, null_mut, Alignment, NonNull};
 use std::slice::SliceIndex;
 use std::sync::OnceLock;
 use std::{io, ptr};
@@ -23,6 +23,9 @@ macro_rules! bail_if {
 
 /// Returns the size of a page in the current architecture.
 fn page_size() -> usize {
+    // Caching the system's page size (and thus avoiding multiple system calls)
+    // can decrease the running time of this subroutine by four; see
+    // https://stackoverflow.com/q/41916545 for a toy benchmark.
     static VALUE: OnceLock<usize> = OnceLock::new();
     *VALUE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize })
 }
@@ -57,6 +60,19 @@ impl StackOrientation {
     }
 }
 
+// idea: if all stacks had the same size, and it was a power of 2, then each
+// coroutine could know where its stack starts and ends without any information
+// apart from the current value of the stack pointer (assuming it has not overflowed
+// nor underflowed). This would let us store metadata such as the caller's
+// instruction and stack pointer in the "header" of the coroutine stack. We
+// can then use this information to implement `yield` very efficiently, without
+// the need of an external (nonprogram) stack in the heap.
+// todo: We would then need to speed up `page_size`; benchmark cost of `OnceLock`.
+//       Are there any safe alternatives that would let us speed it up? Thread
+//       locals could work at the expense of a minimally greater amount of memory.
+//       I still don't have a good mental model of the cost of thread locals either,
+//       however.
+
 /// The program stack of a coroutine, used to store data and control structures.
 /// More precisely, it is a set of contiguous memory pages where a coroutine is
 /// free to store any data. There are exceptions to this statement, however:
@@ -75,7 +91,7 @@ impl StackOrientation {
 /// [stack growth direction]: `StackOrientation`
 /// [authors]: https://devblogs.microsoft.com/oldnewthing/20220203-00/?p=106215
 struct Stack {
-    /// The starting address of the memory region.
+    /// The lowest address of the memory region.
     base: NonNull<u8>,
     /// multiple of `page_size()`.
     size: usize,
@@ -85,11 +101,10 @@ struct Stack {
 impl Stack {
     /// Allocates space for a new program stack.
     fn new(size: usize) -> Result<Self, Error> {
-        // We cannot use the unchecked variant of `from_size_align`: Even if
-        // we know that `page_size` is a power of 2, the passed `size` value
-        // might overflow an `isize` after alignment.
         let page_size = page_size();
-        let size = Layout::from_size_align(size, page_size);
+        let size = size
+            .checked_next_multiple_of(page_size)
+            .expect("`size` overflows after alignment to page size");
         let ptr = unsafe {
             libc::mmap(
                 null_mut(),
@@ -155,6 +170,7 @@ impl StackPool {
 }
 
 thread_local! {
+    // todo: rename to GLOBAL_POOL?
     static STACK_POOL: RefCell<StackPool> = const { RefCell::new(StackPool::new()) };
     // todo: is this the most appropriate type? Can we encode pinning here?
     // todo: get rid of this thread local by keeping parent coroutine information

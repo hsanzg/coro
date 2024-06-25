@@ -2,41 +2,54 @@ use smallvec::SmallVec;
 use std::alloc::Layout;
 use std::arch::{asm, global_asm};
 use std::cell::RefCell;
-use std::io::Error;
+use std::io::{Error, Result};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::num::NonZeroUsize;
 use std::ops::{Coroutine, CoroutineState, Deref};
 use std::os::raw::c_void;
 use std::pin::Pin;
 use std::ptr::{addr_of, null_mut, Alignment, NonNull};
 use std::slice::SliceIndex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::{io, ptr};
 
 macro_rules! bail_if {
     ($e:expr) => {
         if $e {
-            return Err(std::io::Error::last_os_error());
+            return Err(Error::last_os_error());
         }
     };
 }
 
-/// Returns the size of a page in the current architecture.
+/// Returns the default page size in the current platform, measured in bytes.
 fn page_size() -> usize {
-    // Caching the system's page size (and thus avoiding multiple system calls)
-    // can decrease the running time of this subroutine by four; see
-    // https://stackoverflow.com/q/41916545 for a toy benchmark.
-    static VALUE: OnceLock<usize> = OnceLock::new();
-    *VALUE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize })
+    // We try to remember the page size value across function invocations.
+    // This optimization lets us avoid making a system call in the common
+    // case, which gives a significant speedup. The following implementation
+    // of the lazy one-time initialization pattern is due to M. Bos; see
+    // https://marabos.nl/atomics/atomics.html#example-racy-init for details.
+    static VALUE: AtomicUsize = AtomicUsize::new(0);
+    match VALUE.load(Ordering::Relaxed) {
+        0 => {
+            let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+            match VALUE.compare_exchange(0, value, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => value,
+                Err(p) => p,
+            }
+        }
+        value => value,
+    }
 }
 
 /// The direction by which the stack pointer changes after a `push` instruction.
 enum StackOrientation {
-    /// A program stack grows towards _higher_ memory addresses. In other words,
-    /// a `push` instruction _increases_ the stack pointer.
+    /// A program stack grows towards _higher_ memory addresses.
+    /// In other words, a `push` instruction _increases_ the stack pointer.
     Upwards,
-    /// A program stack grows towards _lower_ memory addresses. In other words,
-    /// a `push` instruction _decreases_ the stack pointer.
+    /// A program stack grows towards _lower_ memory addresses.
+    /// In other words, a `push` instruction _decreases_ the stack pointer.
     Downwards,
 }
 
@@ -55,7 +68,7 @@ impl StackOrientation {
         target_arch = "powerpc64",
         target_arch = "wasm32"
     ))]
-    fn current() -> Self {
+    pub fn current() -> Self {
         Self::Downwards
     }
 }
@@ -84,58 +97,81 @@ impl StackOrientation {
 ///    In this way, the process does not have permission to read from, write to,
 ///    or execute any memory location within this _guard page_; any attempt to
 ///    do so will cause a protection fault. For this reason, some [authors] do
-///    not include the guard page as part of a program stack.
+///    not include the guard page as part of a program stack. We will _not_
+///    follow this convention.
 ///
 /// [`resume`]: `Coro::resume`
 /// [`yield`]: `yield_`
 /// [stack growth direction]: `StackOrientation`
 /// [authors]: https://devblogs.microsoft.com/oldnewthing/20220203-00/?p=106215
 struct Stack {
-    /// The lowest address of the memory region.
+    /// The lowest address of a cell in the stack.
     base: NonNull<u8>,
-    /// multiple of `page_size()`.
+    /// The number of bytes occupied by the stack, which is always
+    /// a multiple of [`page_size()`](`page_size`).
     size: usize,
-    // buf: NonNull<c_void>, // todo: change to u8
 }
 
 impl Stack {
     /// Allocates space for a new program stack.
-    fn new(size: usize) -> Result<Self, Error> {
+    pub fn new(min_size: NonZeroUsize) -> Result<Self> {
+        // The size of the stack must be a multiple of the page size,
+        // because we need to align the guard page to a page boundary.
         let page_size = page_size();
-        let size = size
+        let size = min_size
+            .get()
             .checked_next_multiple_of(page_size)
-            .expect("`size` overflows after alignment to page size");
-        let ptr = unsafe {
+            .expect("`usize` cannot represent page-aligned stack size");
+        // Reserve a `size`-byte memory area with read and write permission only.
+        // We pass the `MAP_STACK` flag to indicate that we will use the region
+        // to store a program stack. On success, the kernel guarantees that the
+        // `base` address is page-aligned.
+        let base = unsafe {
             libc::mmap(
                 null_mut(),
                 size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_GROWSDOWN | libc::MAP_STACK,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
                 -1,
                 0,
             )
         };
-        bail_if!(ptr.is_null());
-        // todo: check that ptr is nonnull (and print errno if not) and change NonNull::new below to new_unchecked.
-        // Protect last page. todo: document why we do this.
-        let prot_res = unsafe { libc::mprotect(ptr, page_size, libc::PROT_NONE) };
-        bail_if!(prot_res == -1);
+        bail_if!(base == libc::MAP_FAILED);
+        // Make the last page of the stack inaccessible to the process.
+        // The purpose of this step is to detect the situation when the stack
+        // grows too large, and the running program attempts to access a memory
+        // location within this "overflow" area (called the _guard page_). The
+        // operating system will arrange things so that a memory-protection
+        // interrupt will occur on any such attempt.
+        let guard_base = match StackOrientation::current() {
+            // SAFETY: `size` is at least `page_size`, so the result is between
+            //         the starting address `base` of a `size`-byte mapping and
+            //         one byte past it. Also, overflow is impossible in every
+            //         supported architecture.
+            StackOrientation::Upwards => unsafe { base.add(size).sub(page_size) },
+            StackOrientation::Downwards => base,
+        };
+        bail_if!(unsafe { libc::mprotect(guard_base, page_size, libc::PROT_NONE) } == -1);
         Ok(Self {
-            base: unsafe { NonNull::new_unchecked(ptr.cast()) },
+            base: unsafe { NonNull::new_unchecked(base.cast()) },
             size,
         })
     }
 
+    /// Returns the base address of the stack.
     fn base(&self) -> NonNull<u8> {
         self.base
     }
 
-    fn end(&self) -> NonNull<u8> {
-        unsafe { self.base.add(self.size) }
+    fn first(&self) -> NonNull<u8> {
+        match StackOrientation::current() {
+            StackOrientation::Upwards => self.base,
+            StackOrientation::Downwards => unsafe { self.base.add(self.size - 1) },
+        }
     }
 
-    fn guard(&self) -> NonNull<u8> {
-        unsafe { self.base.add(page_size()) }
+    fn end(&self) -> NonNull<u8> {
+        unsafe { self.base.add(self.size) }
     }
 }
 
@@ -145,25 +181,35 @@ impl Drop for Stack {
     }
 }
 
-/// of available stack regions/segments? for new coroutines.
+/// A pool of available storage for use as the program stacks of new coroutines.
 struct StackPool {
-    stacks: Vec<Stack>,
+    /// The list of available program stacks.
+    stacks: SmallVec<Stack, 4>,
 }
 
 impl StackPool {
+    /// Creates a new storage pool.
     pub const fn new() -> Self {
-        Self { stacks: Vec::new() }
+        Self {
+            stacks: SmallVec::new(),
+        }
     }
 
-    pub fn take(&mut self, min_size: usize) -> Stack {
-        if let Some(ix) = self.stacks.iter().position(|s| s.size >= min_size) {
+    /// Reserves a program stack that can hold at least `min_size` bytes.
+    pub fn take(&mut self, min_size: NonZeroUsize) -> Stack {
+        // Find the position of an appropriate available stack.
+        if let Some(ix) = self.stacks.iter().position(|s| s.size >= min_size.get()) {
+            // Success: Remove `s` from the pool and hand it off to the caller.
             self.stacks.swap_remove(ix)
         } else {
-            // todo: align to power of 2? Take into account cache aliasing, though
+            // Failure: Create a new stack of adequate size.
             Stack::new(min_size).expect("failed to create new stack")
         }
     }
 
+    /// Returns a stack to the pool of available storage.
+    ///
+    /// Note that this pool need not have allocated the given stack.
     pub fn give(&mut self, stack: Stack) {
         self.stacks.push(stack);
     }
@@ -178,6 +224,10 @@ thread_local! {
     //       need some parts of it (which address?)
     static ACTIVE: RefCell<SmallVec<NonNull<Coro>, 4>> = const { RefCell::new(SmallVec::new() )};
 }
+
+/// Platform-specific functionality for the `x86_64` architecture.
+#[cfg(target_arch = "x86_64")]
+mod arch {}
 
 /// "An independent process that shares and pass data and control
 /// back and forth."
@@ -219,7 +269,7 @@ impl Coro {
             // loop {}
         }*/
 
-        let stack = STACK_POOL.with_borrow_mut(|pool| pool.take(0x100));
+        let stack = STACK_POOL.with_borrow_mut(|pool| pool.take(NonZeroUsize::new(0x100).unwrap()));
         let f_addr = addr_of!(f);
         // let f_ptr = (f as *const _) as usize;
         Self {

@@ -1,9 +1,9 @@
-use std::arch::{asm, global_asm};
+use std::arch::asm;
 use std::cell::RefCell;
 use std::io::{Error, Result};
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
-use std::ops::{Coroutine, CoroutineState, Deref};
+use std::ops::{Coroutine, CoroutineState};
 use std::pin::Pin;
 use std::ptr::{addr_of, null_mut, Alignment, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -100,7 +100,7 @@ impl Stack {
     /// [coroutine]: `Coro`
     /// [direction]: `StackOrientation`
     /// [first address]: `Stack::first`
-    pub const STATUS_AREA_SIZE: usize = 16;
+    pub const STATUS_AREA_SIZE: usize = 16; // todo: replace by sizeof(CoroStatus)
 
     /// Allocates space for a new program stack of size at least `min_size`,
     /// with its [base address] being a multiple of `align`.
@@ -276,7 +276,21 @@ thread_local! {
 
 /// Platform-specific functionality for the `x86_64` architecture.
 #[cfg(target_arch = "x86_64")]
-mod arch {}
+mod arch {
+    use crate::coro::CoroStatus;
+
+    unsafe fn current_status() -> CoroStatus {
+        // todo: we should return a mutable reference, not a copy of the status.
+        //       I'm having trouble expresssing the lifetime of the status object.
+        todo!()
+    }
+}
+
+#[repr(C)]
+struct CoroStatus {
+    ret_instr: *const extern "C" fn(),
+    stack_pointer: *mut u8,
+}
 
 /// A stackful, first-class asymmetric coroutine.
 ///
@@ -294,25 +308,35 @@ mod arch {}
 /// This approach usually takes more memory space; we employ [pooling techniques]
 /// to diminish the need for large allocations and liberations.
 ///
-/// The paper "Revisiting Coroutines" by A. L. de Moura and R. Ierusalimschy,
-/// _ACM TOPLAS_ **31** (2009), 1--31, defines the terms "stackful", "first-class"
-/// and "asymmetric" more carefully.
+/// See the paper "Revisiting Coroutines" by A. L. de Moura and R. Ierusalimschy
+/// \[_ACM TOPLAS_ **31** (2009), 1--31] for the definitions of "stackful",
+/// "first-class" and "asymmetric" used above.
 ///
 /// [`yield`]: `yield_`
 /// [`resume`]: `Coroutine::resume`
 /// [program stack]: `Stack`
 /// [pooling techniques]: `StackPool`
 pub struct Coro {
-    state: CoroutineState<(), ()>,
     stack: ManuallyDrop<Stack>,
-    f_ptr: fn(),
 }
 
 impl Coro {
+    // todo: document https://doc.rust-lang.org/std/thread/#stack-size
+    // todo: make size configurable by getting it from an environment variable.
+    const STACK_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1 << 21) }; // 2 KiB
+    const STACK_ALIGN: Alignment = unsafe { Alignment::new_unchecked(Self::STACK_SIZE.get()) };
+
     pub fn new<F>(f: F) -> Self
     where
         F: FnOnce(),
     {
+        extern "C" fn trampoline() {
+            // todo: prepare stack
+            // todo: call the given function
+            // todo: restore the stack
+            // note: all the previous steps must be done in assembly, because
+            //       an asm! statement must preserve the original stack pointer.
+        }
         /*extern "C" fn trampoline<F>()
         where
             F: FnOnce(),
@@ -323,15 +347,21 @@ impl Coro {
             // loop {}
         }*/
 
-        let stack = STACK_POOL.with_borrow_mut(|pool| pool.take(0x100));
-        //.expect("failed to create new stack")
-        let f_addr = addr_of!(f);
+        let stack = STACK_POOL
+            .with_borrow_mut(|pool| pool.take(Self::STACK_SIZE, Self::STACK_ALIGN))
+            .expect("failed to create new stack");
+        let status = unsafe { stack.base().cast::<CoroStatus>().as_mut() };
+        status.ret_instr = addr_of!(trampoline);
+        status.stack_pointer = stack.first().as_ptr();
         // let f_ptr = (f as *const _) as usize;
         Self {
-            state: CoroutineState::Yielded(()),
             stack: ManuallyDrop::new(stack),
-            f_ptr: unsafe { std::mem::transmute(f_addr) },
+            //f_ptr: unsafe { std::mem::transmute(f_addr) },
         }
+    }
+
+    fn status_mut(&mut self) -> &mut CoroStatus {
+        unsafe { self.stack.base().cast().as_mut() }
     }
 }
 
@@ -340,6 +370,9 @@ impl Drop for Coro {
         eprintln!("giving back stack to pool");
         STACK_POOL.with_borrow_mut(|pool| {
             // todo: review safety.
+            // todo: should we replace `take` by `into_inner`? Be extremely
+            //       confident that we are not adding the stack multiple times
+            //       to the available storage pool.
             let stack = unsafe { ManuallyDrop::take(&mut self.stack) };
             pool.give(stack);
         });
@@ -347,41 +380,37 @@ impl Drop for Coro {
 }
 
 impl Coroutine for Coro {
+    // todo: support coroutine inputs, yield values and return values.
     type Yield = ();
     type Return = ();
 
     fn resume(self: Pin<&mut Self>, _arg: ()) -> CoroutineState<Self::Yield, Self::Return> {
-        ACTIVE.with_borrow_mut(|active| {
-            active.push(NonNull::from(self.deref()));
-            eprintln!("pushed coro to active stack");
-        });
-        //let current_addr = &*self as *const Self as usize;
-        let f_ptr = self.f_ptr;
-        let stack_ptr = self.stack.first().as_ptr();
-        eprintln!("calling coro f_ptr {f_ptr:?} with stack @ {stack_ptr:?}");
-
-        //let f_ptr = self.f_ptr;
-        // The stack pointer is guaranteed to be suitably aligned.
+        let coro = self.get_mut();
+        let status = coro.status_mut();
         unsafe {
-            asm!("call {tramp}", tramp = sym resume_trampoline, in("rdi") f_ptr, in("rsi") stack_ptr, clobber_abi("C"))
-        };
-        // todo: to see if the coroutine is done, we can check the stack pointer.
-        CoroutineState::Complete(())
+            asm!(
+                // todo: Overwrite rdi and rsi with current sp and ip;
+                //       do we need auxiliary variables?
+            "mov sp, rdi",
+                // todo: replace by regular jump, per recommendation of libfringe.
+                //       Can we do this? We need to restore the SP and IP of the
+                //       last caller to the function on procedure exit. This
+                //       requires returning to the trampoline, which would then
+                //       restore this necessary state.
+            "call rsi",
+            inout("rdi") status.stack_pointer, inout("rsi") status.ret_instr,
+            clobber_abi("C")
+            );
+        }
+        todo!()
     }
 }
 
 /// "save and restore the context needed by each coroutine"
 pub fn yield_() {
-    ACTIVE.with_borrow_mut(|active| {
-        // todo: replace by expect.
-        if let Some(active) = active.pop() {
-            let active = unsafe { active.as_ref() };
-            todo!("yield active coroutine")
-        } else {
-            // "from the main program"
-            panic!("cannot yield while not running within a coroutine");
-        }
-    })
+    // todo: this is going to be really complicated, but fail if this function
+    //       was not called from within a coroutine. Otherwise we would need
+    //       to mark this function as "unsafe".
 }
 
 #[cfg(test)]
@@ -391,22 +420,22 @@ mod tests {
     #[test]
     fn foo() {
         let mut coro = Coro::new(|| {
-            eprintln!("started");
+            eprintln!("[c] started");
             yield_();
-            eprintln!("first resume");
+            eprintln!("[c] first resume");
             yield_();
-            eprintln!("second resume");
+            eprintln!("[c] second resume");
         });
         match Pin::new(&mut coro).resume(()) {
-            CoroutineState::Yielded(_) => eprintln!("yielded once"),
+            CoroutineState::Yielded(_) => eprintln!("[m] yielded once"),
             CoroutineState::Complete(_) => panic!("completed before"),
         };
         match Pin::new(&mut coro).resume(()) {
-            CoroutineState::Yielded(_) => eprintln!("yielded twice"),
+            CoroutineState::Yielded(_) => eprintln!("[m] yielded twice"),
             CoroutineState::Complete(_) => panic!("completed before"),
         }
         match Pin::new(&mut coro).resume(()) {
-            CoroutineState::Yielded(_) => panic!("yielded thrice"),
+            CoroutineState::Yielded(_) => panic!("[m] yielded thrice"),
             CoroutineState::Complete(_) => eprintln!("completed"),
         }
     }

@@ -337,26 +337,14 @@ impl Coro {
             // note: all the previous steps must be done in assembly, because
             //       an asm! statement must preserve the original stack pointer.
         }
-        /*extern "C" fn trampoline<F>()
-        where
-            F: FnOnce(),
-        {
-            unsafe { asm!("call rdi") };
-            // let f_ptr = unsafe { ptr::read(raw_ptr as *const F) };
-            // todo: switch stack pointer to correct place within `f_ptr`.
-            // loop {}
-        }*/
-
         let stack = STACK_POOL
             .with_borrow_mut(|pool| pool.take(Self::STACK_SIZE, Self::STACK_ALIGN))
             .expect("failed to create new stack");
         let status = unsafe { stack.base().cast::<CoroStatus>().as_mut() };
         status.ret_instr = addr_of!(trampoline);
-        status.stack_pointer = stack.first().as_ptr();
-        // let f_ptr = (f as *const _) as usize;
+        status.stack_pointer = unsafe { stack.first().add(Stack::STATUS_AREA_SIZE) }.as_ptr();
         Self {
             stack: ManuallyDrop::new(stack),
-            //f_ptr: unsafe { std::mem::transmute(f_addr) },
         }
     }
 

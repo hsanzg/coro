@@ -1,3 +1,13 @@
+// The following doc comment is kept in sync with the README.md file. Please
+// run the `cargo sync-readme` command after modifying the comment contents.
+//! This crate provides stackful, first-class asymmetric coroutines.
+
+#![feature(coroutine_trait)]
+#![feature(non_null_convenience)]
+#![feature(ptr_alignment_type)]
+#![feature(nonzero_ops)]
+#![feature(pointer_is_aligned)]
+
 use std::arch::asm;
 use std::cell::RefCell;
 use std::io::{Error, Result};

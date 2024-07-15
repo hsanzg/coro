@@ -1,0 +1,19 @@
+[package]
+name = "coro"
+version = "0.1.0"
+description = "Stackful, first-class asymmetric coroutines."
+authors = ["Hugo Sanz González <hugo@hgsg.me>"]
+license = "MIT"
+homepage = "https://github.com/hsanzg/coro"
+documentation = "https://docs.rs/coro"
+repository = "https://github.com/hsanzg/coro"
+keywords = ["coroutines", "stackful"]
+categories = ["concurrency"]
+readme = "README.md"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libc = "0.2"
+smallvec = "2.0.0-alpha.6"

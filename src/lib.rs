@@ -48,7 +48,7 @@ fn page_size() -> NonZeroUsize {
         }
         v => v,
     };
-    // SAFETY: Any power of 2 is positive.
+    // SAFETY: Any real power of 2 is positive.
     unsafe { NonZeroUsize::new_unchecked(value) }
 }
 
@@ -287,7 +287,7 @@ thread_local! {
 /// Platform-specific functionality for the `x86_64` architecture.
 #[cfg(target_arch = "x86_64")]
 mod arch {
-    use crate::coro::CoroStatus;
+    use crate::CoroStatus;
 
     unsafe fn current_status() -> CoroStatus {
         // todo: we should return a mutable reference, not a copy of the status.
@@ -351,7 +351,7 @@ impl Coro {
             .with_borrow_mut(|pool| pool.take(Self::STACK_SIZE, Self::STACK_ALIGN))
             .expect("failed to create new stack");
         let status = unsafe { stack.base().cast::<CoroStatus>().as_mut() };
-        status.ret_instr = addr_of!(trampoline);
+        //status.ret_instr = addr_of!(trampoline);
         status.stack_pointer = unsafe { stack.first().add(Stack::STATUS_AREA_SIZE) }.as_ptr();
         Self {
             stack: ManuallyDrop::new(stack),

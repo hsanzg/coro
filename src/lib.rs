@@ -389,7 +389,7 @@ impl Coroutine for Coro {
             asm!(
                 // todo: Overwrite rdi and rsi with current sp and ip;
                 //       do we need auxiliary variables?
-            "mov sp, rdi",
+            // "mov sp, rdi",
                 // todo: replace by regular jump, per recommendation of libfringe.
                 //       Can we do this? We need to restore the SP and IP of the
                 //       last caller to the function on procedure exit. This

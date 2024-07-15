@@ -78,7 +78,7 @@ impl StackOrientation {
 ///    information during transfers of control. Here the meaning of "first"
 ///    depends on the [stack growth direction] in the present platform.
 /// 2. To protect against overflows, we protect the last page of a program stack.
-///    In this way, the process does not have permission to read from, write to,
+///    In this way the process does not have permission to read from, write to,
 ///    or execute any memory location within this _guard page_; any attempt to
 ///    do so will cause a protection fault. For this reason, some [authors] do
 ///    not include the guard page as part of a program stack. We will _not_
@@ -91,7 +91,7 @@ impl StackOrientation {
 /// [stack growth direction]: `StackOrientation`
 /// [authors]: https://devblogs.microsoft.com/oldnewthing/20220203-00/?p=106215
 struct Stack {
-    /// The lowest address of a cell in the stack.
+    /// The lowest address of a memory cell in the stack.
     base: NonNull<u8>,
     /// The number of bytes occupied by the stack.
     size: usize,
@@ -143,7 +143,7 @@ impl Stack {
         } else {
             size + align.as_usize()
         };
-        // Reserve a `alloc_size`-byte memory area with read and write permission
+        // Reserve an `alloc_size`-byte memory area with read and write permission
         // only. We pass the `MAP_STACK` flag to indicate that we will use the
         // region to store a program stack. On success, the kernel guarantees
         // that the `base` address is page-aligned.
@@ -170,7 +170,7 @@ impl Stack {
             bail_if!(unsafe { libc::munmap(base, offset) } == -1);
         }
         let base = unsafe { base.add(offset) };
-        let tail_base = unsafe { base.add(size) };
+        let tail_base = unsafe { base.byte_add(size) };
         let tail_size = alloc_size - offset - size;
         if tail_size > 0 {
             // SAFETY: Since `base` and `size` are multiples of `page_size`,
@@ -188,7 +188,7 @@ impl Stack {
             //         the starting address `base` of a `size`-byte mapping and
             //         one byte past it. Also, overflow is impossible in every
             //         supported architecture.
-            StackOrientation::Upwards => unsafe { tail_base.sub(page_size.get()) },
+            StackOrientation::Upwards => unsafe { tail_base.byte_sub(page_size.get()) },
             StackOrientation::Downwards => base,
         };
         bail_if!(unsafe { libc::mprotect(guard_base, page_size.get(), libc::PROT_NONE) } == -1);
@@ -216,7 +216,7 @@ impl Stack {
     pub fn first(&self) -> NonNull<u8> {
         match StackOrientation::current() {
             StackOrientation::Upwards => self.base,
-            StackOrientation::Downwards => unsafe { self.base.add(self.size - 1) },
+            StackOrientation::Downwards => unsafe { self.base.byte_add(self.size - 1) },
         }
     }
 }
@@ -235,7 +235,7 @@ impl Drop for Stack {
 /// A pool of available storage for use as the program stacks of new coroutines.
 struct StackPool {
     /// The list of available program stacks.
-    stacks: SmallVec<Stack, 4>,
+    stacks: SmallVec<Stack, 3>,
 }
 
 impl StackPool {

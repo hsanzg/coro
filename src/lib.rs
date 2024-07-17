@@ -347,25 +347,32 @@ mod arch {
         unsafe { asm!("mov rax, rsp", "ret", options(noreturn)) }
     }
 
+    // todo: remove
+    #[naked]
+    extern "sysv64" fn frame_pointer() -> *mut u8 {
+        unsafe { asm!("mov rax, rbp", "ret", options(noreturn)) }
+    }
+
     pub unsafe fn transfer_control(record: &mut Control) {
         println!(
-            "[arch] transferring control: current sp={:?}, new sp={:?}, rp={:?}",
+            "[arch] transferring control: current sp={:?}, new sp={:?}, rp={:?}, rbp={:?}",
             stack_ptr(),
             record.stack_ptr,
-            record.resume_addr
+            record.resume_addr,
+            frame_pointer()
         );
         asm!(
             // Swap the current stack pointer with the address at $rdi.
             "mov rax, rsp",
             "mov rsp, [rdi]", // rsp <- record.stack_ptr
-            "mov rbp, rsp", // also set frame base pointer.
+            //"mov rbp, rsp", // also set frame base pointer.
                             // todo: only do so in debug mode.
             "mov [rdi], rax", // record.stack_ptr <- rax
             // Fetch the callee resumption point stored at $rsi, and store
             // the caller resumption point there.
             "mov rax, [rsi]",    // rax <- record.resume_addr
-            "lea rbx, [rip+2f]", // rbx <- #2
-            "mov [rsi], rbx",    // record.resume_addr <- rbx
+            "lea rdx, [rip+2f]", // rdx <- #2
+            "mov [rsi], rdx",    // record.resume_addr <- rdx
             // Jump to the coroutine.
             "jmp rax",
             // If the coroutine yields or returns, it will do so to this point.
@@ -378,6 +385,12 @@ mod arch {
             inout("rsi") &mut record.resume_addr as *mut _ => _,
             // todo: Handle clobbers on Windows.
             clobber_abi("sysv64")
+        );
+        println!(
+            "[arch] resumed or returned from coroutine: current sp={:?}, coro final sp={:?}, last rp={:?}",
+            stack_ptr(),
+            record.stack_ptr,
+            record.resume_addr
         );
     }
 
@@ -440,23 +453,25 @@ impl Coro {
     {
         // todo: document that we need trampoline function to support our custom
         //       calling convention, because Rust has no defined ABI yet.
-        extern "sysv64" fn trampoline<F: FnOnce()>() {
+        extern "sysv64" fn trampoline<F: FnOnce()>() -> ! {
             let mut control_ptr = unsafe { current_control() };
             let control = unsafe { control_ptr.as_mut() };
-            eprintln!(
-                "[trampolining] status: control={:?}, sp={:?}, rp={:?}",
-                control_ptr, control.stack_ptr, control.resume_addr
-            );
 
             // todo: replace *mut F by *const F.
-            let f_ptr = arch::stack_ptr().cast::<F>();
+            let f_ptr = control_ptr.cast::<*const F>();
             let f_ptr = match StackOrientation::current() {
-                StackOrientation::Upwards => f_ptr,
+                StackOrientation::Upwards => unsafe { f_ptr.byte_add(Stack::CONTROL_BLOCK_SIZE) },
                 StackOrientation::Downwards => unsafe { f_ptr.sub(1) },
             };
-            eprintln!("[trampoline] f_ptr={f_ptr:?}");
+            eprintln!(
+                "[trampolining] status: control={:?}, sp={:?}, rp={:?}, f_ptr={f_ptr:?}",
+                control_ptr, control.stack_ptr, control.resume_addr
+            );
             // todo: document that initialized by `new`
-            let f = unsafe { ptr::read(f_ptr) };
+            // This step makes a copy, but it's only executed once per coroutine.
+            // todo: do we need to do anything with respect to dropping `F`. There
+            //       is a quite delicate interaction with `new` here.
+            let f = unsafe { f_ptr.read().read() };
             f();
 
             // todo: document that current value at top of stack is the return
@@ -464,11 +479,16 @@ impl Coro {
             let mut control_ptr = unsafe { current_control() };
             let control = unsafe { control_ptr.as_mut() };
             eprintln!(
-                "[returning] status: sp={:?}, rp={:?}, returning to {:?}",
-                control.stack_ptr,
-                control.resume_addr,
-                unsafe { *arch::stack_ptr().cast::<*mut u8>() }
+                "[returning] status: sp={:?}, rp={:?}",
+                control.stack_ptr, control.resume_addr
             );
+            loop {
+                // Yield immediately, coroutine has completed its execution.
+                // This is a rare case, so we do not optimize for it.
+                unsafe {
+                    arch::transfer_control(control);
+                }
+            }
         }
         let stack = STACK_POOL
             .with_borrow_mut(|pool| pool.take(Self::STACK_SIZE, Self::STACK_ALIGN))
@@ -511,16 +531,16 @@ impl Coro {
         unsafe {
             f_arg_ptr.write(&f);
         }
-        unsafe {
+        /*unsafe {
             // todo: remove, only for debugging purposes.
             control
                 .stack_ptr
                 .cast::<usize>()
                 .sub(1)
                 .write(0xDEADDEADDEADDEAD);
-        }
+        }*/
         eprintln!(
-            "[new] status: sp={:?}, rp={:?}, wrote {:?} to {:?}",
+            "[new] status: sp={:?}, rp={:?}, wrote f_arg={:?} to {:?}",
             control.stack_ptr,
             control.resume_addr,
             unsafe { f_arg_ptr.read() },

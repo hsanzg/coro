@@ -9,26 +9,32 @@
 #![feature(pointer_is_aligned)]
 #![feature(naked_functions)]
 #![feature(ptr_mask)]
+#![cfg_attr(not(feature = "std"), no_std)]
 
-use std::arch::asm;
-use std::cell::RefCell;
-use std::io::{Error, Result, Write};
-use std::mem::{size_of, ManuallyDrop};
-use std::num::NonZeroUsize;
-use std::ops::{Coroutine, CoroutineState};
-use std::pin::Pin;
-use std::ptr;
-use std::ptr::{addr_of, null_mut, Alignment, NonNull};
-use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "std")]
+use core::cell::RefCell;
+use core::mem::{size_of, ManuallyDrop};
+use core::num::NonZeroUsize;
+use core::ops::{Coroutine, CoroutineState};
+use core::pin::Pin;
+use core::ptr;
+use core::ptr::{addr_of, null_mut, Alignment, NonNull};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use smallvec::SmallVec;
 
-macro_rules! bail_if {
-    ($e:expr) => {
-        if $e {
-            return Err(Error::last_os_error());
-        }
-    };
+/// Returns an object that represents the last error reported by a system call
+/// or a library function (if any).
+#[cfg(feature = "std")]
+fn last_os_error() -> std::io::Error {
+    std::io::Error::last_os_error()
+}
+
+/// Returns the number of the last error reported by a system call or a library
+/// function (if any), as found in variable `errno`.
+#[cfg(not(feature = "std"))]
+fn last_os_error() -> i32 {
+    unsafe { *libc::__errno_location() }
 }
 
 /// Returns the default page size set by current platform, measured in bytes.
@@ -121,6 +127,11 @@ impl Stack {
     /// and the [size] of a stack are multiples of the [page size], this helps
     /// to bring the initial stack pointer address into proper alignment.
     ///
+    /// # Panics
+    ///
+    /// This function panics if it fails to allocate enough memory for the
+    /// stack, or if it cannot protect the guard page against access by
+    /// the current process.
     ///
     /// [`resume`]: Coro::resume
     /// [`yield`]: yield_
@@ -136,7 +147,7 @@ impl Stack {
     /// with its [starting address] being a multiple of `align`.
     ///
     /// [starting address]: Self::start
-    pub fn new(min_size: NonZeroUsize, align: Alignment) -> Result<Self> {
+    pub fn new(min_size: NonZeroUsize, align: Alignment) -> Self {
         // The size of the stack must be a multiple of the page size, because
         // we need to align the guard page to a page boundary. It also needs
         // to be larger than the page size, because otherwise the stack would
@@ -177,7 +188,12 @@ impl Stack {
                 0,
             )
         };
-        bail_if!(start == libc::MAP_FAILED);
+        assert_ne!(
+            start,
+            libc::MAP_FAILED,
+            "stack mapping creation failed: {}",
+            last_os_error()
+        );
         // Locate the aligned `size`-byte block that will hold the stack. Next,
         // free all other pages in the mapping that would otherwise go unused.
         // This step can cause up to two TLB shootdowns, but stack allocations
@@ -187,7 +203,12 @@ impl Stack {
             // SAFETY: Note that `offset` can be positive only if `align` is
             //         greater than `page_size`; in that case the page size
             //         divides `align`, so it also divides `offset`.
-            bail_if!(unsafe { libc::munmap(start, offset) } == -1);
+            assert_ne!(
+                unsafe { libc::munmap(start, offset) },
+                -1,
+                "failed to trim the front of the stack mapping: {}",
+                last_os_error()
+            );
         }
         let start = unsafe { start.add(offset) };
         let tail_start = unsafe { start.byte_add(size) };
@@ -195,7 +216,12 @@ impl Stack {
         if tail_size > 0 {
             // SAFETY: Since `start` and `size` are multiples of `page_size`,
             //         so is `tail_start`.
-            bail_if!(unsafe { libc::munmap(tail_start, tail_size) } == -1);
+            assert_ne!(
+                unsafe { libc::munmap(tail_start, tail_size) },
+                -1,
+                "failed to trim the back of the stack mapping: {}",
+                last_os_error()
+            );
         }
         // Make the last page of the stack inaccessible to the process.
         // The purpose of this step is to detect the situation when the stack
@@ -210,12 +236,17 @@ impl Stack {
             StackOrientation::Upwards => unsafe { tail_start.byte_sub(page_size.get()) },
             StackOrientation::Downwards => start,
         };
-        bail_if!(unsafe { libc::mprotect(guard_start, page_size.get(), libc::PROT_NONE) } == -1);
-        Ok(Self {
+        assert_ne!(
+            unsafe { libc::mprotect(guard_start, page_size.get(), libc::PROT_NONE) },
+            -1,
+            "could not apply memory protection to guard page: {}",
+            last_os_error()
+        );
+        Self {
             // SAFETY: `start` is nonnull, because `mmap` completed successfully.
             start: unsafe { NonNull::new_unchecked(start.cast()) },
             size,
-        })
+        }
     }
 
     /// Returns the lowest location within the stack, including the guard page.
@@ -256,13 +287,14 @@ impl Drop for Stack {
         assert_eq!(
             unsafe { libc::munmap(self.start.cast().as_ptr(), self.size) },
             0, // indicates success.
-            "failed to deallocate program stack"
+            "failed to remove program stack mapping: {}",
+            last_os_error()
         );
     }
 }
 
 /// A pool of available storage for use as the program stacks of new coroutines.
-struct StackPool(
+pub struct StackPool(
     /// The list of available program stacks.
     SmallVec<Stack, 3>,
 );
@@ -275,7 +307,7 @@ impl StackPool {
 
     /// Reserves a program stack that can hold at least `min_size` bytes,
     /// and whose starting location is a multiple of `align`.
-    pub fn take(&mut self, min_size: NonZeroUsize, align: Alignment) -> Result<Stack> {
+    pub(crate) fn take(&mut self, min_size: NonZeroUsize, align: Alignment) -> Stack {
         // Find the position of an appropriate available stack.
         if let Some(ix) = self
             .0
@@ -283,7 +315,7 @@ impl StackPool {
             .position(|s| s.size >= min_size.get() && s.start.is_aligned_to(align.as_usize()))
         {
             // Success: Remove `s` from the pool and hand it off to the caller.
-            Ok(self.0.swap_remove(ix))
+            self.0.swap_remove(ix)
         } else {
             // Failure: Create a new stack of adequate size.
             Stack::new(min_size, align)
@@ -293,11 +325,12 @@ impl StackPool {
     /// Returns a stack to the pool of available storage.
     ///
     /// Note that this pool need not have allocated the given stack.
-    pub fn give(&mut self, stack: Stack) {
+    pub(crate) fn give(&mut self, stack: Stack) {
         self.0.push(stack);
     }
 }
 
+#[cfg(feature = "std")]
 thread_local! {
     /// A per-thread pool of available program stacks.
     static STACK_POOL: RefCell<StackPool> = const { RefCell::new(StackPool::new()) };
@@ -326,7 +359,7 @@ struct Control {
 #[cfg(target_arch = "x86_64")]
 mod arch {
     use crate::Control;
-    use std::arch::asm;
+    use core::arch::asm;
     /*/// Returns the ABI-required minimum alignment of a stack frame in bytes.
     ///
     /// todo: clarify alignment requirement is on the base pointer, not on
@@ -354,7 +387,8 @@ mod arch {
     }
 
     pub unsafe fn transfer_control(record: &mut Control) {
-        println!(
+        #[cfg(feature = "std")]
+        eprintln!(
             "[arch] transferring control: current sp={:?}, new sp={:?}, rp={:?}, rbp={:?}",
             stack_ptr(),
             record.stack_ptr,
@@ -365,7 +399,7 @@ mod arch {
             // Swap the current stack pointer with the address at $rdi.
             "mov rax, rsp",
             "mov rsp, [rdi]", // rsp <- record.stack_ptr
-            //"mov rbp, rsp", // also set frame base pointer.
+            "mov rbp, rsp", // also set frame base pointer.
                             // todo: only do so in debug mode.
             "mov [rdi], rax", // record.stack_ptr <- rax
             // Fetch the callee resumption point stored at $rsi, and store
@@ -386,7 +420,8 @@ mod arch {
             // todo: Handle clobbers on Windows.
             clobber_abi("sysv64")
         );
-        println!(
+        #[cfg(feature = "std")]
+        eprintln!(
             "[arch] resumed or returned from coroutine: current sp={:?}, coro final sp={:?}, last rp={:?}",
             stack_ptr(),
             record.stack_ptr,
@@ -405,13 +440,6 @@ mod arch {
         }
     }
 }
-
-/*// todo: this struct needs to be platform-dependent. Or outright remove.
-#[repr(C)]
-struct CoroStatus {
-    ret_instr: extern "C" fn(*const u8),
-    stack_pointer: *mut u8,
-}*/
 
 /// A stackful, first-class asymmetric coroutine.
 ///
@@ -438,7 +466,10 @@ struct CoroStatus {
 /// [program stack]: Stack
 /// [pooling techniques]: StackPool
 pub struct Coro {
+    #[cfg(feature = "std")]
     stack: ManuallyDrop<Stack>,
+    #[cfg(not(feature = "std"))]
+    stack: Stack,
 }
 
 impl Coro {
@@ -447,7 +478,16 @@ impl Coro {
     const STACK_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1 << 21) }; // 2 KiB
     const STACK_ALIGN: Alignment = unsafe { Alignment::new_unchecked(Self::STACK_SIZE.get()) };
 
+    #[cfg(feature = "std")]
     pub fn new<F>(f: F) -> Self
+    where
+        F: FnOnce(),
+    {
+        STACK_POOL.with_borrow_mut(|pool| Self::with_stack_from(pool, f))
+    }
+
+    #[must_use = "must call `resume` to start the coroutine"] // todo: improve message and add it to new
+    pub fn with_stack_from<F>(pool: &mut StackPool, f: F) -> Self
     where
         F: FnOnce(),
     {
@@ -463,6 +503,7 @@ impl Coro {
                 StackOrientation::Upwards => unsafe { f_ptr.byte_add(Stack::CONTROL_BLOCK_SIZE) },
                 StackOrientation::Downwards => unsafe { f_ptr.sub(1) },
             };
+            #[cfg(feature = "std")]
             eprintln!(
                 "[trampolining] status: control={:?}, sp={:?}, rp={:?}, f_ptr={f_ptr:?}",
                 control_ptr, control.stack_ptr, control.resume_addr
@@ -478,6 +519,7 @@ impl Coro {
             //       address of the last caller to the resume.
             let mut control_ptr = unsafe { current_control() };
             let control = unsafe { control_ptr.as_mut() };
+            #[cfg(feature = "std")]
             eprintln!(
                 "[returning] status: sp={:?}, rp={:?}",
                 control.stack_ptr, control.resume_addr
@@ -485,14 +527,15 @@ impl Coro {
             loop {
                 // Yield immediately, coroutine has completed its execution.
                 // This is a rare case, so we do not optimize for it.
+                // todo: follow rust built-in coroutines behavior and panic after
+                //       the first transfer of control.
                 unsafe {
                     arch::transfer_control(control);
                 }
             }
         }
-        let stack = STACK_POOL
-            .with_borrow_mut(|pool| pool.take(Self::STACK_SIZE, Self::STACK_ALIGN))
-            .expect("failed to create new stack");
+        let stack = pool.take(Self::STACK_SIZE, Self::STACK_ALIGN);
+        #[cfg(feature = "std")]
         eprintln!(
             "[new] took stack start={:?}, size={:?}, bottom={:?}",
             stack.start(),
@@ -539,6 +582,7 @@ impl Coro {
                 .sub(1)
                 .write(0xDEADDEADDEADDEAD);
         }*/
+        #[cfg(feature = "std")]
         eprintln!(
             "[new] status: sp={:?}, rp={:?}, wrote f_arg={:?} to {:?}",
             control.stack_ptr,
@@ -547,9 +591,9 @@ impl Coro {
             // &f as *const F,
             f_arg_ptr,
         );
-        Self {
-            stack: ManuallyDrop::new(stack),
-        }
+        #[cfg(feature = "std")]
+        let stack = ManuallyDrop::new(stack);
+        Self { stack }
     }
 
     fn control_mut(&mut self) -> &mut Control {
@@ -562,16 +606,6 @@ impl Coro {
         };
         unsafe { control_ptr.cast().as_mut() }
     }
-
-    /*fn status_mut(&mut self) -> &mut CoroStatus {
-        unsafe {
-            self.stack
-                .base()
-                .byte_sub(Stack::STATUS_AREA_SIZE)
-                .cast()
-                .as_mut()
-        }
-    }*/
 }
 
 unsafe fn current_control() -> NonNull<Control> {
@@ -589,6 +623,7 @@ unsafe fn current_control() -> NonNull<Control> {
     .cast()
 }
 
+#[cfg(feature = "std")]
 impl Drop for Coro {
     fn drop(&mut self) {
         eprintln!("giving back stack to pool");
@@ -611,6 +646,7 @@ impl Coroutine for Coro {
     fn resume(self: Pin<&mut Self>, _arg: ()) -> CoroutineState<Self::Yield, Self::Return> {
         let coro = self.get_mut();
         let control = coro.control_mut();
+        #[cfg(feature = "std")]
         eprintln!(
             "[resuming] status: sp={:?}, rp={:?}",
             control.stack_ptr, control.resume_addr
@@ -665,6 +701,7 @@ pub fn yield_() {
     // let status = unsafe { arch::current_status() };
     let mut control_ptr = unsafe { current_control() };
     let control = unsafe { control_ptr.as_mut() };
+    #[cfg(feature = "std")]
     eprintln!(
         "[yielding] status: sp={:?}, rp={:?}",
         control.stack_ptr, control.resume_addr
@@ -694,7 +731,11 @@ pub fn yield_() {
 mod tests {
     use super::*;
 
+    // todo: make most test use a standalone stack pool, and test Coro::new
+    //       separately.
+
     #[test]
+    #[cfg(feature = "std")]
     fn simple() {
         eprintln!("[c] creating new");
         let mut coro = Coro::new(|| {
@@ -703,12 +744,16 @@ mod tests {
             eprintln!("[c] resumed fine, returning");
         });
         match Pin::new(&mut coro).resume(()) {
-            CoroutineState::Yielded(_) => eprintln!("[m] yielded once"),
+            CoroutineState::Yielded(_) => {
+                eprintln!("[m] yielded once")
+            }
             CoroutineState::Complete(_) => panic!("completed before expected"),
         }
         match Pin::new(&mut coro).resume(()) {
             CoroutineState::Yielded(_) => panic!("yielded when not expected"),
-            CoroutineState::Complete(_) => eprintln!("[m] completed!"),
+            CoroutineState::Complete(_) => {
+                eprintln!("[m] completed!")
+            }
         }
     }
 

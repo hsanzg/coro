@@ -121,11 +121,8 @@ impl Stack {
     /// bytes (in the [direction] of stack growth) starting at the [bottom] of
     /// its program stack.
     ///
-    // todo: update wrong comment:
-    /// This value is a multiple of the ABI-required minimum alignment for
-    /// a stack frame in the current platform. Since the [starting address]
-    /// and the [size] of a stack are multiples of the [page size], this helps
-    /// to bring the initial stack pointer address into proper alignment.
+    /// This value is such that the initial stack pointer address meets the
+    /// ABI-required minimum alignment requirements in the current platform.
     ///
     /// # Panics
     ///

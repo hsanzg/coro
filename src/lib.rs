@@ -13,7 +13,8 @@
 
 #[cfg(feature = "std")]
 use core::cell::RefCell;
-use core::mem::{size_of, ManuallyDrop};
+use core::marker::PhantomData;
+use core::mem::{align_of, size_of, ManuallyDrop};
 use core::num::NonZeroUsize;
 use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
@@ -74,7 +75,7 @@ enum StackOrientation {
 impl StackOrientation {
     /// The orientation of every program stack in the current platform.
     #[cfg(target_arch = "x86_64")]
-    pub fn current() -> Self {
+    pub const fn current() -> Self {
         Self::Downwards
     }
 }
@@ -149,8 +150,13 @@ impl Stack {
         // we need to align the guard page to a page boundary. It also needs
         // to be larger than the page size, because otherwise the stack would
         // consist of a single guard page with no space available for data and
-        // control structures.
+        // control structures. Signal an error in the highly unlikely event
+        // that the control record cannot be placed at the bottom of the stack.
         let page_size = page_size();
+        debug_assert!(
+            Self::CONTROL_BLOCK_SIZE <= page_size.get(),
+            "control record at the bottom of stack must be aligned"
+        );
         let size = min_size
             // SAFETY: There is no known platform whose default page size is
             //         the largest power of 2 that fits in a `usize`.
@@ -247,7 +253,7 @@ impl Stack {
     }
 
     /// Returns the lowest location within the stack, including the guard page.
-    pub fn start(&self) -> NonNull<u8> {
+    pub const fn start(&self) -> NonNull<u8> {
         self.start
     }
 
@@ -269,12 +275,34 @@ impl Stack {
     /// [coroutine]: Coro
     /// [`CONTROL_BLOCK_SIZE`]: Self::CONTROL_BLOCK_SIZE
     /// [starting location]: Self::start
-    pub fn bottom(&self) -> NonNull<u8> {
+    pub const fn bottom(&self) -> NonNull<u8> {
         match StackOrientation::current() {
             StackOrientation::Upwards => self.start,
             // SAFETY: `start` is the first location of a `size`-byte region.
             StackOrientation::Downwards => unsafe { self.start.byte_add(self.size) },
         }
+    }
+
+    /// Returns an exclusive reference to the control structure at the bottom
+    /// of this program stack.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the control record is not accessed (read or
+    /// written) through any other pointer while the returned reference exists.
+    pub unsafe fn control_mut<'a>(&self) -> &'a mut Control {
+        let ptr = match StackOrientation::current() {
+            StackOrientation::Upwards => self.start,
+            // SAFETY: The control structure starts `CONTROL_BLOCK_SIZE` bytes
+            //         before the end of a memory region of much greater size.
+            StackOrientation::Downwards => unsafe {
+                self.start.byte_add(self.size - Self::CONTROL_BLOCK_SIZE)
+            },
+        };
+        // SAFETY: the pointer is aligned because the page size is a multiple
+        //         of `CONTROL_BLOCK_SIZE`. Also, the caller guarantees that
+        //         we have exclusive access to `ptr`'s initialized contents.
+        unsafe { ptr.cast().as_mut() }
     }
 }
 
@@ -333,23 +361,20 @@ thread_local! {
     static STACK_POOL: RefCell<StackPool> = const { RefCell::new(StackPool::new()) };
 }
 
-// idea: if all stacks had the same alignment, and it was a power of 2, then each
-// coroutine could know where its stack starts and ends without any information
-// apart from the current value of the stack pointer (assuming it has not overflowed
-// nor underflowed). This would let us store metadata such as the caller's
-// instruction and stack pointer in the "header" of the coroutine stack. We
-// can then use this information to implement `yield` very efficiently, without
-// the need of an external (nonprogram) stack in the heap.
-
 /// The control record of a [coroutine].
 ///
 /// [coroutine]: Coroutine
 #[repr(C)] // the order of fields is important
 struct Control {
+    /// When coroutine is resumed, it begins where it last left off.
     resume_addr: *const u8,
-    // todo: document
-    _padding: u64,
-    stack_ptr: *mut u8,
+    // todo: this is needed by Section 3.2.2 of System V 64 ABI.
+    //       the ABI-required minimum alignment of a stack frame in bytes.
+    ///
+    ///
+    /// is used as padding.
+    signature: u64, // todo: replace by signature
+    stack_ptr: NonNull<u8>,
 }
 
 /// Platform-specific functionality for the `x86_64` architecture.
@@ -357,40 +382,27 @@ struct Control {
 mod arch {
     use crate::Control;
     use core::arch::asm;
-    /*/// Returns the ABI-required minimum alignment of a stack frame in bytes.
-    ///
-    /// todo: clarify alignment requirement is on the base pointer, not on
-    ///       starting address.
-    pub const fn frame_alignment() -> Alignment {
-        // See Section 3.2.2 of
-        unsafe { Alignment::new_unchecked(16) }
-    }*/
 
-    /*pub unsafe fn current_status() -> &'static mut CoroStatus {
-        // todo: we should return a mutable reference, not a copy of the status.
-        //       I'm having trouble expressing the lifetime of the status object.
-        todo!()
-    }*/
-
+    /// Returns the current stack pointer value.
     #[naked]
     pub extern "sysv64" fn stack_ptr() -> *mut u8 {
         unsafe { asm!("mov rax, rsp", "ret", options(noreturn)) }
     }
 
-    // todo: remove
-    #[naked]
-    extern "sysv64" fn frame_pointer() -> *mut u8 {
-        unsafe { asm!("mov rax, rbp", "ret", options(noreturn)) }
-    }
-
+    /// Resumes execution of a computation at the point where it last suspended.
+    /// More precisely, this function saves the program's current context and
+    /// restores the old context in the given control structure.
+    ///
+    /// # Safety
+    ///
+    /// The control record must refer to a previously saved context.
     pub unsafe fn transfer_control(record: &mut Control) {
         #[cfg(feature = "std")]
         eprintln!(
-            "[arch] transferring control: current sp={:?}, new sp={:?}, rp={:?}, rbp={:?}",
+            "[arch] transferring control: current sp={:?}, new sp={:?}, rp={:?}",
             stack_ptr(),
             record.stack_ptr,
-            record.resume_addr,
-            frame_pointer()
+            record.resume_addr
         );
         asm!(
             // Swap the current stack pointer with the address at $rdi.
@@ -433,7 +445,7 @@ mod arch {
         #[test]
         fn alignment_requirements() {
             // todo: cite System V 64.
-            assert_eq!(Stack::CONTROL_BLOCK_SIZE % 16, 0);
+            assert_eq!(Stack::CONTROL_BLOCK_SIZE % 16, 8);
         }
     }
 }
@@ -462,49 +474,79 @@ mod arch {
 /// [`resume`]: Coroutine::resume
 /// [program stack]: Stack
 /// [pooling techniques]: StackPool
-pub struct Coro {
+pub struct Coro<'f> {
+    /// The program stack of the coroutine, which [`drop`] returns to the
+    /// [thread-local storage pool] when the coroutine is no longer needed.
+    ///
+    /// [`drop`]: Self::drop
+    /// [thread-local storage pool]: STACK_POOL
     #[cfg(feature = "std")]
     stack: ManuallyDrop<Stack>,
+    /// The program stack of the coroutine, which is freed when the coroutine
+    /// is dropped.
     #[cfg(not(feature = "std"))]
     stack: Stack,
+    // todo: document that the purpose of this field is to guarantee that the
+    //       closure outlives the coroutine.
+    phantom: PhantomData<&'f ()>,
 }
 
-impl Coro {
-    // todo: document https://doc.rust-lang.org/std/thread/#stack-size
-    // todo: make size configurable by getting it from an environment variable.
-    const STACK_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1 << 21) }; // 2 KiB
+impl<'f> Coro<'f> {
+    // todo: make stack size configurable by reading an environment variable.
+    /// The fixed size in bytes of the [program stack] for a coroutine.
+    /// We currently use Rust's [default stack size] for a thread, 2 MiB.
+    ///
+    /// [program stack]: Stack
+    /// [default stack size]: std::thread#stack-size
+    const STACK_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1 << 21) };
+    /// The minimum alignment requirement for the [program stack] of a coroutine.
+    /// Functions such as [`current_control`] require that this quantity is at
+    /// least [`STACK_SIZE`], because they need to locate the [start] of the
+    /// current program stack from the stack pointer value alone.
+    ///
+    /// [program stack]: Stack
+    /// [`STACK_SIZE`]: Self::STACK_SIZE
+    /// [start]: Stack::start
     const STACK_ALIGN: Alignment = unsafe { Alignment::new_unchecked(Self::STACK_SIZE.get()) };
 
+    /// Creates a new coroutine that is to run the provided closure on an
+    /// independent [program stack] from a thread-local [pool of memory].
+    ///
+    /// [program stack]: Stack
+    /// [pool of memory]: STACK_POOL
     #[cfg(feature = "std")]
+    #[must_use = "method creates a coroutine but does not begin its execution"]
     pub fn new<F>(f: F) -> Self
     where
-        F: FnOnce(),
+        F: FnOnce() + 'f,
     {
         STACK_POOL.with_borrow_mut(|pool| Self::with_stack_from(pool, f))
     }
 
-    #[must_use = "must call `resume` to start the coroutine"] // todo: improve message and add it to new
+    /// Creates a new coroutine that is to run the provided closure on an
+    /// independent [program stack] from the given pool of available memory.
+    ///
+    /// [program stack]: Stack
+    #[must_use = "method creates a coroutine but does not begin its execution"]
     pub fn with_stack_from<F>(pool: &mut StackPool, f: F) -> Self
     where
-        F: FnOnce(),
+        F: FnOnce() + 'f,
     {
+        //
+        // store all caller-preserved registers in memory at the top of the
+        // current program stack.
         // todo: document that we need trampoline function to support our custom
         //       calling convention, because Rust has no defined ABI yet.
         extern "sysv64" fn trampoline<F: FnOnce()>() -> ! {
             let mut control_ptr = unsafe { current_control() };
             let control = unsafe { control_ptr.as_mut() };
 
-            // todo: replace *mut F by *const F.
+            // Undo the round-trip cast made by `new`.
             let f_ptr = control_ptr.cast::<*const F>();
             let f_ptr = match StackOrientation::current() {
                 StackOrientation::Upwards => unsafe { f_ptr.byte_add(Stack::CONTROL_BLOCK_SIZE) },
                 StackOrientation::Downwards => unsafe { f_ptr.sub(1) },
             };
-            #[cfg(feature = "std")]
-            eprintln!(
-                "[trampolining] status: control={:?}, sp={:?}, rp={:?}, f_ptr={f_ptr:?}",
-                control_ptr, control.stack_ptr, control.resume_addr
-            );
             // todo: document that initialized by `new`
             // This step makes a copy, but it's only executed once per coroutine.
             // todo: do we need to do anything with respect to dropping `F`. There
@@ -531,36 +573,23 @@ impl Coro {
                 }
             }
         }
-        let stack = pool.take(Self::STACK_SIZE, Self::STACK_ALIGN);
-        #[cfg(feature = "std")]
-        eprintln!(
-            "[new] took stack start={:?}, size={:?}, bottom={:?}",
-            stack.start(),
-            stack.size,
-            stack.bottom()
-        );
-        let control_ptr = match StackOrientation::current() {
-            StackOrientation::Upwards => stack.bottom(),
-            StackOrientation::Downwards => unsafe {
-                stack.bottom().byte_sub(Stack::CONTROL_BLOCK_SIZE)
-            },
+        // Allocate a stack for the coroutine.
+        let mut stack = pool.take(Self::STACK_SIZE, Self::STACK_ALIGN);
+        // Initialize the control record as follows: First point the coroutine's stack pointer
+        // to the last byte (in the stack growth direction) of the control structure, and point
+        // the activation location to the first instruction of the trampoline function.
+        // We already know that this address meets the ABI-required minimum alignment
+        // requirements; see the documentation of `CONTROL_BLOCK_SIZE` for details.
+        let control = unsafe { stack.control_mut() };
+        control.stack_ptr = unsafe {
+            match StackOrientation::current() {
+                StackOrientation::Upwards => stack.bottom().byte_add(Stack::CONTROL_BLOCK_SIZE),
+                StackOrientation::Downwards => stack.bottom().byte_sub(Stack::CONTROL_BLOCK_SIZE),
+            }
         };
-        // todo: review safety of this operation
-        // todo: mention that initial stack pointer is aligned to nearest 16-byte boundary in x86-64, due to control size constraints.
-        let control = unsafe { control_ptr.cast::<Control>().as_mut() };
-        control.stack_ptr = match StackOrientation::current() {
-            StackOrientation::Upwards => unsafe { control_ptr.byte_add(Stack::CONTROL_BLOCK_SIZE) },
-            StackOrientation::Downwards => control_ptr,
-        }
-        .as_ptr();
         control.resume_addr = trampoline::<F> as *const u8;
         // Pass the original function pointer via the new coroutine stack.
-        // todo: assert that *const F and *const u8 have same size and alignment
-        //       requirements. Add verification as SAFETY notes, or (even better)
-        //       improve.
-        // let f_ptr = unsafe { status.stack_pointer.cast::<*const F>().sub(1) };
-        // let f_arg_ptr = unsafe { control.stack_ptr.cast::<*const F>() };
-        let f_arg_ptr = unsafe { stack.bottom().cast::<*const F>() };
+        let f_arg_ptr = stack.bottom().cast::<*const F>();
         let f_arg_ptr = match StackOrientation::current() {
             StackOrientation::Upwards => unsafe { f_arg_ptr.byte_add(Stack::CONTROL_BLOCK_SIZE) },
             StackOrientation::Downwards => unsafe {
@@ -571,26 +600,12 @@ impl Coro {
         unsafe {
             f_arg_ptr.write(&f);
         }
-        /*unsafe {
-            // todo: remove, only for debugging purposes.
-            control
-                .stack_ptr
-                .cast::<usize>()
-                .sub(1)
-                .write(0xDEADDEADDEADDEAD);
-        }*/
-        #[cfg(feature = "std")]
-        eprintln!(
-            "[new] status: sp={:?}, rp={:?}, wrote f_arg={:?} to {:?}",
-            control.stack_ptr,
-            control.resume_addr,
-            unsafe { f_arg_ptr.read() },
-            // &f as *const F,
-            f_arg_ptr,
-        );
         #[cfg(feature = "std")]
         let stack = ManuallyDrop::new(stack);
-        Self { stack }
+        Self {
+            stack,
+            phantom: PhantomData,
+        }
     }
 
     fn control_mut(&mut self) -> &mut Control {
@@ -605,6 +620,11 @@ impl Coro {
     }
 }
 
+/// stored at the bottom of the current coroutine stack.
+///
+/// # Safety
+///
+/// can only be called from within a coroutine.
 unsafe fn current_control() -> NonNull<Control> {
     let sp = arch::stack_ptr();
     let start =
@@ -621,7 +641,7 @@ unsafe fn current_control() -> NonNull<Control> {
 }
 
 #[cfg(feature = "std")]
-impl Drop for Coro {
+impl<'f> Drop for Coro<'f> {
     fn drop(&mut self) {
         eprintln!("giving back stack to pool");
         STACK_POOL.with_borrow_mut(|pool| {
@@ -635,7 +655,7 @@ impl Drop for Coro {
     }
 }
 
-impl Coroutine for Coro {
+impl<'f> Coroutine for Coro<'f> {
     // todo: support coroutine inputs, yield values and return values.
     type Yield = ();
     type Return = ();
@@ -698,6 +718,11 @@ pub fn yield_() {
     // let status = unsafe { arch::current_status() };
     let mut control_ptr = unsafe { current_control() };
     let control = unsafe { control_ptr.as_mut() };
+    /*debug_assert_eq!(
+        control.signature, 0xDEADBEEFCAFEBABE,
+        "cannot yield from outside a coroutine"
+    );*/
+
     #[cfg(feature = "std")]
     eprintln!(
         "[yielding] status: sp={:?}, rp={:?}",

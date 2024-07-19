@@ -163,43 +163,45 @@ impl<'f> Coro<'f> {
         // todo: document that we need trampoline function to support our custom
         //       calling convention, because Rust has no defined ABI yet.
         extern "system" fn trampoline<F: FnOnce()>() {
-            // Read the address of the closure, which appears in the location
-            // immediately above the top item in the current program stack.
-            // (The stack is actually empty at this point, so the sought address
-            // appears immediately above the control record of the coroutine.)
-            // todo: document that this makes a copy, explore ptr::read in detail.
-            let coro_fn = unsafe {
+            // Read the address of the closure from the control record within
+            // the program stack of the coroutine. Then make a copy of the
+            // coroutine on this new stack, because that's the only way to
+            // call it (safely).
+            let coro_fn: F = {
+                // SAFETY: We have exclusive access to the stack, because the
+                //         owner of this coroutine just transferred control to
+                //         this function and is therefore suspended.
                 let control = unsafe { current_control() };
-                // todo: document safety of `unwrap_unchecked` extensively.
-                control.coro_fn.take().unwrap_unchecked().cast::<F>().read()
+                // Take the closure out of the control record, so that method
+                // `is_finished` can distinguish between the case in which the
+                // coroutine has not yet started, and the case in which it has
+                // finished its execution.
+                let fn_ptr = control
+                    .coro_fn
+                    .take()
+                    .expect("closure pointer should be nonnull on first activation")
+                    .cast();
+                // Read the closure from `fn_ptr` without moving it.
+                // SAFETY: `Coro::new` takes ownership of the closure, and it
+                //         must return before the coroutine can be activated.
+                //         Hence `trampoline` is the only function that can
+                //         reference the closure at this point.
+                unsafe { fn_ptr.read() }
+                // Destroy the exclusive reference to `control` prior to calling
+                // the closure, because `yield` also requires exclusive access
+                // to the control record.
             };
+            // Execute the provided closure in the stack of the coroutine.
             coro_fn();
-
-            /*let stack_ptr = arch::stack_ptr().cast::<NonNull<F>>();
-            let f_arg_ptr = match StackOrientation::current() {
-                StackOrientation::Upwards => stack_ptr,
-                StackOrientation::Downwards => unsafe { stack_ptr.sub(1) },
-            };
-            // Read the actual location, and get a reference to the closure.
-            let f_addr = unsafe { f_arg_ptr.read() };
-            let f = unsafe { f_addr.as_ref() };
-            // Begin the actual execution.
-            f();*/
-            // At this point the coroutine has finished its execution. Yield for
-            // the last time, and panic if the coroutine is ever activated again.
-            // safety: `coro_fn` does not have access to the
-            unsafe { arch::transfer_control(current_control()) };
-
-            /*// todo: document that current value at top of stack is the return
-            //       address of the last caller to the resume.
-            // let mut control_ptr = unsafe { current_control() };
-            // let control = unsafe { control_ptr.as_mut() };
-            loop {
-                // Yield immediately, coroutine has completed its execution.
-                // This is a rare case, so we do not optimize for it.
-                // todo: follow rust built-in coroutines behavior and panic after
-                //       the first transfer of control.
-            }*/
+            // At this point the coroutine has finished its execution. Destroy
+            // the closure, restore the stack pointer to the value present in
+            // the control record, and return to the last caller of `resume`.
+            // Any attempt to resume the coroutine ever again will trigger a
+            // panic.
+            drop(coro_fn);
+            // SAFETY: We have exclusive access to the stack.
+            let control = unsafe { current_control() };
+            unsafe { arch::terminate!(control) }
         }
         // Allocate a stack for the coroutine, and initialize its control record
         // as follows: First set the value of the stack pointer to the location
@@ -211,8 +213,8 @@ impl<'f> Coro<'f> {
         //         its control record.
         let control = unsafe { stack.control().as_uninit_mut() };
         control.write(Control {
-            // SAFETY: The control structure occupies less than a page, so the
-            //         stack can fit at least one byte.
+            // SAFETY: The control structure occupies less than a page, so we
+            //         can fit at least one byte in the stack.
             stack_ptr: unsafe {
                 let bottom = stack.bottom();
                 match StackOrientation::current() {
@@ -220,29 +222,17 @@ impl<'f> Coro<'f> {
                     StackOrientation::Downwards => bottom.byte_sub(Stack::CONTROL_BLOCK_SIZE),
                 }
             },
-            // SAFETY: A function pointer cannot be null.
+            // SAFETY: Function pointers cannot be null.
             instr_ptr: unsafe { NonNull::new_unchecked(trampoline::<F> as *mut _) },
             coro_fn: Some(unsafe { NonNull::new_unchecked(&f as *const _ as *mut _) }),
         });
-
-        /*// Push the address of the closure to the stack (but do not update the
-        // stack pointer!), so that `trampoline` can call it during the first
-        // activation. This scheme forms part of our custom parameter passing
-        // convention.
-        let stack_ptr = control.stack_ptr.cast::<NonNull<F>>();
-        let f_arg_ptr = match StackOrientation::current() {
-            StackOrientation::Upwards => stack_ptr,
-            // SAFETY: In fact, the stack can fit at least one pointer value.
-            StackOrientation::Downwards => unsafe { stack_ptr.sub(1) },
-        };
-        // SAFETY: The pointer is aligned because `Control`'s is aligned to
-        //         the size of a pointer in the current arch. Moreover,
-        //         we have exclusive access to the stack.
-        unsafe { f_arg_ptr.write(NonNull::new_unchecked(&f as *const _ as *mut _)) };*/
         // Make sure the closure does not get dropped, because the trampoline
         // may call it later. This is a bit safer than doing `mem::forget(f)`;
         // see the documentation of that function for details. This lets us
         // preserve the closure in memory without making a copy in the heap.
+        // In fact, the documentation of `ptr::read` tells us that we cannot
+        // destroy the closure even after `trampoline` makes a bitwise copy
+        // in the program stack of the coroutine.
         let _ = ManuallyDrop::new(f);
         #[cfg(feature = "std")]
         let stack = ManuallyDrop::new(stack);
@@ -268,6 +258,17 @@ impl<'f> Coro<'f> {
 
     /// Checks if the coroutine has completely finished its execution.
     fn is_finished(&self) -> bool {
+        // stack pointer does not return to its original position until
+        // the trampoline function terminates.
+
+        // The only two cases where the stack of a coroutine is empty is
+        // The stack of a coroutine is empty if and only if it has either
+        // not yet started execution or has terminated.
+        // To distinguish between the two cases
+
+        // (The stack is actually empty at this point, so the sought address
+        // appears immediately above the control record of the coroutine.)
+        // todo: this is incorrect, because the trampoline never calls `ret`.
         let control = self.control();
         self.stack.bottom() == control.stack_ptr && control.coro_fn.is_none()
     }
@@ -275,17 +276,15 @@ impl<'f> Coro<'f> {
 
 /// Returns a reference to the control record of the active coroutine.
 ///
-/// todo: See [`Coro::control_mut`].
-///
 /// # Safety
 ///
-///
-///
-/// can only be called from within a coroutine.
-// todo: also dictate that we have exclusive access, and add to safety comment below.
+/// This function must be called from within a coroutine. Moreover, the caller
+/// must ensure that the control record is not accessed (read or written)
+/// through any other pointer while the returned reference exists.
 unsafe fn current_control<'a>() -> &'a mut Control {
     let stack_ptr = arch::stack_ptr().cast::<Control>();
     let stack_start = stack_ptr
+        // This transformation is the `NonNull`-equivalent of `pointer::mask`.
         // SAFETY: The stack does not occupy the first page of memory by
         //         assumption (see `arch::stack_ptr`), hence its starting
         //         location is positive.
@@ -293,13 +292,16 @@ unsafe fn current_control<'a>() -> &'a mut Control {
     let mut control_ptr = match StackOrientation::current() {
         StackOrientation::Upwards => stack_start,
         // SAFETY: The program stack of the coroutine consists of `STACK_SIZE`
-        //         bytes, which is greater than `CONTROL_BLOCK_SIZE`.
+        //         bytes, a quantity bigger than `CONTROL_BLOCK_SIZE`.
         StackOrientation::Downwards => stack_start
             .byte_add(Coro::STACK_SIZE.get())
             .byte_sub(Stack::CONTROL_BLOCK_SIZE),
     };
     // SAFETY: This method is called by a coroutine whose control record was
-    //         initialized in `Control::new`.
+    //         initialized in `Control::new`. The pointer is aligned because
+    //         the page size is a multiple of `CONTROL_BLOCK_SIZE`. Also, the
+    //         caller guarantees that we have exclusive access to `control_ptr`'s
+    //         contents.
     control_ptr.as_mut()
 }
 

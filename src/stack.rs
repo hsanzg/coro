@@ -245,28 +245,6 @@ impl Stack {
         }
         .cast()
     }
-
-    /*/// Returns an exclusive reference to the control structure at the bottom
-    /// of this program stack.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the control record is not accessed (read or
-    /// written) through any other pointer while the returned reference exists.
-    pub unsafe fn control_mut<'a>(&self) -> &'a mut MaybeUninit<Control> {
-        let ptr = match StackOrientation::current() {
-            StackOrientation::Upwards => self.start,
-            // SAFETY: The control structure starts `CONTROL_BLOCK_SIZE` bytes
-            //         before the end of a memory region of much greater size.
-            StackOrientation::Downwards => unsafe {
-                self.start.byte_add(self.size - Self::CONTROL_BLOCK_SIZE)
-            },
-        };
-        // SAFETY: the pointer is aligned because the page size is a multiple
-        //         of `CONTROL_BLOCK_SIZE`. Also, the caller guarantees that
-        //         we have exclusive access to `ptr`'s contents.
-        unsafe { ptr.cast().as_uninit_mut() }
-    }*/
 }
 
 impl Drop for Stack {

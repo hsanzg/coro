@@ -69,3 +69,23 @@ pub unsafe extern "system" fn transfer_control(record: &mut Control) {
         clobber_abi("system")
     );
 }
+
+// this is a macro rather than a function, because we need to call the `ret`
+// instruction in the current context. This is the only legal way to replace
+// the stack pointer value from within an inline assembly block in Rust.
+macro_rules! terminate {
+    ($control:expr) => {
+        core::arch::asm!(
+            // todo: empty the stack by replacing the stack pointer in the control record
+            //       prior to returning. This effectively undoes the first set
+            //       of instructions in `transfer_control`.
+            "mov rsp, [{new_sp_addr}]",
+            "ret",
+            new_sp_addr = in(reg) $control.stack_ptr,
+            //stack_ptr_offset = const offset_of!(Control, stack_ptr),
+            options(noreturn, nomem)
+        );
+    };
+}
+
+pub(crate) use terminate;

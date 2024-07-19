@@ -245,6 +245,19 @@ impl Stack {
         }
         .cast()
     }
+
+    /// Returns the initial value for the stack pointer of a coroutine
+    /// associated with this program stack.
+    pub(crate) const fn initial_ptr(&self) -> NonNull<u8> {
+        // SAFETY: The control structure occupies less than a page, so we can
+        //         fit at least one byte in the stack.
+        match StackOrientation::current() {
+            StackOrientation::Upwards => unsafe { self.start.byte_add(Stack::CONTROL_BLOCK_SIZE) },
+            StackOrientation::Downwards => unsafe {
+                self.start.byte_add(self.size - Stack::CONTROL_BLOCK_SIZE)
+            },
+        }
+    }
 }
 
 impl Drop for Stack {

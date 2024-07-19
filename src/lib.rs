@@ -213,15 +213,7 @@ impl<'f> Coro<'f> {
         //         its control record.
         let control = unsafe { stack.control().as_uninit_mut() };
         control.write(Control {
-            // SAFETY: The control structure occupies less than a page, so we
-            //         can fit at least one byte in the stack.
-            stack_ptr: unsafe {
-                let bottom = stack.bottom();
-                match StackOrientation::current() {
-                    StackOrientation::Upwards => bottom.byte_add(Stack::CONTROL_BLOCK_SIZE),
-                    StackOrientation::Downwards => bottom.byte_sub(Stack::CONTROL_BLOCK_SIZE),
-                }
-            },
+            stack_ptr: stack.initial_ptr(),
             // SAFETY: Function pointers cannot be null.
             instr_ptr: unsafe { NonNull::new_unchecked(trampoline::<F> as *mut _) },
             coro_fn: Some(unsafe { NonNull::new_unchecked(&f as *const _ as *mut _) }),
@@ -258,19 +250,16 @@ impl<'f> Coro<'f> {
 
     /// Checks if the coroutine has completely finished its execution.
     fn is_finished(&self) -> bool {
-        // stack pointer does not return to its original position until
-        // the trampoline function terminates.
-
-        // The only two cases where the stack of a coroutine is empty is
-        // The stack of a coroutine is empty if and only if it has either
-        // not yet started execution or has terminated.
-        // To distinguish between the two cases
-
-        // (The stack is actually empty at this point, so the sought address
-        // appears immediately above the control record of the coroutine.)
-        // todo: this is incorrect, because the trampoline never calls `ret`.
+        // The stack of a coroutine is empty if and only if it has either not
+        // yet started execution or it has already terminated. To distinguish
+        // between the two cases, we can exploit the fact that the trampoline
+        // function clears the `coro_fn` field of the control record during
+        // the first activation of the coroutine. Of course, the stack is empty
+        // if the address in `control.stack_ptr` points to the item one byte
+        // past the end of the control structure in the stack growth direction;
+        // see `Stack::initial_ptr` for details.
         let control = self.control();
-        self.stack.bottom() == control.stack_ptr && control.coro_fn.is_none()
+        control.coro_fn.is_none() && self.stack.initial_ptr() == control.stack_ptr
     }
 }
 
@@ -308,13 +297,8 @@ unsafe fn current_control<'a>() -> &'a mut Control {
 #[cfg(feature = "std")]
 impl<'f> Drop for Coro<'f> {
     fn drop(&mut self) {
-        // todo: drop the closure.
-        eprintln!("giving back stack to pool");
         STACK_POOL.with_borrow_mut(|pool| {
-            // todo: review safety.
-            // todo: should we replace `take` by `into_inner`? Be extremely
-            //       confident that we are not adding the stack multiple times
-            //       to the available storage pool.
+            // SAFETY: The `self.stack` variable is not used again.
             let stack = unsafe { ManuallyDrop::take(&mut self.stack) };
             pool.give(stack);
         });
@@ -323,24 +307,24 @@ impl<'f> Drop for Coro<'f> {
 
 impl<'f> Coroutine for Coro<'f> {
     type Yield = ();
-    #[cfg(feature = "std")]
     type Return = ();
-    #[cfg(not(feature = "std"))]
-    type Return = Stack;
 
     fn resume(self: Pin<&mut Self>, _arg: ()) -> CoroutineState<Self::Yield, Self::Return> {
         let coro = self.get_mut();
-        let control = unsafe { coro.control_mut() };
-        #[cfg(feature = "std")]
-        eprintln!(
-            "[resuming] status: sp={:?}, rp={:?}",
-            control.stack_ptr, control.instr_ptr
-        );
-        unsafe { arch::transfer_control(control) };
-        // todo: To determine if yielded or not, check if `status.ret_instr`
-        //       was overwritten or not (if yes, then yielded; otherwise returned
-        //       normally via `ret` instruction)?
-        CoroutineState::Yielded(())
+        {
+            let control = unsafe { coro.control_mut() };
+            #[cfg(feature = "std")]
+            eprintln!(
+                "[resuming] status: sp={:?}, rp={:?}",
+                control.stack_ptr, control.instr_ptr
+            );
+            unsafe { arch::transfer_control(control) };
+        }
+        if coro.is_finished() {
+            CoroutineState::Complete(())
+        } else {
+            CoroutineState::Yielded(())
+        }
     }
 }
 
@@ -349,7 +333,7 @@ pub fn yield_() {
     // todo: this is going to be really complicated, but fail if this function
     //       was not called from within a coroutine. Otherwise we would need
     //       to mark this function as "unsafe".
-    // let status = unsafe { arch::current_status() };
+    // todo: this can actually lead to undefined behavior. Document extensively.
     let control = unsafe { current_control() };
     unsafe { arch::transfer_control(control) };
 }

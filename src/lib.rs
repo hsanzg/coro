@@ -53,7 +53,7 @@ struct Control {
     /// was last suspended.
     ///
     /// This field is of use when [resuming] a coroutine that has not [finished]
-    /// its execution, because it begins where it last left off.
+    /// its execution, because it does so at the point where it last left off.
     ///
     /// [`trampoline` function]: Coro::new
     /// [resuming]: Coro::resume
@@ -193,15 +193,13 @@ impl<'f> Coro<'f> {
             };
             // Execute the provided closure in the stack of the coroutine.
             coro_fn();
-            // At this point the coroutine has finished its execution. Destroy
-            // the closure, restore the stack pointer to the value present in
-            // the control record, and return to the last caller of `resume`.
-            // Any attempt to resume the coroutine ever again will trigger a
-            // panic.
-            drop(coro_fn);
+            // At this point the coroutine has finished its execution. We need
+            // to restore the stack pointer to the value present in the control
+            // record, and return to the last caller of `resume`. Any attempt
+            // to resume the coroutine ever again will trigger a panic.
             // SAFETY: We have exclusive access to the stack.
             let control = unsafe { current_control() };
-            unsafe { arch::terminate!(control) }
+            unsafe { arch::return_control!(control) }
         }
         // Allocate a stack for the coroutine, and initialize its control record
         // as follows: First set the value of the stack pointer to the location
@@ -310,9 +308,10 @@ impl<'f> Coroutine for Coro<'f> {
     type Return = ();
 
     fn resume(self: Pin<&mut Self>, _arg: ()) -> CoroutineState<Self::Yield, Self::Return> {
+        // todo: document + add safety comments
         let coro = self.get_mut();
         {
-            let control = unsafe { coro.control_mut() };
+            let control = coro.control_mut();
             #[cfg(feature = "std")]
             eprintln!(
                 "[resuming] status: sp={:?}, rp={:?}",

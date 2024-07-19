@@ -321,5 +321,10 @@ impl StackPool {
             "cannot take stack of suspended coroutine"
         );
         self.0.push(coro.stack);
+        // Section 10.8 of [_The Rust Language Reference_ (4d292b6)] states
+        // that only the remaining fields are dropped after a partial move;
+        // this property prevents a double-free of the stack instance.
+        //
+        // [_The Rust Language Reference_ (4d292b6)]: https://doc.rust-lang.org/reference/
     }
 }

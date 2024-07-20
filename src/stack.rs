@@ -28,9 +28,9 @@ impl StackOrientation {
 /// 1. The [`resume`] and [`yield`] operations employ the bottommost
 ///    [`Control::SIZE`] bytes of a coroutine's stack to record status
 ///    information during transfers of control. Here the meaning of "bottom"
-///    depends on the [stack growth direction] in the present arch. The
-///    first stack frame starts on top of the [control record].
-/// 2. To protect against overflows, we protect the last page of a program stack.
+///    depends on the [stack growth direction] in the present arch. The actual
+///    stack contents appear on top of the [control record].
+/// 2. To guard against overflows, we protect the last page of a program stack.
 ///    In this way the process does not have permission to read from, write to,
 ///    or execute any memory location within this _guard page_; any attempt to
 ///    do so will cause a protection fault. Some [authors] do not include the
@@ -52,7 +52,7 @@ pub struct Stack {
     /// [bottom]: Self::bottom
     start: NonNull<u8>,
     /// The number of bytes occupied by the stack.
-    size: usize,
+    size: NonZeroUsize,
 }
 
 impl Stack {
@@ -65,7 +65,13 @@ impl Stack {
     /// stack, or if it cannot protect the guard page against access by
     /// the current process.
     ///
+    /// # Safety
+    ///
+    /// This function assumes that the smallest multiple of `align` and the
+    /// [page size] greater than or equal to `size` is at most [`isize::MAX`].
+    ///
     /// [starting address]: Self::start
+    /// [page size]: page_size
     pub(crate) fn new(min_size: NonZeroUsize, align: Alignment) -> Self {
         // The size of the stack must be a multiple of the page size, because
         // we need to align the guard page to a page boundary. It also needs
@@ -84,9 +90,8 @@ impl Stack {
             .max(unsafe {
                 let two = NonZeroUsize::new_unchecked(2);
                 page_size.unchecked_mul(two)
-            })
-            .get()
-            .next_multiple_of(page_size.get());
+            });
+        let size = next_multiple_of(size, page_size);
         // The latest version of the POSIX standard at the time of writing,
         // namely IEEE Std. 1003.1-2024, does not give us a portable way to
         // create a memory mapping whose lowest location is a multiple of some
@@ -96,7 +101,8 @@ impl Stack {
         let alloc_size = if align.as_usize() <= page_size.get() {
             size
         } else {
-            size + align.as_usize()
+            // SAFETY: The caller ensures that this addition cannot overflow.
+            unsafe { size.unchecked_add(align.as_usize()) }
         };
         // Reserve an `alloc_size`-byte area with read and write permission
         // only. We pass the `MAP_STACK` flag to indicate that we will use the
@@ -105,7 +111,7 @@ impl Stack {
         let start = unsafe {
             libc::mmap(
                 null_mut(),
-                alloc_size,
+                alloc_size.get(),
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
                 -1,
@@ -135,8 +141,8 @@ impl Stack {
             );
         }
         let start = unsafe { start.add(offset) };
-        let tail_start = unsafe { start.byte_add(size) };
-        let tail_size = alloc_size - offset - size;
+        let tail_start = unsafe { start.byte_add(size.get()) };
+        let tail_size = alloc_size.get() - offset - size.get();
         if tail_size > 0 {
             // SAFETY: Since `start` and `size` are multiples of `page_size`,
             //         so is `tail_start`.
@@ -199,7 +205,7 @@ impl Stack {
         match StackOrientation::current() {
             StackOrientation::Upwards => self.start,
             // SAFETY: `start` is the first location of a `size`-byte region.
-            StackOrientation::Downwards => unsafe { self.start.byte_add(self.size) },
+            StackOrientation::Downwards => unsafe { self.start.byte_add(self.size.get()) },
         }
     }
 
@@ -215,7 +221,7 @@ impl Stack {
             // SAFETY: The control structure starts `Control::SIZE` bytes before
             //         the end of a memory region of much greater size.
             StackOrientation::Downwards => unsafe {
-                self.start.byte_add(self.size - Control::SIZE)
+                self.start.byte_add(self.size.get() - Control::SIZE)
             },
         }
         .cast()
@@ -229,7 +235,7 @@ impl Stack {
         match StackOrientation::current() {
             StackOrientation::Upwards => unsafe { self.start.byte_add(Control::SIZE) },
             StackOrientation::Downwards => unsafe {
-                self.start.byte_add(self.size - Control::SIZE)
+                self.start.byte_add(self.size.get() - Control::SIZE)
             },
         }
     }
@@ -237,9 +243,11 @@ impl Stack {
 
 impl Drop for Stack {
     fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        eprintln!("deleting stack @ {:?}", self.start);
         // Delete the mappings for this stack's address range.
         assert_eq!(
-            unsafe { libc::munmap(self.start.cast().as_ptr(), self.size) },
+            unsafe { libc::munmap(self.start.cast().as_ptr(), self.size.get()) },
             0, // indicates success.
             "failed to remove program stack mapping: {}",
             last_os_error()
@@ -282,7 +290,7 @@ impl StackPool {
         if let Some(ix) = self
             .0
             .iter()
-            .position(|s| s.size >= min_size.get() && s.start.is_aligned_to(align.as_usize()))
+            .position(|s| s.size >= min_size && s.start.is_aligned_to(align.as_usize()))
         {
             // Success: Remove `s` from the pool and hand it off to the caller.
             self.0.swap_remove(ix)
@@ -317,5 +325,23 @@ impl StackPool {
         // move; this property prevents a double-free of the stack instance.
         //
         // [_The Rust Language Reference_ (4d292b6)]: https://doc.rust-lang.org/reference/
+    }
+}
+
+/// Calculates the smallest value greater than or equal to `lhs` that is a
+/// multiple of `rhs`.
+///
+/// This function is the [`NonZeroUsize`] version of [`usize::next_multiple_of`].
+///
+/// # Panics
+///
+/// This function will panic on overflow.
+fn next_multiple_of(lhs: NonZeroUsize, rhs: NonZeroUsize) -> NonZeroUsize {
+    match lhs.get().next_multiple_of(rhs.get()) {
+        // If overflow checks are enabled, `usize::next_multiple_of` already
+        // panics by itself. Otherwise it wraps to zero on overflow, because
+        // zero is the trivial multiple of every integer.
+        0 => panic!("least multiple of {rhs} greater than or equal to {lhs} overflows a `usize`"),
+        r => unsafe { NonZeroUsize::new_unchecked(r) },
     }
 }

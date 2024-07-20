@@ -1,4 +1,4 @@
-use crate::Control;
+use crate::{Control, Finished};
 use core::arch::asm;
 use core::mem::offset_of;
 use core::ptr::NonNull;
@@ -12,6 +12,8 @@ use core::ptr::NonNull;
 /// [nonnull]: core::ptr::null
 #[naked]
 pub extern "system" fn stack_ptr() -> NonNull<u8> {
+    // The `rax` register is to contain the first return value under the
+    // System V and Windows ABI calling conventions for the x86-64 architecture.
     unsafe { asm!("mov rax, rsp", "ret", options(noreturn)) }
 }
 
@@ -66,11 +68,52 @@ pub unsafe extern "system" fn transfer_control(record: &mut Control) {
         in("rdi") record,
         stack_ptr_offset = const offset_of!(Control, stack_ptr),
         instr_ptr_offset = const offset_of!(Control, instr_ptr),
-        clobber_abi("system")
+        clobber_abi("system") // includes `rax` and `rdx`.
     );
 }
 
-// this is a macro rather than a function, because we need to call the `ret`
+/// Returns to the instruction immediately after the [`resume`] call that
+/// activated the current [coroutine]. This function is a special version
+/// of [`transfer_control`] for the case when the coroutine will never get
+/// activated again (hence the `!` return type); for example, it does not
+/// save the previous _callee-saved_ register contents, nor does it store
+/// the current instruction pointer in the coroutine's [control record].
+/// It is important to note that a call to one function cannot be replaced
+/// by one to the other, however, because `return_control` is the only to
+/// "mark" the coroutine as finished. (The [`Coro::is_finished`] method
+/// has further details.)
+///
+/// # Safety
+///
+/// This function must be called from within a coroutine that shall never be
+/// resumed again.
+///
+/// [`resume`]: crate::Coro::resume
+/// [coroutine]: crate::Coro
+/// [control record]: Control
+/// [`Coro::is_finished`]: crate::Coro::is_finished
+pub unsafe extern "system" fn return_control(record: &mut Control) -> ! {
+    // The stack grows downwards in the x86-64 architecture, hence the initial
+    // stack pointer value is the address of the control record.
+    asm!(
+        // Empty the current stack,
+
+        // refer to the bottom address of the stack.
+        "mov rsp, [rdi + {stack_ptr_offset}]",
+        "mov qword ptr [rdi + {finished_offset}], {yes}",
+        //"mov [rdi + {stack_ptr_offset}], rdi",
+        "mov rax, [rdi + {instr_ptr_offset}]",
+        "jmp rax",
+        in("rdi") record,
+        stack_ptr_offset = const offset_of!(Control, stack_ptr),
+        finished_offset = const offset_of!(Control, finished),
+        yes = const Finished::YES.0,
+        instr_ptr_offset = const offset_of!(Control, instr_ptr),
+        options(noreturn)
+    )
+}
+
+/*// this is a macro rather than a function, because we need to call the `ret`
 // instruction in the current context. This is the only legal way to replace
 // the stack pointer value from within an inline assembly block in Rust.
 macro_rules! return_control {
@@ -90,3 +133,4 @@ macro_rules! return_control {
 }
 
 pub(crate) use return_control;
+*/

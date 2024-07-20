@@ -1,6 +1,5 @@
 use crate::os::{last_os_error, page_size};
 use crate::{Control, Coro};
-use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::ptr::{null_mut, Alignment, NonNull};
 use smallvec::SmallVec;
@@ -27,7 +26,7 @@ impl StackOrientation {
 /// More precisely, it is a set of contiguous memory pages where a coroutine is
 /// free to store any data. There are exceptions to this statement, however:
 /// 1. The [`resume`] and [`yield`] operations employ the bottommost
-///    [`CONTROL_BLOCK_SIZE`] bytes of a coroutine's stack to record status
+///    [`Control::SIZE`] bytes of a coroutine's stack to record status
 ///    information during transfers of control. Here the meaning of "bottom"
 ///    depends on the [stack growth direction] in the present arch. The
 ///    first stack frame starts on top of the [control record].
@@ -41,7 +40,6 @@ impl StackOrientation {
 /// [coroutine]: Coro
 /// [`resume`]: Coro::resume
 /// [`yield`]: yield_
-/// [`CONTROL_BLOCK_SIZE`]: Self::CONTROL_BLOCK_SIZE
 /// [control record]: Control
 /// [stack growth direction]: StackOrientation
 /// [authors]: https://devblogs.microsoft.com/oldnewthing/20220203-00/?p=106215
@@ -58,34 +56,14 @@ pub struct Stack {
 }
 
 impl Stack {
-    /// The fixed number of cells at the bottom of a program stack reserved for
-    /// special use by the [`resume`] and [`yield`] functions, which perform
-    /// transfer of control between coroutines. For this reason it is undefined
-    /// behavior for a [coroutine] to write onto the first `CONTROL_BLOCK_SIZE`
-    /// bytes (in the [direction] of stack growth) starting at the [bottom] of
-    /// its program stack.
-    ///
-    /// This value is such that the initial stack pointer address meets the
-    /// ABI-required minimum alignment requirements in the current architecture.
+    /// Allocates space for a new program stack of size at least `min_size`,
+    /// with its [starting address] being a multiple of `align`.
     ///
     /// # Panics
     ///
     /// This function panics if it fails to allocate enough memory for the
     /// stack, or if it cannot protect the guard page against access by
     /// the current process.
-    ///
-    /// [`resume`]: Coro::resume
-    /// [`yield`]: yield_
-    /// [coroutine]: Coro
-    /// [direction]: StackOrientation
-    /// [bottom]: Self::bottom
-    /// [starting address]: Stack::start
-    /// [size]: Self::size
-    /// [page size]: page_size
-    pub(crate) const CONTROL_BLOCK_SIZE: usize = size_of::<Control>();
-
-    /// Allocates space for a new program stack of size at least `min_size`,
-    /// with its [starting address] being a multiple of `align`.
     ///
     /// [starting address]: Self::start
     pub(crate) fn new(min_size: NonZeroUsize, align: Alignment) -> Self {
@@ -97,7 +75,7 @@ impl Stack {
         // that the control record cannot be placed at the bottom of the stack.
         let page_size = page_size();
         debug_assert!(
-            Self::CONTROL_BLOCK_SIZE <= page_size.get(),
+            Control::SIZE <= page_size.get(),
             "control record at the bottom of stack must be aligned"
         );
         let size = min_size
@@ -120,7 +98,7 @@ impl Stack {
         } else {
             size + align.as_usize()
         };
-        // Reserve an `alloc_size`-byte memory area with read and write permission
+        // Reserve an `alloc_size`-byte area with read and write permission
         // only. We pass the `MAP_STACK` flag to indicate that we will use the
         // region to store a program stack. On success, the kernel guarantees
         // that the `start` address is page-aligned.
@@ -206,8 +184,8 @@ impl Stack {
     /// item that would appear at the bottom of the stack. Otherwise (namely
     /// if the stack grows [downwards]), the returned address is the location
     /// one byte past the bottom of the stack. In any case a [coroutine] is
-    /// to access the contents of its program stack [`CONTROL_BLOCK_SIZE`]
-    /// bytes past this address, in the stack growth direction.
+    /// to access the contents of its program stack [`Control::SIZE`] bytes
+    /// past this address, in the stack growth direction.
     ///
     /// This concept should not to be confused with the [starting location]
     /// of the stack.
@@ -216,7 +194,6 @@ impl Stack {
     /// [upwards]: StackOrientation::Upwards
     /// [downwards]: StackOrientation::Downwards
     /// [coroutine]: Coro
-    /// [`CONTROL_BLOCK_SIZE`]: Self::CONTROL_BLOCK_SIZE
     /// [starting location]: Self::start
     pub(crate) const fn bottom(&self) -> NonNull<u8> {
         match StackOrientation::current() {
@@ -229,18 +206,16 @@ impl Stack {
     /// Returns the location of the control record within this stack.
     ///
     /// The pointer is properly aligned: the stack size is a multiple of
-    /// the page size, which is itself a multiple of [`CONTROL_BLOCK_SIZE`].
+    /// the page size, which is itself a multiple of [`Control::SIZE`].
     /// Care must be taken when dereferencing the pointer, however, because
     /// the record contents might be uninitialized.
-    ///
-    /// [`CONTROL_BLOCK_SIZE`]: Self::CONTROL_BLOCK_SIZE
     pub(crate) const fn control(&self) -> NonNull<Control> {
         match StackOrientation::current() {
             StackOrientation::Upwards => self.start,
-            // SAFETY: The control structure starts `CONTROL_BLOCK_SIZE` bytes
-            //         before the end of a memory region of much greater size.
+            // SAFETY: The control structure starts `Control::SIZE` bytes before
+            //         the end of a memory region of much greater size.
             StackOrientation::Downwards => unsafe {
-                self.start.byte_add(self.size - Self::CONTROL_BLOCK_SIZE)
+                self.start.byte_add(self.size - Control::SIZE)
             },
         }
         .cast()
@@ -252,9 +227,9 @@ impl Stack {
         // SAFETY: The control structure occupies less than a page, so we can
         //         fit at least one byte in the stack.
         match StackOrientation::current() {
-            StackOrientation::Upwards => unsafe { self.start.byte_add(Stack::CONTROL_BLOCK_SIZE) },
+            StackOrientation::Upwards => unsafe { self.start.byte_add(Control::SIZE) },
             StackOrientation::Downwards => unsafe {
-                self.start.byte_add(self.size - Stack::CONTROL_BLOCK_SIZE)
+                self.start.byte_add(self.size - Control::SIZE)
             },
         }
     }
@@ -269,6 +244,22 @@ impl Drop for Stack {
             "failed to remove program stack mapping: {}",
             last_os_error()
         );
+    }
+}
+
+///
+pub fn push_loc<T>(stack_ptr: NonNull<u8>) -> (NonNull<u8>, NonNull<T>) {
+    // todo: handle alignment and overflows.
+    match StackOrientation::current() {
+        StackOrientation::Upwards => {
+            let item_ptr = stack_ptr.cast();
+            let stack_ptr = unsafe { item_ptr.add(1) }.cast();
+            (stack_ptr, item_ptr)
+        }
+        StackOrientation::Downwards => {
+            let item_ptr = unsafe { stack_ptr.cast().sub(1) };
+            (item_ptr.cast(), item_ptr)
+        }
     }
 }
 
@@ -322,8 +313,8 @@ impl StackPool {
         );
         self.0.push(coro.stack);
         // Section 10.8 of [_The Rust Language Reference_ (4d292b6)] states
-        // that only the remaining fields are dropped after a partial move;
-        // this property prevents a double-free of the stack instance.
+        // that only the remaining fields of `Coro` are dropped after a partial
+        // move; this property prevents a double-free of the stack instance.
         //
         // [_The Rust Language Reference_ (4d292b6)]: https://doc.rust-lang.org/reference/
     }

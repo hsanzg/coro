@@ -99,6 +99,22 @@ struct Control {
 }
 
 impl Control {
+    /// The fixed number of cells at the bottom of a [program stack] reserved
+    /// for special use by the [`resume`] and [`yield`] functions, which perform
+    /// transfer of control between coroutines. For this reason it is undefined
+    /// behavior for a [coroutine] to write onto the first `SIZE` bytes (in
+    /// the [direction] of stack growth) starting at the [bottom] of its
+    /// program stack.
+    ///
+    /// [program stack]: Stack
+    /// [`resume`]: Coro::resume
+    /// [`yield`]: yield_
+    /// [coroutine]: Coro
+    /// [direction]: StackOrientation
+    /// [bottom]: Stack::bottom
+    /// [starting address]: Stack::start
+    /// [size]: Stack::size
+    /// [page size]: os::page_size
     pub const SIZE: usize = size_of::<Self>();
 }
 

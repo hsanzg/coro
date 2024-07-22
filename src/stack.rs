@@ -40,11 +40,12 @@ impl StackOrientation {
 ///    convention when doing size calculations.
 ///
 /// [coroutine]: crate::Coro
-/// [`resume`]: crate::Coro::resume
+/// [`resume`]: core::ops::Coroutine::resume
 /// [`yield`]: crate::yield_
 /// [control record]: Control
 /// [stack growth direction]: StackOrientation
 /// [authors]: https://devblogs.microsoft.com/oldnewthing/20220203-00/?p=106215
+#[allow(rustdoc::private_intra_doc_links)]
 pub struct Stack {
     /// The lowest address of a memory cell in the stack.
     ///

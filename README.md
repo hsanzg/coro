@@ -54,3 +54,9 @@ See the paper "Revisiting Coroutines" by A. L. de Moura and R. Ierusalimschy
 ## License
 
 [MIT](LICENSE) &copy; [Hugo Sanz González](https://hgsg.me)
+
+[`yield`]: https://docs.rs/exact-covers/latest/coro/fn.yield_.html
+[`resume`]: https://docs.rs/exact-covers/latest/coro/struct.Coro.html#method.resume
+[`Coro`]: https://docs.rs/exact-covers/latest/coro/struct.Coro.html
+[`core::ops::Coroutine`]: https://doc.rust-lang.org/nightly/core/ops/trait.Coroutine.html
+[same size]: https://docs.rs/exact-covers/latest/coro/constant.STACK_SIZE.html

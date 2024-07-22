@@ -1,5 +1,7 @@
 use crate::os::{last_os_error, page_size};
-use crate::{Control, Coro};
+use crate::Control;
+use core::any::type_name;
+use core::cell::RefCell;
 use core::num::NonZeroUsize;
 use core::ptr::{null_mut, Alignment, NonNull};
 use smallvec::SmallVec;
@@ -15,7 +17,7 @@ pub enum StackOrientation {
 }
 
 impl StackOrientation {
-    /// The orientation of every program stack in the current arch.
+    /// The orientation of every program stack in the current platform.
     #[cfg(target_arch = "x86_64")]
     pub const fn current() -> Self {
         Self::Downwards
@@ -37,9 +39,9 @@ impl StackOrientation {
 ///    guard page as part of a program stack, but we will _not_ follow this
 ///    convention when doing size calculations.
 ///
-/// [coroutine]: Coro
-/// [`resume`]: Coro::resume
-/// [`yield`]: yield_
+/// [coroutine]: crate::Coro
+/// [`resume`]: crate::Coro::resume
+/// [`yield`]: crate::yield_
 /// [control record]: Control
 /// [stack growth direction]: StackOrientation
 /// [authors]: https://devblogs.microsoft.com/oldnewthing/20220203-00/?p=106215
@@ -179,36 +181,6 @@ impl Stack {
         }
     }
 
-    /// Returns the lowest location within the stack, including the guard page.
-    pub(crate) const fn start(&self) -> NonNull<u8> {
-        self.start
-    }
-
-    /// Returns the bottom boundary of the stack in memory, which depends on the
-    /// [stack growth direction] in the present architecture. More precisely,
-    /// if the stack grows [upwards], this method returns the address of the
-    /// item that would appear at the bottom of the stack. Otherwise (namely
-    /// if the stack grows [downwards]), the returned address is the location
-    /// one byte past the bottom of the stack. In any case a [coroutine] is
-    /// to access the contents of its program stack [`Control::SIZE`] bytes
-    /// past this address, in the stack growth direction.
-    ///
-    /// This concept should not to be confused with the [starting location]
-    /// of the stack.
-    ///
-    /// [stack growth direction]: StackOrientation
-    /// [upwards]: StackOrientation::Upwards
-    /// [downwards]: StackOrientation::Downwards
-    /// [coroutine]: Coro
-    /// [starting location]: Self::start
-    pub(crate) const fn bottom(&self) -> NonNull<u8> {
-        match StackOrientation::current() {
-            StackOrientation::Upwards => self.start,
-            // SAFETY: `start` is the first location of a `size`-byte region.
-            StackOrientation::Downwards => unsafe { self.start.byte_add(self.size.get()) },
-        }
-    }
-
     /// Returns the location of the control record within this stack.
     ///
     /// The pointer is properly aligned: the stack size is a multiple of
@@ -227,9 +199,25 @@ impl Stack {
         .cast()
     }
 
-    /// Returns the initial value for the stack pointer of a coroutine
-    /// associated with this program stack.
-    pub(crate) const fn initial_ptr(&self) -> NonNull<u8> {
+    /// Returns the top boundary of the control record within this stack, which
+    /// depends on the [stack growth direction] in the present architecture.
+    /// More precisely, if the stack grows [upwards], this method returns the
+    /// address of the item that would appear at the bottom of the stack (on
+    /// top of the control record). Otherwise (namely if the stack grows
+    /// [downwards]), the returned address is the location one byte past the
+    /// bottom of the stack. In any case a [coroutine] is not to access the
+    /// [`Control::SIZE`] bytes past this address, in the opposite direction
+    /// of stack growth.
+    ///
+    /// This concept should not be confused with the [starting location] of
+    /// the stack.
+    ///
+    /// [stack growth direction]: StackOrientation
+    /// [upwards]: StackOrientation::Upwards
+    /// [downwards]: StackOrientation::Downwards
+    /// [coroutine]: Coro
+    /// [starting location]: Self::start
+    pub(crate) const fn bottom(&self) -> NonNull<u8> {
         // SAFETY: The control structure occupies less than a page, so we can
         //         fit at least one byte in the stack.
         match StackOrientation::current() {
@@ -239,12 +227,85 @@ impl Stack {
             },
         }
     }
+
+    /// Returns two pointers to the beginning and end of the first block within
+    /// the stack lying _above_ `ptr` that may contain a value of type `T`. The
+    /// block is a set of `size_of::<T>()` contiguous memory locations starting
+    /// at a multiple of `align_of::<T>()`, and it does not intersect any cell
+    /// of memory [below] `ptr`. Note that the two locations coincide if the
+    /// stack grows [downwards]; otherwise the first one is `size_of::<T>()`
+    /// bytes smaller than the second.
+    ///
+    /// This operation is always safe, but using the resulting pointers is not.
+    /// For example, the first pointer might not link to an initialized value
+    /// of type `T`.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if there is not enough room to store a value of
+    /// `T` above `ptr` in the stack, and with support for aligned accesses.
+    ///
+    /// [below]: StackOrientation
+    /// [downwards]: StackOrientation::Downwards
+    pub(crate) fn align_alloc<T>(&self, ptr: NonNull<u8>) -> (NonNull<T>, NonNull<u8>) {
+        let aligned = align_alloc::<T>(ptr, Alignment::of::<T>());
+        // Check that the relevant `sizeof::<T>()`-byte block of consecutive
+        // memory locations is within the bounds of the stack region. Note that
+        // all pointers involved have the same provenance, so it makes sense to
+        // compare their addresses.
+        assert!(
+            match StackOrientation::current() {
+                StackOrientation::Upwards => {
+                    // SAFETY: `start` is the first location of a `size`-byte stack.
+                    let stack_end = unsafe { self.start.byte_add(self.size.get()) };
+                    aligned.wrapping_add(1).cast() <= stack_end.as_ptr()
+                }
+                StackOrientation::Downwards => self.start.as_ptr() <= aligned.cast(),
+            },
+            "aligned value of type `{}` above {:?} would overflow the stack",
+            type_name::<T>(),
+            ptr
+        );
+        // SAFETY: The pointer refers to a location within the stack.
+        let aligned = unsafe { NonNull::new_unchecked(aligned) };
+        let end = match StackOrientation::current() {
+            // SAFETY: In the worst case, the result of `add` is one byte past
+            //         the end of the stack.
+            StackOrientation::Upwards => unsafe { aligned.add(1) },
+            StackOrientation::Downwards => aligned,
+        };
+        (aligned, end.cast())
+    }
+}
+
+/// Returns the address of the first block _above_ `ptr` (in the [direction]
+/// of stack growth) that may contain a value of type `T`. The block is a set
+/// of `size_of::<T>()` contiguous memory locations starting at a multiple of
+/// `align_of::<T>()`.
+///
+/// # Safety
+///
+/// This operation is always safe, but using the resulting pointer is not. For
+/// example, the resulting pointer might not link to an initialized value of
+/// type `T`. Offsetting the pointer might cause overflow, underflow, or return
+/// the [zero address].
+///
+/// [direction]: StackOrientation
+/// [zero address]: ptr::null
+pub(crate) fn align_alloc<T>(ptr: NonNull<u8>, align: Alignment) -> *mut T {
+    let align_mask = align.as_usize() - 1;
+    ptr.as_ptr()
+        .map_addr(|a| match StackOrientation::current() {
+            StackOrientation::Upwards => (a + align_mask) & !align_mask,
+            // The size of a value is always a multiple of its alignment, except
+            // if `T` is zero-sized; the following code also handles this case.
+            StackOrientation::Downwards => (a & !align_mask) - size_of::<T>(),
+        })
+        .cast()
 }
 
 impl Drop for Stack {
     fn drop(&mut self) {
-        #[cfg(feature = "std")]
-        eprintln!("deleting stack @ {:?}", self.start);
         // Delete the mappings for this stack's address range.
         assert_eq!(
             unsafe { libc::munmap(self.start.cast().as_ptr(), self.size.get()) },
@@ -252,22 +313,6 @@ impl Drop for Stack {
             "failed to remove program stack mapping: {}",
             last_os_error()
         );
-    }
-}
-
-///
-pub fn push_loc<T>(stack_ptr: NonNull<u8>) -> (NonNull<u8>, NonNull<T>) {
-    // todo: handle alignment and overflows.
-    match StackOrientation::current() {
-        StackOrientation::Upwards => {
-            let item_ptr = stack_ptr.cast();
-            let stack_ptr = unsafe { item_ptr.add(1) }.cast();
-            (stack_ptr, item_ptr)
-        }
-        StackOrientation::Downwards => {
-            let item_ptr = unsafe { stack_ptr.cast().sub(1) };
-            (item_ptr.cast(), item_ptr)
-        }
     }
 }
 
@@ -303,7 +348,7 @@ impl StackPool {
     /// Returns a stack to the pool of available storage.
     ///
     /// Note that this pool need not have allocated the given stack.
-    pub fn give(&mut self, stack: Stack) {
+    pub(crate) fn give(&mut self, stack: Stack) {
         self.0.push(stack);
     }
 
@@ -314,7 +359,7 @@ impl StackPool {
     ///
     /// This function panics if the coroutine has not finished execution yet.
     #[cfg(not(feature = "std"))]
-    pub fn give_from(&mut self, coro: Coro) {
+    pub fn give_from<F>(&mut self, coro: Coro<F>) {
         assert!(
             coro.is_finished(),
             "cannot take stack of suspended coroutine"
@@ -326,6 +371,12 @@ impl StackPool {
         //
         // [_The Rust Language Reference_ (4d292b6)]: https://doc.rust-lang.org/reference/
     }
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    /// A per-thread pool of available program stacks.
+    pub static COMMON_POOL: RefCell<StackPool> = const { RefCell::new(StackPool::new()) };
 }
 
 /// Calculates the smallest value greater than or equal to `lhs` that is a

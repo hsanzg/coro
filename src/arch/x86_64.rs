@@ -1,7 +1,7 @@
-use crate::{Control, Finished};
+use crate::Control;
 use core::arch::asm;
 use core::mem::offset_of;
-use core::ptr::NonNull;
+use core::ptr::{Alignment, NonNull};
 
 /// Returns the current stack pointer value.
 ///
@@ -50,8 +50,19 @@ pub unsafe extern "system" fn transfer_control(record: &mut Control) {
     // following version 1.0 of the System V ABI (see Section 3.2.3); we will
     // use the same register to save a `mov` on non-Windows systems.
     asm!(
+        // Preserve the contents of the `rbx` and `rbp` registers manually. The
+        // former is not included in the clobber list because LLVM uses it
+        // internally; similarly, Rust does not allow us to specify the frame
+        // pointer as an input nor output.
+        // todo: We do not need to increase the stack pointer in non-Windows
+        //       systems, thanks to the 128-byte red zone.
+        "push rbx",
+        "push rbp",
         // Swap the current stack pointer (`sp`) with the pointer address
-        // in the control record (`record.stack_ptr`).
+        // in the control record (`record.stack_ptr`). The stack setup section
+        // of code in `Coro::new` ensures that the stack pointer is properly
+        // aligned during the first coroutine activation. (See Section 3.2.3
+        // of the System V ABI for details.)
         "mov rax, rsp",
         "mov rsp, [rdi + {stack_ptr_offset}]",
         "mov [rdi + {stack_ptr_offset}], rax",
@@ -65,10 +76,17 @@ pub unsafe extern "system" fn transfer_control(record: &mut Control) {
         // Resume the computation.
         "jmp rax",
         "2:",
+        // At this point we have come back to the original stack. It remains to
+        // restore the contents of all manually-preserved registers.
+        "pop rbp",
+        "pop rbx",
         in("rdi") record,
         stack_ptr_offset = const offset_of!(Control, stack_ptr),
         instr_ptr_offset = const offset_of!(Control, instr_ptr),
-        clobber_abi("system") // includes `rax` and `rdx`.
+        clobber_abi("system"), // includes `rax` and `rdx`.
+        // The `clobber_abi("system")` clobber set is currently missing some
+        // registers; specify them manually.
+        lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
     );
 }
 
@@ -81,7 +99,9 @@ pub unsafe extern "system" fn transfer_control(record: &mut Control) {
 /// It is important to note that a call to one function cannot be replaced
 /// by one to the other, however, because `return_control` is the only to
 /// "mark" the coroutine as finished. (The [`Coro::is_finished`] method
-/// has further details.)
+/// has further details; in short, this function resets the instruction
+/// pointer to zero and writes the address `ret_val_addr` of the coroutine's
+/// return value to the stack pointer field.)
 ///
 /// # Safety
 ///
@@ -92,45 +112,24 @@ pub unsafe extern "system" fn transfer_control(record: &mut Control) {
 /// [coroutine]: crate::Coro
 /// [control record]: Control
 /// [`Coro::is_finished`]: crate::Coro::is_finished
-pub unsafe extern "system" fn return_control(record: &mut Control) -> ! {
-    // The stack grows downwards in the x86-64 architecture, hence the initial
-    // stack pointer value is the address of the control record.
+pub unsafe extern "system" fn return_control<R>(
+    record: &mut Control,
+    ret_val_addr: NonNull<R>,
+) -> ! {
     asm!(
-        // Empty the current stack,
-
-        // refer to the bottom address of the stack.
         "mov rsp, [rdi + {stack_ptr_offset}]",
-        "mov qword ptr [rdi + {finished_offset}], {yes}",
-        //"mov [rdi + {stack_ptr_offset}], rdi",
+        "mov [rdi + {stack_ptr_offset}], rdx",
         "mov rax, [rdi + {instr_ptr_offset}]",
+        "mov qword ptr [rdi + {instr_ptr_offset}], 0",
+        // Jump to the last caller.
         "jmp rax",
         in("rdi") record,
+        in("rdx") ret_val_addr.as_ptr(),
         stack_ptr_offset = const offset_of!(Control, stack_ptr),
-        finished_offset = const offset_of!(Control, finished),
-        yes = const Finished::YES.0,
         instr_ptr_offset = const offset_of!(Control, instr_ptr),
         options(noreturn)
     )
 }
 
-/*// this is a macro rather than a function, because we need to call the `ret`
-// instruction in the current context. This is the only legal way to replace
-// the stack pointer value from within an inline assembly block in Rust.
-macro_rules! return_control {
-    ($record:expr) => {
-        core::arch::asm!(
-            // todo: empty the stack by replacing the stack pointer in the control record
-            //       prior to returning. This effectively undoes the first set
-            //       of instructions in `transfer_control`.
-            "mov rsp, [{ctrl_record} + {stack_ptr_offset}]",
-            "jmp [{ctrl_record} + {instr_ptr_offset}]",
-            ctrl_record = in(reg) $record,
-            stack_ptr_offset = const core::mem::offset_of!(Control, stack_ptr),
-            instr_ptr_offset = const core::mem::offset_of!(Control, instr_ptr),
-            options(noreturn, nomem)
-        )
-    };
-}
-
-pub(crate) use return_control;
-*/
+/// The ABI-required minimum alignment of a stack frame.
+pub const STACK_FRAME_ALIGN: Alignment = unsafe { Alignment::new_unchecked(16) };

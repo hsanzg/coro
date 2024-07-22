@@ -1,338 +1,254 @@
 // The following doc comment is kept in sync with the README.md file. Please
 // run the `cargo sync-readme` command after modifying the comment contents.
-//! This crate provides stackful, first-class asymmetric coroutines.
-// todo: improve crate docs; include the following:
-// The solution taken by other stackful coroutine libraries is to provide
-// a `Yielder` object passed to the `FnOnce` instance of the coroutine,
-// but we like the flexibility of suspending the execution of a coroutine
-// without carrying any object everywhere.
+//! This crate provides an implementation of stackful, first-class asymmetric
+//! coroutines in the Rust language.
+//!
+//! The general notion of _coroutines_, first discussed in the published
+//! literature by M. E. Conway \[_CACM_ **6** (1963), 396–408], extends the
+//! concept of subroutines by allowing them to share and pass data and control
+//! back and forth. A coroutine suspends execution of its program by invoking
+//! the [`yield`] function, which returns control to the caller. Invoking the
+//! [`resume`] method on a coroutine resumes execution of its program
+//! immediately after the point where it was last suspended.
+//!
+//! The Rust language has built-in support for coroutines, but one cannot easily
+//! suspend their execution from within a nested function call. One way to solve
+//! this issue is to maintain a separate program stack for each coroutine. This
+//! approach takes more memory space, but one can employ pooling techniques to
+//! diminish the need for large allocations and liberations.
+//!
+//! The crux of this crate is the [`Coro`] type, which implements the built-in
+//! [`core::ops::Coroutine`] trait. The most noteworthy feature of this library
+//! is that it allows a coroutine to return control without the need to pass
+//! a "yielder" object around. (It's easy to achieve this by carefully aligning
+//! the program stack of a coroutine, so that we can deduce the location of a
+//! control record from the current stack pointer value alone.) This approach
+//! has the following disadvantage: the compiler can no longer prove that
+//! [`yield`] is always called from a coroutine. Nevertheless, the function
+//! will trigger a panic in the rare event that this invariant does not hold.
+//! It may be of interest to note that this faulty-call detection mechanism can
+//! slow down the action, because it needs to update a thread-local variable
+//! during each transfer of control. Experienced programmers can disable the
+//! `safe_yield` feature to skip the check, but we should mention that this
+//! can lead to undefined behavior in purely safe code. Another potential
+//! disadvantage of our implementation is that the program stacks of all
+//! coroutines must have the [same size].
+//!
+//! See the paper "Revisiting Coroutines" by A. L. de Moura and R. Ierusalimschy
+//! \[_ACM TOPLAS_ **31** (2009), 1–31] for the definitions of "stackful",
+//! "first-class" and "asymmetric" used above.
+//!
+// todo: add an example.
+//!
+//! [`yield`]: yield_
+//! [`resume`]: Coro::resume
+//! [same size]: STACK_SIZE
 
-#![feature(coroutine_trait)]
-#![feature(non_null_convenience)]
 #![feature(ptr_alignment_type)]
-#![feature(nonzero_ops)]
-#![feature(pointer_is_aligned)]
-#![feature(naked_functions)]
-#![feature(ptr_mask)]
+#![feature(coroutine_trait)]
 #![feature(ptr_as_uninit)]
+#![feature(ptr_mask)]
+#![feature(ptr_sub_ptr)]
 #![feature(strict_provenance)]
+#![feature(nonzero_ops)]
+#![feature(pointer_is_aligned_to)]
+#![feature(naked_functions)]
 #![feature(asm_const)]
-#![cfg_attr(not(feature = "std"), no_std)]
-extern crate alloc;
 
-pub(crate) mod arch;
+mod arch;
 pub(crate) mod os;
-pub(crate) mod stack;
+pub mod stack;
 
-#[cfg(feature = "std")]
-use crate::stack::StackPool;
-#[cfg(not(feature = "std"))]
-pub use crate::stack::StackPool;
-use crate::stack::{push_loc, Stack, StackOrientation};
-#[cfg(feature = "std")]
-use core::cell::RefCell;
+use crate::arch::STACK_FRAME_ALIGN;
+use crate::stack::{align_alloc, Stack, StackOrientation, StackPool, COMMON_POOL};
 use core::marker::PhantomData;
-use core::mem::{size_of, ManuallyDrop};
+use core::mem::ManuallyDrop;
 use core::num::NonZeroUsize;
 use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
 use core::ptr::{Alignment, NonNull};
 
-#[cfg(feature = "std")]
-thread_local! {
-    /// A per-thread pool of available program stacks.
-    static STACK_POOL: RefCell<StackPool> = const { RefCell::new(StackPool::new()) };
-}
-
 /// The control record of a [coroutine], used to store and restore the context
 /// needed by the coroutine during a [transfer of control].
 ///
-/// Any bit pattern is valid for this type; in particular, it is safe to
-/// [transmute] an initialized array of `size_of::<Control>()` bytes into a
-/// `Control`. The [`current_control`] function takes advantage of this fact.
-///
-/// [coroutine]: Coroutine
+/// [coroutine]: Coro
 /// [transfer of control]: arch::transfer_control
-/// [transmute]: core::mem::transmute
-#[repr(C)] // The order of fields and the alignment of the struct are important.
 struct Control {
     /// If the coroutine has not been activated yet, the address of a
     /// [trampoline function] that immediately bounces to its associated
     /// coroutine. If the coroutine is active, the location of the first
     /// instruction to execute when it reaches a suspension point or terminates.
-    /// Otherwise the location immediately after the point where the coroutine
-    /// was last suspended.
+    /// Else (namely if the coroutine has completely finished its execution)
+    /// a [null pointer].
     ///
     /// This field is of use when [resuming] a coroutine that has not [finished]
     /// its execution, because it does so at the point where it last left off.
     ///
-    /// [`trampoline` function]: Coro::new
+    /// [trampoline function]: Coro::new
+    /// [null pointer]: core::ptr::null
     /// [resuming]: Coro::resume
     /// [finished]: Coro::is_finished
     instr_ptr: *const u8,
     /// Analogous to [`instr_ptr`], the value of the stack pointer register
     /// just before a transfer of control involving the coroutine associated
-    /// with this control record.
+    /// with this control record. Just after the coroutine has finished
+    /// successfully, this field links to its return value.
     ///
     /// [`instr_ptr`]: Self::instr_ptr
-    stack_ptr: *const u8,
-    /// Whether the coroutine has completely finished its execution.
-    finished: Finished,
+    stack_ptr: NonNull<u8>,
 }
 
 impl Control {
-    /// The fixed number of cells at the bottom of a [program stack] reserved
-    /// for special use by the [`resume`] and [`yield`] functions, which perform
-    /// transfer of control between coroutines. For this reason it is undefined
-    /// behavior for a [coroutine] to write onto the first `SIZE` bytes (in
-    /// the [direction] of stack growth) starting at the [bottom] of its
-    /// program stack.
-    ///
-    /// This value is such that the initial stack pointer address meets the
-    /// ABI-required minimum alignment requirements in the current architecture.
-    ///
-    /// [program stack]: Stack
-    /// [`resume`]: Coro::resume
-    /// [`yield`]: yield_
-    /// [coroutine]: Coro
-    /// [direction]: StackOrientation
-    /// [bottom]: Stack::bottom
-    /// [starting address]: Stack::start
-    /// [size]: Stack::size
-    /// [page size]: os::page_size
     pub const SIZE: usize = size_of::<Self>();
-}
-
-/// Indicates whether a [coroutine] has completed its computations or not.
-///
-/// This type is very much like a wrapper around a `bool` variable, except that
-/// it can hold any _initialized_ bit pattern. This relaxed representation helps
-/// us to check that the [current program stack] belongs to a [coroutine], and
-/// hence that its [bottommost] cells of memory represent a valid [control record].
-/// This detection mechanism is not foolproof, however, because the original
-/// program stack (which is not associated with any coroutine) may contain
-/// a [valid] `Finished` value in the place supposedly reserved for the
-/// `finished` field of a [`Control`] object. The good news is that the bit
-/// representations of the [`YES`] and [`NO`] constants were chosen completely
-/// at random, so this event ought to occur very rarely. The bad news is that
-/// this "probing" technique can easily lead to undefined behavior: Even if the
-/// [`Control`] type accepts any bit pattern, the relevant [`Control::SIZE`]-byte
-/// block of consecutive memory locations must all be within the bounds of a
-/// single allocated object. (As the documentation of [`ptr::read`] states, each
-/// stack-allocated variable is considered to be a separate allocated object in
-/// Rust.) The `coro` library cannot uphold this invariant in general, but the
-/// danger is low in practice: Calling [`yield`] from outside a coroutine will
-/// almost always lead to a panic (the desired outcome!) or a memory-protection
-/// fault (a particular manifestation of undefined behavior) on most platforms.
-/// If we were to skip the check, the effects of a faulty call to [`yield`]
-/// would be extremely difficult to debug. For example, the program may jump
-/// the control to any location in memory. The key fact is that proper use of
-/// the library will not lead to any memory safety violations. We hope that
-/// future static code analysis tools will allow us to verify that every call
-/// to [`yield`] in a program appears within the sections of code exclusively
-/// executed by coroutines. This would eliminate the need for the fragile check
-/// just explained.
-///
-/// The size of this type is platform-dependent, because it takes care of
-/// bringing the [initial stack pointer] value of a [coroutine] into alignment.
-///
-/// [coroutine]: Coro
-/// [current program stack]: Stack
-/// [bottommost]: Control::SIZE
-/// [control record]: Control
-/// [valid]: Self::check_valid
-/// [`YES`]: Self::YES
-/// [`NO`]: Self::NO
-/// [`ptr::read`]: core::ptr::read
-/// [`yield`]: yield_
-/// [initial stack pointer]: Stack::initial_ptr
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Finished(usize);
-
-impl Finished {
-    // todo: replace constants by randomly-chosen values.
-    /// The coroutine has completely finished its execution.
-    pub const YES: Self = Self(0xF00);
-    /// The coroutine either has not yet started execution, is active, or has
-    /// reached a suspension point.
-    pub const NO: Self = Self(0xF01);
-
-    /// Panics if this object does not represent one of the two possible
-    /// termination states of a [coroutine]. Otherwise does nothing.
-    ///
-    /// [coroutine]: Coro
-    pub fn check_valid(self) {
-        assert!(
-            self == Self::YES || self == Self::NO,
-            "invalid coroutine termination state {:#X}; was `yield` called from outside a coroutine?",
-            self.0
-        )
-    }
 }
 
 /// A stackful, first-class asymmetric coroutine.
 ///
-/// The general notion of _coroutines_, first discussed in the published
-/// literature by M. E. Conway \[_CACM_ **6** (1963), 396--408\], extends the
-/// concept of subroutines by allowing them to share and pass data and control
-/// back and forth. A coroutine suspends execution of its program by invoking
-/// the function [`yield`], which returns control to the caller. Invoking
-/// the [`resume`] method on a coroutine resumes execution of its program
-/// immediately after the point where it was last suspended.
+/// The [crate-level documentation] discusses this type in more detail.
 ///
-/// The Rust language has built-in support for coroutines, but one cannot easily
-/// suspend their execution from within a nested function call. One way to solve
-/// this problem is to maintain a separate [program stack] for each coroutine.
-/// This approach usually takes more memory space; we employ [pooling techniques]
-/// to diminish the need for large allocations and liberations.
-///
-/// See the paper "Revisiting Coroutines" by A. L. de Moura and R. Ierusalimschy
-/// \[_ACM TOPLAS_ **31** (2009), 1--31] for the definitions of "stackful",
-/// "first-class" and "asymmetric" used above.
-///
-/// [`yield`]: yield_
-/// [`resume`]: Coroutine::resume
-/// [program stack]: Stack
-/// [pooling techniques]: StackPool
-pub struct Coro<'f> {
+/// [crate-level documentation]: crate
+pub struct Coro<Return> {
     /// The program stack of the coroutine, which [`drop`] returns to the
     /// [thread-local storage pool] when the coroutine is no longer needed.
     ///
     /// [`drop`]: Self::drop
-    /// [thread-local storage pool]: STACK_POOL
+    /// [thread-local storage pool]: COMMON_POOL
     #[cfg(feature = "std")]
     stack: ManuallyDrop<Stack>,
     /// The program stack of the coroutine, which is freed when the coroutine
-    /// is dropped. Alternatively, [`StackPool::give_from`] returns the program
-    /// stack to a pool of available storage once the coroutine has completely
-    /// finished its execution.
+    /// is dropped. Alternatively, [`StackPool::give_from`] returns the stack
+    /// to a particular pool of available storage once the coroutine has
+    /// completely finished its execution.
+    ///
+    /// [`StackPool::give_from`]: stack::StackPool::give_from
     #[cfg(not(feature = "std"))]
     stack: Stack,
     /// A coroutine acts as though it contains a reference to the [`FnOnce`]
-    /// instance in the [control record] of its [program stack].
+    /// instance in its [program stack].
     ///
-    /// [control record]: Control
     /// [program stack]: Stack
-    phantom: PhantomData<&'f ()>,
+    phantom: PhantomData<fn() -> Return>,
 }
 
-impl<'f> Coro<'f> {
-    // todo: The stack size should be configurable through an environment variable.
-    /// The fixed size in bytes of the [program stack] for a coroutine.
-    /// We currently use Rust's [default stack size] for a thread, 2 MiB.
-    ///
-    /// [program stack]: Stack
-    /// [default stack size]: std::thread#stack-size
-    const STACK_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1 << 21) };
-    /// The minimum alignment requirement for the [program stack] of a coroutine.
-    /// Functions such as [`current_control`] require that this quantity is at
-    /// least [`STACK_SIZE`], because they need to locate the [start] of the
-    /// current program stack from the stack pointer value alone.
-    ///
-    /// [program stack]: Stack
-    /// [`STACK_SIZE`]: Self::STACK_SIZE
-    /// [start]: Stack::start
-    const STACK_ALIGN: Alignment = unsafe { Alignment::new_unchecked(Self::STACK_SIZE.get()) };
+/// The fixed size in bytes of the [program stack] of a [coroutine].
+/// We currently use Rust's [default stack size] for a thread, 2 MiB.
+///
+/// [program stack]: Stack
+/// [coroutine]: Coro
+/// [default stack size]: std::thread#stack-size
+// todo: this value should be configurable through an environment variable.
+pub const STACK_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1 << 21) };
 
-    /// Creates a new coroutine that is to run the provided [`FnOnce`] instance
-    /// on an independent [program stack] from a thread-local [pool of memory].
+/// The minimum alignment requirement for the [program stack] of a [coroutine].
+///
+/// This quantity must match the [size] in bytes of any program stack, because
+/// some internal routines need to locate the start of the current program stack
+/// from the stack pointer value alone.
+///
+/// [program stack]: Stack
+/// [coroutine]: Coro
+/// [size]: STACK_SIZE
+pub const STACK_ALIGN: Alignment = unsafe { Alignment::new_unchecked(STACK_SIZE.get()) };
+
+impl<Return> Coro<Return> {
+    /// Creates a coroutine that is to run the provided [`FnOnce`] instance on
+    /// an independent [program stack] (of size [`STACK_SIZE`]) from a
+    /// thread-local [pool of memory].
     ///
     /// [program stack]: Stack
-    /// [pool of memory]: STACK_POOL
-    #[cfg(feature = "std")]
-    #[must_use = "method creates a coroutine but does not begin its execution"]
-    pub fn new<F: FnOnce() + 'f>(f: F) -> Self {
-        STACK_POOL.with_borrow_mut(|pool| Self::with_stack_from(pool, f))
+    /// [pool of memory]: COMMON_POOL
+    pub fn new<F>(f: F) -> Self
+    where
+        F: FnOnce() -> Return + 'static,
+    {
+        COMMON_POOL.with_borrow_mut(|pool| Self::with_stack_from(pool, f))
     }
 
     /// Creates a new coroutine that is to run the provided [`FnOnce`] instance
-    /// on an independent [program stack] from the pool of available storage.
+    /// on an independent [program stack] from a pool of available storage.
+    ///
+    /// If the `std` feature is enabled, the coroutine's destructor returns
+    /// the stack to a thread-local [pool of memory]; otherwise the stack
+    /// is dropped. One can also return the stack to a different pool of
+    /// available storage by calling [`StackPool::give_from`], provided that
+    /// the coroutine has completely finished its execution.
     ///
     /// [program stack]: Stack
-    #[must_use = "method creates a coroutine but does not begin its execution"]
-    pub fn with_stack_from<F: FnOnce() + 'f>(pool: &mut StackPool, f: F) -> Self {
-        // Before we can activate the coroutine (and invoke `f`) upon the first
-        // call to `resume`, we need to save the old context at the top of the
-        // current program stack. The default ABI in Rust does not define the
-        // set of callee-saved registers, so we must jump through a trampoline
-        // function with an explicit calling convention immediately after the
-        // function `arch::transfer_control` activates the coroutine for the
-        // first time.
-        extern "system" fn trampoline<F: FnOnce()>() -> ! {
-            // todo: outdated; update comment.
-            // Read the address of the `FnOnce` instance from the control record
-            // within the program stack of the coroutine. Then make a bitwise
-            // copy of the coroutine on this new stack, because that's the only
-            // way to call it (safely).
+    /// [pool of memory]: COMMON_POOL
+    #[allow(rustdoc::broken_intra_doc_links)]
+    pub fn with_stack_from<F>(pool: &mut StackPool, f: F) -> Self
+    where
+        F: FnOnce() -> Return + 'static,
+    {
+        // Before the first call to `resume` invokes `f`, it needs to save the
+        // old context at the top of the current program stack. The default ABI
+        // in Rust does not define the set of callee-saved registers, so we must
+        // jump through a trampoline function with an explicit calling convention
+        // immediately after `arch::transfer_control` activates the coroutine
+        // for the first time.
+        extern "system" fn trampoline<F, Return>() -> !
+        where
+            F: FnOnce() -> Return + 'static,
+        {
+            // Make a bitwise copy of the `FnOnce` instance on the new stack,
+            // because that's the only way to call it safely.
             let stack_start = unsafe { stack_start() };
-            let bottom_ptr = match StackOrientation::current() {
+            let stack_bottom = match StackOrientation::current() {
+                // SAFETY:
                 StackOrientation::Upwards => unsafe { stack_start.byte_add(Control::SIZE) },
                 StackOrientation::Downwards => unsafe {
-                    stack_start.byte_add(Coro::STACK_SIZE.get() - Control::SIZE)
+                    stack_start.byte_add(STACK_SIZE.get() - Control::SIZE)
                 },
             };
-            let (_, f_ptr) = push_loc::<F>(bottom_ptr);
+            let f_ptr = align_alloc::<F>(stack_bottom, Alignment::of::<F>());
             let f = unsafe { f_ptr.read() };
-
-            /*let coro_fn: F = {
-                // SAFETY: We have exclusive access to the stack, because the
-                //         owner of this coroutine just transferred control to
-                //         this function and is therefore suspended.
-                let control = unsafe { current_control() };
-                // Take the closure out of the control record, so that method
-                // `is_finished` can distinguish between the case in which the
-                // coroutine has not yet started, and the case in which it has
-                // finished its execution.
-                let fn_ptr = control
-                    .coro_fn
-                    .take()
-                    .expect("closure pointer should be nonnull on first activation")
-                    .cast();
-                // Read the closure from `fn_ptr` without moving it.
-                // SAFETY: `Coro::new` takes ownership of the closure, and it
-                //         must return before the coroutine can be activated.
-                //         Hence `trampoline` is the only function that can
-                //         reference the closure at this point.
-                unsafe { fn_ptr.read() }
-                // Destroy the exclusive reference to `control` prior to calling
-                // the closure, because `yield` also requires exclusive access
-                // to the control record.
-            };*/
-            // Execute the provided closure in the stack of the coroutine.
-            f();
-            // At this point the coroutine has finished its execution, and `f`
-            // has been destroyed. (The latter observation is important, because
-            // there's no guarantee that the local variables in scope will be
-            // dropped before `return_control` is invoked.) It remains to
-            // restore the stack pointer to the value present in the control
-            // record, and return to the last caller of `resume`. Any attempt
-            // to resume the coroutine ever again will trigger a panic.
+            // We are ready to execute the user's `FnOnce` instance.
+            let ret_value = ManuallyDrop::new(f());
+            // At this point the coroutine has almost finished its execution,
+            // and `f` has been destroyed. (The latter observation is important,
+            // because there's no guarantee that the local variables in scope
+            // will be dropped before `return_control` is invoked below.) It
+            // remains to restore the stack pointer to the value present in the
+            // control record, and return to the last caller of `resume`. Any
+            // attempt to resume the coroutine ever again will trigger a panic.
             // SAFETY: We have exclusive access to the stack.
             let control = unsafe { current_control() };
-            unsafe { arch::return_control(control) }
+            unsafe { arch::return_control(control, NonNull::from(&ret_value)) }
         }
-        // Allocate a stack for the coroutine, place `f` at the bottom, and
-        // initialize the control record as follows: First set the value of
-        // the stack pointer to the location one byte past the end of the
-        // copied `FnOnce` instance (in the stack growth direction). Next,
-        // arrange things so that the coroutine begins its execution at the
-        // first instruction of the `trampoline` function.
-        let stack = pool.take(Self::STACK_SIZE, Self::STACK_ALIGN);
-        let stack_ptr = stack.initial_ptr();
-        let (stack_ptr, f_ptr) = push_loc::<F>(stack_ptr);
-        // SAFETY: todo
+        // Allocate a stack for the coroutine.
+        let stack = pool.take(STACK_SIZE, STACK_ALIGN);
+        // Place `f` at the bottom of the new stack, and initialize the control
+        // record as follows: First arrange things so that the coroutine begins
+        // its execution at the first instruction of the trampoline function.
+        // Then set the value of the stack pointer to the first appropriate
+        // location above the copied `f` in the stack growth direction.
+        let (f_ptr, stack_ptr) = stack.align_alloc(stack.bottom());
+        // SAFETY: We know that `f_ptr` is aligned and points to a cell of the
+        //         stack. Also, the present function is the only one that can
+        //         access the stack at this moment.
         unsafe { f_ptr.write(f) };
-
-        // SAFETY: We have exclusive access to the entire stack, including
-        //         its control record.
+        // Immediately before the first transfer of control to the coroutine,
+        // its stack pointer needs to point to the beginning of the first frame
+        // (which is associated with the trampoline function). The purpose of
+        // the following `align_alloc` call is to respect the frame alignment
+        // restrictions set by the ABI calling convention.
+        let stack_ptr = align_alloc::<()>(stack_ptr, STACK_FRAME_ALIGN);
+        // SAFETY: We do not support any platform where the stack may occupy
+        //         the first page of memory (also known as the "zero page").
+        //         Since `STACK_FRAME_ALIGN` is much smaller than the page size,
+        //         this implies that the stack pointer cannot be set to zero
+        //         after alignment.
+        let stack_ptr = unsafe { NonNull::new_unchecked(stack_ptr) }.cast();
+        // SAFETY: Again, we have exclusive access to the control record at the
+        //         bottom of the stack.
         let control = unsafe { stack.control().as_uninit_mut() };
         control.write(Control {
-            stack_ptr: stack_ptr.as_ptr(),
-            // SAFETY: Function pointers cannot be null.
-            instr_ptr: trampoline::<F> as *const _,
-            finished: Finished::NO,
+            instr_ptr: trampoline::<F, Return> as *const _,
+            stack_ptr,
         });
+        // If the `std` feature is enabled, we must be careful not to drop the
+        // stack once the coroutine is destroyed. Instead, we need to return it
+        // to the thread-local pool of available storage.
         #[cfg(feature = "std")]
         let stack = ManuallyDrop::new(stack);
         Self {
@@ -355,19 +271,80 @@ impl<'f> Coro<'f> {
         unsafe { self.stack.control().as_mut() }
     }
 
-    /*/// Checks if the coroutine has completely finished its execution.
-    fn is_finished(&self) -> bool {
-        // The stack of a coroutine is empty if and only if it has either not
-        // yet started execution or it has already terminated. To distinguish
-        // between the two cases, we can exploit the fact that the trampoline
-        // function clears the `coro_fn` field of the control record during
-        // the first activation of the coroutine. Of course, the stack is empty
-        // if the address in `control.stack_ptr` points to the item one byte
-        // past the end of the control structure in the stack growth direction;
-        // see `Stack::initial_ptr` for details.
-        let control = self.control();
-        control.coro_fn.is_none() && self.stack.initial_ptr() == control.stack_ptr
-    }*/
+    /// Checks if the coroutine has completely finished its execution.
+    pub fn is_finished(&self) -> bool {
+        // The coroutine clears the `instr_ptr` field of the control record
+        // when the trampoline function exits via `arch::return_control`.
+        self.control().instr_ptr.is_null()
+    }
+}
+
+impl<Return> Drop for Coro<Return> {
+    fn drop(&mut self) {
+        COMMON_POOL.with_borrow_mut(|pool| {
+            // SAFETY: The `self.stack` variable is not used again.
+            let stack = unsafe { ManuallyDrop::take(&mut self.stack) };
+            pool.give(stack);
+        });
+    }
+}
+
+impl<Return> Coroutine for Coro<Return> {
+    type Yield = ();
+    type Return = Return;
+
+    fn resume(self: Pin<&mut Self>, _arg: ()) -> CoroutineState<Self::Yield, Self::Return> {
+        // todo: document safety properties.
+        let coro = self.get_mut();
+        {
+            let control = coro.control_mut();
+            unsafe { arch::transfer_control(control) };
+        }
+        if coro.is_finished() {
+            let ret_val_addr = coro.control().stack_ptr.cast();
+            // Make a bitwise copy of the return value, so that it is safe to
+            // destroy the coroutine stack.
+            let ret_val = unsafe { ret_val_addr.read() };
+            CoroutineState::Complete(ret_val)
+        } else {
+            CoroutineState::Yielded(())
+        }
+    }
+}
+
+/// Transfers control back to the computation that last resumed the active
+/// coroutine.
+///
+/// # Panics
+///
+/// This function must be called from within a coroutine.
+///
+/// see the next section.
+// todo: finish documentation.
+///
+/// # Safety
+pub fn yield_() {
+    // todo: check that we are within the active coroutine.
+    let control = unsafe { current_control() };
+    unsafe { arch::transfer_control(control) };
+}
+
+/// Returns the lowest location within the [current stack] of a [coroutine],
+/// including its guard page.
+///
+/// # Safety
+///
+/// This function must be called from within a coroutine.
+///
+/// [current stack]: Stack
+/// [coroutine]: Coro
+unsafe fn stack_start() -> NonNull<u8> {
+    arch::stack_ptr()
+        // This transformation is the `NonNull`-equivalent of `pointer::mask`.
+        // SAFETY: The stack does not occupy the first page of memory by
+        //         assumption (see `arch::stack_ptr`), hence its starting
+        //         location is positive.
+        .map_addr(|a| NonZeroUsize::new_unchecked(a.get() & STACK_ALIGN.mask()))
 }
 
 /// Returns a reference to the control record of the active coroutine.
@@ -385,9 +362,7 @@ unsafe fn current_control<'a>() -> &'a mut Control {
         StackOrientation::Upwards => stack_start,
         // SAFETY: The program stack of the coroutine consists of `STACK_SIZE`
         //         bytes, a quantity bigger than `Control::SIZE`.
-        StackOrientation::Downwards => stack_start
-            .byte_add(Coro::STACK_SIZE.get())
-            .byte_sub(Control::SIZE),
+        StackOrientation::Downwards => stack_start.byte_add(STACK_SIZE.get() - Control::SIZE),
     };
     // SAFETY: This method is called by a coroutine whose control record was
     //         initialized in `Control::new`. The pointer is aligned because
@@ -397,74 +372,18 @@ unsafe fn current_control<'a>() -> &'a mut Control {
     control_ptr.as_mut()
 }
 
-unsafe fn stack_start() -> NonNull<u8> {
-    arch::stack_ptr()
-        // This transformation is the `NonNull`-equivalent of `pointer::mask`.
-        // SAFETY: The stack does not occupy the first page of memory by
-        //         assumption (see `arch::stack_ptr`), hence its starting
-        //         location is positive.
-        .map_addr(|a| NonZeroUsize::new_unchecked(a.get() & Coro::STACK_ALIGN.mask()))
-}
-
-#[cfg(feature = "std")]
-impl<'f> Drop for Coro<'f> {
-    fn drop(&mut self) {
-        STACK_POOL.with_borrow_mut(|pool| {
-            // SAFETY: The `self.stack` variable is not used again.
-            let stack = unsafe { ManuallyDrop::take(&mut self.stack) };
-            pool.give(stack);
-        });
-    }
-}
-
-impl<'f> Coroutine for Coro<'f> {
-    type Yield = ();
-    type Return = ();
-
-    fn resume(self: Pin<&mut Self>, _arg: ()) -> CoroutineState<Self::Yield, Self::Return> {
-        // todo: document + add safety comments
-        let coro = self.get_mut();
-        {
-            let control = coro.control_mut();
-            unsafe { arch::transfer_control(control) };
-        }
-        let control = coro.control_mut();
-        if control.finished == Finished::YES {
-            CoroutineState::Complete(())
-        } else {
-            CoroutineState::Yielded(())
-        }
-    }
-}
-
-/// "save and restore the context needed by each coroutine"
-pub fn yield_() {
-    // todo: this is going to be really complicated, but fail if this function
-    //       was not called from within a coroutine. Otherwise we would need
-    //       to mark this function as "unsafe".
-    // todo: this can actually lead to undefined behavior. Document extensively.
-    let control = unsafe { current_control() };
-    unsafe { arch::transfer_control(control) };
-}
-
-// todo: Convert to integration tests.
-// todo: Test unwinding. (This is a big one.)
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use alloc::string::String;
-
-    // todo: Make most test use a standalone stack pool, and test Coro::new
-    //       separately.
+    use crate::{yield_, Coro};
+    use std::ops::{Coroutine, CoroutineState};
+    use std::pin::Pin;
 
     #[test]
-    #[cfg(feature = "std")]
     fn simple() {
-        eprintln!("[c] creating new");
         let mut coro = Coro::new(|| {
-            eprintln!("[c] first point");
+            eprintln!("[c] activated for the first time");
             yield_();
-            eprintln!("[c] resumed fine, returning");
+            eprintln!("[c] resumed fine, exiting");
         });
         match Pin::new(&mut coro).resume(()) {
             CoroutineState::Yielded(_) => {
@@ -480,56 +399,34 @@ mod tests {
         }
     }
 
-    /*#[test]
-    fn foo() {
+    #[test]
+    fn return_value() {
+        let mut coro = Coro::new(|| 12345);
+        assert_eq!(
+            Pin::new(&mut coro).resume(()),
+            CoroutineState::Complete(12345)
+        );
+    }
+
+    #[test]
+    fn lots_of_yields() {
+        const ITER_COUNT: usize = 10_000_000;
         let mut coro = Coro::new(|| {
-            eprintln!("[c] started");
-            yield_();
-            eprintln!("[c] first resume");
-            yield_();
-            eprintln!("[c] second resume");
+            let mut res = 0;
+            for i in 0..ITER_COUNT {
+                res |= core::hint::black_box(i);
+                yield_();
+            }
+            res
         });
-        match Pin::new(&mut coro).resume(()) {
-            CoroutineState::Yielded(_) => eprintln!("[m] yielded once"),
-            CoroutineState::Complete(_) => panic!("completed before"),
-        };
-        match Pin::new(&mut coro).resume(()) {
-            CoroutineState::Yielded(_) => eprintln!("[m] yielded twice"),
-            CoroutineState::Complete(_) => panic!("completed before"),
+        let mut res = 0;
+        for i in 0..ITER_COUNT {
+            res |= i;
+            assert_eq!(Pin::new(&mut coro).resume(()), CoroutineState::Yielded(()));
         }
-        match Pin::new(&mut coro).resume(()) {
-            CoroutineState::Yielded(_) => panic!("[m] yielded thrice"),
-            CoroutineState::Complete(_) => eprintln!("completed"),
-        }
-    }*/
-
-    /*#[test]
-    fn foo() {
-        struct Baz<'a, F> {
-            f_ptr: *const u8,
-            ph: PhantomData<&'a F>,
-        }
-
-        impl<'a, F: FnMut() + 'a> Baz<'a, F> {
-            fn new(f: F) -> Self {
-                let f = ManuallyDrop::new(f);
-                Self {
-                    f_ptr: &f as *const _ as *const u8,
-                    ph: PhantomData,
-                }
-            }
-
-            fn call(self) {
-                let foo = self.f_ptr as *const F;
-                let f = unsafe { foo.read() };
-                f();
-            }
-        }
-
-        let x = String::from("hello");
-        let test = move || assert!(x == "hello");
-        let baz = Baz::new(test);
-        baz.call();
-        // test();
-    }*/
+        assert_eq!(
+            Pin::new(&mut coro).resume(()),
+            CoroutineState::Complete(res)
+        );
+    }
 }

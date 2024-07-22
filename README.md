@@ -10,7 +10,44 @@
 
 <!-- cargo-sync-readme start -->
 
-This crate provides stackful, first-class asymmetric coroutines.
+This crate provides an implementation of stackful, first-class asymmetric
+coroutines in the Rust language.
+
+The general notion of _coroutines_, first discussed in the published
+literature by M. E. Conway \[_CACM_ **6** (1963), 396–408], extends the
+concept of subroutines by allowing them to share and pass data and control
+back and forth. A coroutine suspends execution of its program by invoking
+the [`yield`] function, which returns control to the caller. Invoking the
+[`resume`] method on a coroutine resumes execution of its program
+immediately after the point where it was last suspended.
+
+The Rust language has built-in support for coroutines, but one cannot easily
+suspend their execution from within a nested function call. One way to solve
+this issue is to maintain a separate program stack for each coroutine. This
+approach takes more memory space, but one can employ pooling techniques to
+diminish the need for large allocations and liberations.
+
+The crux of this crate is the [`Coro`] type, which implements the built-in
+[`core::ops::Coroutine`] trait. The most noteworthy feature of this library
+is that it allows a coroutine to return control without the need to pass
+a "yielder" object around. (It's easy to achieve this by carefully aligning
+the program stack of a coroutine, so that we can deduce the location of a
+control record from the current stack pointer value alone.) This approach
+has the following disadvantage: the compiler can no longer prove that
+[`yield`] is always called from a coroutine. Nevertheless, the function
+will trigger a panic in the rare event that this invariant does not hold.
+It may be of interest to note that this faulty-call detection mechanism can
+slow down the action, because it needs to update a thread-local variable
+during each transfer of control. Experienced programmers can disable the
+`safe_yield` feature to skip the check, but we should mention that this
+can lead to undefined behavior in purely safe code. Another potential
+disadvantage of our implementation is that the program stacks of all
+coroutines must have the [same size].
+
+See the paper "Revisiting Coroutines" by A. L. de Moura and R. Ierusalimschy
+\[_ACM TOPLAS_ **31** (2009), 1–31] for the definitions of "stackful",
+"first-class" and "asymmetric" used above.
+
 
 <!-- cargo-sync-readme end -->
 

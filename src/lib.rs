@@ -38,11 +38,26 @@
 //! \[_ACM TOPLAS_ **31** (2009), 1–31] for the definitions of "stackful",
 //! "first-class" and "asymmetric" used above.
 //!
-// todo: add an example.
+//! This library incorporates ideas from two other implementations of stackful
+//! coroutines: [`corosensei`] by A. d'Antras, and [`libfringe`] by edef1c.
+//! Preliminary experiments seem to indicate that the three approaches can
+//! transfer control between coroutines with comparable efficiency, but `coro`
+//! is inferior with respect to platform support and stack unwinding. I put
+//! together this library for my own education, so significant improvements
+//! are possible.
+//!
+//! # Example
+//!
+//! Process the nodes in an extended tree in pairs of two.
+//! ```
+//!
+//! ```
 //!
 //! [`yield`]: yield_
 //! [`resume`]: Coro::resume
 //! [same size]: STACK_SIZE
+//! [`libfringe`]: https://github.com/edef1c/libfringe
+//! [`corosensei`]: https://github.com/Amanieu/corosensei
 
 #![feature(ptr_alignment_type)]
 #![feature(coroutine_trait)]
@@ -252,8 +267,8 @@ impl<Return> Coro<Return> {
         // SAFETY: We do not support any platform where the stack may occupy
         //         the first page of memory (also known as the "zero page").
         //         Since `STACK_FRAME_ALIGN` is much smaller than the page size,
-        //         this implies that the stack pointer cannot be set to zero
-        //         after alignment.
+        //         this implies that the stack pointer cannot become zero after
+        //         alignment.
         let stack_ptr = unsafe { NonNull::new_unchecked(stack_ptr) }.cast();
         // SAFETY: Again, we have exclusive access to the control record at the
         //         bottom of the stack.

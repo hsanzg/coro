@@ -322,7 +322,8 @@ impl<'a, Return> Coro<'a, Return> {
             // because that's the only way to call it safely.
             let stack_start = unsafe { stack_start() };
             let stack_bottom = match StackOrientation::current() {
-                // SAFETY:
+                // SAFETY: `Control::SIZE` is much smaller than the size of the
+                //         stack, so the resulting pointer is within bounds.
                 StackOrientation::Upwards => unsafe { stack_start.byte_add(Control::SIZE) },
                 StackOrientation::Downwards => unsafe {
                     stack_start.byte_add(STACK_SIZE.get() - Control::SIZE)
@@ -423,14 +424,24 @@ impl<'a, Return> Coroutine for Coro<'a, Return> {
     type Return = Return;
 
     fn resume(self: Pin<&mut Self>, _arg: ()) -> CoroutineState<Self::Yield, Self::Return> {
-        // todo: document safety properties.
+        // Get an exclusive reference to the inner coroutine value, and ensure
+        // that its computation is only partially complete before we attempt to
+        // activate it.
         let coro = self.get_mut();
         assert!(!coro.is_finished(), "coroutine resumed after completion");
         {
             let control = coro.control_mut();
+            // SAFETY: The instruction and stack pointer values stored in the
+            //         control record are valid. Also, the resumed coroutine
+            //         cannot access the memory referenced by `coro`.
             unsafe { arch::transfer_control(control) };
+            // The previous function modifies the control record, so we must not
+            // access its contents through the unique reference. Let's prevent
+            // any future mistakes by destroying the `control` variable here.
         }
         if coro.is_finished() {
+            // The `stack_ptr` control record field now links to the return
+            // value of the coroutine.
             let ret_val_addr = coro.control().stack_ptr.cast();
             // Make a bitwise copy of the return value, so that it is safe to
             // destroy the coroutine stack.
@@ -449,10 +460,10 @@ impl<'a, Return> Coroutine for Coro<'a, Return> {
 ///
 /// This function must be called from within a coroutine.
 ///
-/// see the next section.
+// see the next section.
 // todo: finish documentation.
-///
-/// # Safety
+//
+// # Safety
 pub fn yield_() {
     // todo: check that we are within the active coroutine.
     let control = unsafe { current_control() };

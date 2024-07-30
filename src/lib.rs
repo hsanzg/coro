@@ -63,8 +63,10 @@
 //! use std::ops::{Coroutine, CoroutineState};
 //! use std::pin::Pin;
 //! use coro::{Coro, yield_};
+//! # #[cfg(not(feature = "std"))]
+//! # use coro::stack::StackPool;
 //!
-//! # #[derive(Clone)]
+//! #[derive(Clone)]
 //! struct Node {
 //!     children: Vec<Node>,
 //! }
@@ -80,8 +82,17 @@
 //! fn similar(first: &Node, second: &Node) -> bool {
 //!     let m = Cell::new(0);
 //!     let m_prime = Cell::new(0);
+//!     # #[cfg(feature = "std")]
 //!     let mut first_coro = Coro::new(|| visit(first, &m));
+//!     # #[cfg(feature = "std")]
 //!     let mut second_coro = Coro::new(|| visit(second, &m_prime));
+//!     # // Alternate implementation for use in `no_std` environments.
+//!     # #[cfg(not(feature = "std"))]
+//!     let mut pool = StackPool::new();
+//!     # #[cfg(not(feature = "std"))]
+//!     # let mut first_coro = Coro::with_stack_from(&mut pool, || visit(first, &m));
+//!     # #[cfg(not(feature = "std"))]
+//!     # let mut second_coro = Coro::with_stack_from(&mut pool, || visit(second, &m_prime));
 //!     loop {
 //!         match (
 //!             Pin::new(&mut first_coro).resume(()),
@@ -156,7 +167,9 @@ pub(crate) mod os;
 pub mod stack;
 
 use crate::arch::STACK_FRAME_ALIGN;
-use crate::stack::{align_alloc, Stack, StackOrientation, StackPool, COMMON_POOL};
+#[cfg(feature = "std")]
+use crate::stack::COMMON_POOL;
+use crate::stack::{align_alloc, Stack, StackOrientation, StackPool};
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::num::NonZeroUsize;
@@ -269,6 +282,8 @@ impl<'a, Return> Coro<'a, Return> {
     ///
     /// [program stack]: Stack
     /// [pool of memory]: COMMON_POOL
+    #[cfg(feature = "std")]
+    #[must_use = "method creates a coroutine but does not begin its execution"]
     pub fn new<F>(f: F) -> Self
     where
         F: FnOnce() -> Return + 'a,
@@ -288,6 +303,7 @@ impl<'a, Return> Coro<'a, Return> {
     /// [program stack]: Stack
     /// [pool of memory]: COMMON_POOL
     #[allow(rustdoc::broken_intra_doc_links)]
+    #[must_use = "method creates a coroutine but does not begin its execution"]
     pub fn with_stack_from<F>(pool: &mut StackPool, f: F) -> Self
     where
         F: FnOnce() -> Return + 'a,
@@ -391,6 +407,7 @@ impl<'a, Return> Coro<'a, Return> {
     }
 }
 
+#[cfg(feature = "std")]
 impl<'a, Return> Drop for Coro<'a, Return> {
     fn drop(&mut self) {
         COMMON_POOL.with_borrow_mut(|pool| {
@@ -485,7 +502,7 @@ unsafe fn current_control<'a>() -> &'a mut Control {
     control_ptr.as_mut()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use crate::{yield_, Coro};
     use std::ops::{Coroutine, CoroutineState};

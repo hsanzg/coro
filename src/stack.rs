@@ -1,6 +1,7 @@
 use crate::os::{last_os_error, page_size};
 use crate::Control;
 use core::any::type_name;
+#[cfg(feature = "std")]
 use core::cell::RefCell;
 use core::num::NonZeroUsize;
 use core::ptr::{null_mut, Alignment, NonNull};
@@ -360,7 +361,7 @@ impl StackPool {
     ///
     /// This function panics if the coroutine has not finished execution yet.
     #[cfg(not(feature = "std"))]
-    pub fn give_from<F>(&mut self, coro: Coro<F>) {
+    pub fn give_from<F>(&mut self, coro: crate::Coro<F>) {
         assert!(
             coro.is_finished(),
             "cannot take stack of suspended coroutine"

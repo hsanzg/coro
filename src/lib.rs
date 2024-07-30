@@ -82,17 +82,17 @@
 //! fn similar(first: &Node, second: &Node) -> bool {
 //!     let m = Cell::new(0);
 //!     let m_prime = Cell::new(0);
-//!     # #[cfg(feature = "std")]
+//! #   #[cfg(feature = "std")]
 //!     let mut first_coro = Coro::new(|| visit(first, &m));
-//!     # #[cfg(feature = "std")]
+//! #   #[cfg(feature = "std")]
 //!     let mut second_coro = Coro::new(|| visit(second, &m_prime));
-//!     # // Alternate implementation for use in `no_std` environments.
-//!     # #[cfg(not(feature = "std"))]
-//!     let mut pool = StackPool::new();
-//!     # #[cfg(not(feature = "std"))]
-//!     # let mut first_coro = Coro::with_stack_from(&mut pool, || visit(first, &m));
-//!     # #[cfg(not(feature = "std"))]
-//!     # let mut second_coro = Coro::with_stack_from(&mut pool, || visit(second, &m_prime));
+//! #   // Alternate implementation for use in `no_std` environments.
+//! #   #[cfg(not(feature = "std"))]
+//! #   let mut pool = StackPool::new();
+//! #   #[cfg(not(feature = "std"))]
+//! #   let mut first_coro = Coro::with_stack_from(&mut pool, || visit(first, &m));
+//! #   #[cfg(not(feature = "std"))]
+//! #   let mut second_coro = Coro::with_stack_from(&mut pool, || visit(second, &m_prime));
 //!     loop {
 //!         match (
 //!             Pin::new(&mut first_coro).resume(()),

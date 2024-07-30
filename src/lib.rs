@@ -58,8 +58,7 @@
 //! $T_i$ and $T\'_i$ are similar for all $1\le i\le m$.
 //!
 //! ```
-//! #![feature(coroutine_trait)]
-//!
+//! # #![feature(coroutine_trait)]
 //! use std::cell::Cell;
 //! use std::ops::{Coroutine, CoroutineState};
 //! use std::pin::Pin;
@@ -95,42 +94,42 @@
 //!     }
 //! }
 //! # let first_tree = Node {
-//! #        children: vec![
-//! #            Node {
-//! #                children: vec![Node { children: vec![] }],
-//! #            },
-//! #            Node {
-//! #                children: vec![
-//! #                    Node { children: vec![] },
-//! #                    Node {
-//! #                        children: vec![Node { children: vec![] }],
-//! #                    },
-//! #                    Node { children: vec![] },
-//! #                ],
-//! #            },
-//! #        ],
-//! #    };
-//! #    let second_tree = first_tree.clone();
-//! #    assert!(similar(&first_tree, &second_tree));
+//! #     children: vec![
+//! #         Node {
+//! #             children: vec![Node { children: vec![] }],
+//! #         },
+//! #         Node {
+//! #             children: vec![
+//! #                 Node { children: vec![] },
+//! #                 Node {
+//! #                     children: vec![Node { children: vec![] }],
+//! #                 },
+//! #                 Node { children: vec![] },
+//! #             ],
+//! #         },
+//! #     ],
+//! # };
+//! # let second_tree = first_tree.clone();
+//! # assert!(similar(&first_tree, &second_tree));
 //! #
-//! #    let second_tree = Node {
-//! #        children: vec![
-//! #            Node {
-//! #                children: vec![Node { children: vec![] }],
-//! #            },
-//! #            Node {
-//! #                children: vec![
-//! #                    Node { children: vec![] },
-//! #                    Node {
-//! #                        children: vec![Node { children: vec![] }],
-//! #                    },
-//! #                    Node { children: vec![] },
-//! #                    Node { children: vec![] },
-//! #                ],
-//! #            },
-//! #        ],
-//! #    };
-//! #    assert!(!similar(&first_tree, &second_tree));
+//! # let second_tree = Node {
+//! #     children: vec![
+//! #         Node {
+//! #             children: vec![Node { children: vec![] }],
+//! #         },
+//! #         Node {
+//! #             children: vec![
+//! #                 Node { children: vec![] },
+//! #                 Node {
+//! #                     children: vec![Node { children: vec![] }],
+//! #                 },
+//! #                 Node { children: vec![] },
+//! #                 Node { children: vec![] },
+//! #             ],
+//! #         },
+//! #     ],
+//! # };
+//! # assert!(!similar(&first_tree, &second_tree));
 //! ```
 //!
 //! [`yield`]: yield_
@@ -150,6 +149,7 @@
 #![feature(pointer_is_aligned_to)]
 #![feature(naked_functions)]
 #![feature(asm_const)]
+#![cfg_attr(not(feature = "std"), no_std)]
 
 mod arch;
 pub(crate) mod os;

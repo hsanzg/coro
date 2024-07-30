@@ -10,11 +10,23 @@ use core::ptr::{Alignment, NonNull};
 /// always [nonnull].
 ///
 /// [nonnull]: core::ptr::null
-#[naked]
+// #[naked]
 pub extern "system" fn stack_ptr() -> NonNull<u8> {
     // The `rax` register is to contain the first return value under the
     // System V and Windows ABI calling conventions for the x86-64 architecture.
-    unsafe { asm!("mov rax, rsp", "ret", options(noreturn)) }
+    // todo: replace the current implementation by the following line, and mark this function as
+    //       #[naked] once https://github.com/rust-lang/rust/pull/127853#issuecomment-2257323333
+    //       is resolved.
+    // unsafe { asm!("mov rax, rsp", "ret", options(noreturn)) }
+    let mut sp: *mut u8;
+    unsafe {
+        asm!(
+            "mov {sp}, rsp",
+            sp = lateout(reg) sp,
+            options(nomem, nostack)
+        )
+    };
+    unsafe { NonNull::new_unchecked(sp) }
 }
 
 /// Resumes execution of a computation at the point where it was last suspended.

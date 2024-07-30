@@ -59,9 +59,9 @@
 //!
 //! ```
 //! # #![feature(coroutine_trait)]
-//! use std::cell::Cell;
-//! use std::ops::{Coroutine, CoroutineState};
-//! use std::pin::Pin;
+//! use core::cell::Cell;
+//! use core::ops::{Coroutine, CoroutineState};
+//! use core::pin::Pin;
 //! use coro::{Coro, yield_};
 //! # #[cfg(not(feature = "std"))]
 //! # use coro::stack::StackPool;
@@ -170,6 +170,7 @@ use crate::arch::STACK_FRAME_ALIGN;
 #[cfg(feature = "std")]
 use crate::stack::COMMON_POOL;
 use crate::stack::{align_alloc, Stack, StackOrientation, StackPool};
+use core::cell::Cell;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::num::NonZeroUsize;
@@ -227,6 +228,19 @@ impl Control {
     pub const SIZE: usize = size_of::<Self>();
 }
 
+#[cfg(feature = "safe_yield")]
+thread_local! {
+    /// The number of coroutines that were last activated on the current thread,
+    /// have not finished their execution, and are waiting for another coroutine
+    /// to return control to them by invoking [`yield`]. The [`Coro::resume`]
+    /// function increases the suspension depth by one, activates the coroutine,
+    /// waits for the coroutine to pass control back, and finally decreases the
+    /// suspension depth by one.
+    ///
+    /// [`yield`]: yield_
+    static SUSPEND_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
 /// A stackful, first-class asymmetric coroutine.
 ///
 /// The [crate-level documentation] discusses this type in more detail.
@@ -262,6 +276,7 @@ pub struct Coro<'a, Return> {
 /// [coroutine]: Coro
 /// [default stack size]: std::thread#stack-size
 // todo: this value should be configurable through an environment variable.
+#[allow(rustdoc::broken_intra_doc_links)] // allow `std::thread` reference in doc.
 pub const STACK_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1 << 21) };
 
 /// The minimum alignment requirement for the [program stack] of a [coroutine].
@@ -429,6 +444,14 @@ impl<'a, Return> Coroutine for Coro<'a, Return> {
         // activate it.
         let coro = self.get_mut();
         assert!(!coro.is_finished(), "coroutine resumed after completion");
+        // Update the suspension depth, which `yield` uses to determine whether
+        // it is being called from within a coroutine.
+        #[cfg(feature = "safe_yield")]
+        let prev_depth = SUSPEND_DEPTH.with(|c| {
+            let prev = c.get();
+            c.set(prev + 1);
+            prev
+        });
         {
             let control = coro.control_mut();
             // SAFETY: The instruction and stack pointer values stored in the
@@ -439,12 +462,14 @@ impl<'a, Return> Coroutine for Coro<'a, Return> {
             // access its contents through the unique reference. Let's prevent
             // any future mistakes by destroying the `control` variable here.
         }
+        #[cfg(feature = "safe_yield")]
+        SUSPEND_DEPTH.set(prev_depth);
         if coro.is_finished() {
-            // The `stack_ptr` control record field now links to the return
-            // value of the coroutine.
-            let ret_val_addr = coro.control().stack_ptr.cast();
             // Make a bitwise copy of the return value, so that it is safe to
-            // destroy the coroutine stack.
+            // destroy the coroutine stack (without dropping the return value).
+            let ret_val_addr = coro.control().stack_ptr.cast();
+            // SAFETY: The `stack_ptr` control record field now links to the
+            //         return value of the coroutine.
             let ret_val = unsafe { ret_val_addr.read() };
             CoroutineState::Complete(ret_val)
         } else {
@@ -456,17 +481,44 @@ impl<'a, Return> Coroutine for Coro<'a, Return> {
 /// Transfers control back to the computation that last resumed the active
 /// coroutine.
 ///
-/// # Panics
-///
-/// This function must be called from within a coroutine.
-///
-// see the next section.
-// todo: finish documentation.
-//
-// # Safety
+#[cfg_attr(
+    feature = "safe_yield",
+    doc = "# Panics
+
+This function panics if it is called from outside a coroutine."
+)]
+#[cfg_attr(
+    not(feature = "safe_yield"),
+    doc = r#"# Safety
+
+Calling this function from outside the active coroutine results in undefined
+behavior. This often causes a memory-protection fault on most platforms, but
+the effects of a faulty call to `yield` can be extremely difficult to debug.
+For example, the program may jump the control to any location in memory. In
+view of this danger, the reader may well ask why this function is not marked
+`unsafe`. Well, the `safe_yield` feature protects against this kind of issue
+without much loss of efficiency, and fortunately it is enabled by default. We
+consider the act of disabling the `safe_yield` feature unsafe "in itself", so
+that experienced programmers do not need to wrap every call to `yield` in an
+`unsafe` block. We hope that future static code analysis tools will allow us
+to verify that every call to `yield` in a program appears within the sections
+of code exclusively executed by coroutines. This would eliminate the need for
+the fast-but-not-free caller identification scheme."#
+)]
 pub fn yield_() {
-    // todo: check that we are within the active coroutine.
+    // Check that we are running in the active coroutine, in which case at least
+    // one other coroutine (or the main program) is waiting for this coroutine
+    // to suspend its execution.
+    #[cfg(feature = "safe_yield")]
+    assert!(
+        SUSPEND_DEPTH.get() > 0,
+        "cannot yield from outside a coroutine"
+    );
+    // SAFETY: We have exclusive access to the stack of the active coroutine,
+    //         including its control record.
     let control = unsafe { current_control() };
+    // SAFETY: The control record contains the context needed by the last caller
+    //         of `Coro::resume`.
     unsafe { arch::transfer_control(control) };
 }
 
@@ -513,36 +565,33 @@ unsafe fn current_control<'a>() -> &'a mut Control {
     control_ptr.as_mut()
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
 mod tests {
+    use crate::stack::StackPool;
     use crate::{yield_, Coro};
-    use std::ops::{Coroutine, CoroutineState};
-    use std::pin::Pin;
+    use core::ops::{Coroutine, CoroutineState};
+    use core::pin::Pin;
 
     #[test]
     fn simple() {
-        let mut coro = Coro::new(|| {
-            eprintln!("[c] activated for the first time");
+        let mut pool = StackPool::new();
+        let mut coro = Coro::with_stack_from(&mut pool, || {
             yield_();
-            eprintln!("[c] resumed fine, exiting");
         });
         match Pin::new(&mut coro).resume(()) {
-            CoroutineState::Yielded(_) => {
-                eprintln!("[m] yielded once")
-            }
+            CoroutineState::Yielded(_) => {}
             CoroutineState::Complete(_) => panic!("completed before expected"),
         }
         match Pin::new(&mut coro).resume(()) {
             CoroutineState::Yielded(_) => panic!("yielded when not expected"),
-            CoroutineState::Complete(_) => {
-                eprintln!("[m] completed!")
-            }
+            CoroutineState::Complete(_) => {}
         }
     }
 
     #[test]
     fn return_value() {
-        let mut coro = Coro::new(|| 12345);
+        let mut pool = StackPool::new();
+        let mut coro = Coro::with_stack_from(&mut pool, || 12345);
         assert_eq!(
             Pin::new(&mut coro).resume(()),
             CoroutineState::Complete(12345)
@@ -552,7 +601,8 @@ mod tests {
     #[test]
     fn lots_of_yields() {
         const ITER_COUNT: usize = 10_000_000;
-        let mut coro = Coro::new(|| {
+        let mut pool = StackPool::new();
+        let mut coro = Coro::with_stack_from(&mut pool, || {
             let mut res = 0;
             for i in 0..ITER_COUNT {
                 res |= core::hint::black_box(i);
@@ -569,5 +619,12 @@ mod tests {
             Pin::new(&mut coro).resume(()),
             CoroutineState::Complete(res)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot yield from outside a coroutine")]
+    #[cfg(feature = "safe_yield")]
+    fn yield_from_main_program_panics() {
+        yield_();
     }
 }

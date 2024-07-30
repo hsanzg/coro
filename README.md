@@ -75,9 +75,9 @@ Then $T$ and $T\'$ are said to be _similar_ if $m=m\'$ and the subtrees
 $T_i$ and $T\'_i$ are similar for all $1\le i\le m$.
 
 ```rust
-use std::cell::Cell;
-use std::ops::{Coroutine, CoroutineState};
-use std::pin::Pin;
+use core::cell::Cell;
+use core::ops::{Coroutine, CoroutineState};
+use core::pin::Pin;
 use coro::{Coro, yield_};
 
 #[derive(Clone)]

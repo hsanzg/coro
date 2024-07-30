@@ -23,3 +23,9 @@ std = ["smallvec/write", "libc/use_std"]
 [dependencies]
 libc = { version = "0.2", default-features = false }
 smallvec = { version = "2.0.0-alpha.6", default-features = false }
+
+# Taken from https://docs.rs/rustdoc-katex-demo/latest/rustdoc_katex_demo/
+# To build locally, run RUSTDOCFLAGS="--html-in-header misc/katex-header.html" cargo +nightly doc -Zunstable-options -Zrustdoc-scrape-examples --no-deps
+[package.metadata.docs.rs]
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+rustdoc-args = ["--html-in-header", "misc/katex-header.html"]

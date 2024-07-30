@@ -48,6 +48,69 @@ See the paper "Revisiting Coroutines" by A. L. de Moura and R. Ierusalimschy
 \[_ACM TOPLAS_ **31** (2009), 1–31] for the definitions of "stackful",
 "first-class" and "asymmetric" used above.
 
+This library incorporates ideas from two other implementations of stackful
+coroutines: [`corosensei`] by A. d'Antras, and [`libfringe`] by edef1c.
+Preliminary experiments seem to indicate that the three approaches can
+transfer control between coroutines with comparable efficiency, but `coro`
+is inferior with respect to platform support and stack unwinding. I put
+together this library for my own education, so significant improvements
+are possible.
+
+# Example
+
+As a [typical example] where coroutines are useful, we will write a program
+that tests the similarity of two ordered trees. Formally speaking, a _tree_
+is a finite set of nodes that consists of a _root_ together with $m\ge0$
+disjoint trees. If the relative order of the $m$ subtrees is important, we
+say that the tree is an _ordered tree_. Let the subtrees of ordered trees
+$T$ and $T\'$ be respectively $T_1,\dots,T_m$ and $T\'\_1,\dots,T\'_{m\'}$.
+Then $T$ and $T\'$ are said to be _similar_ if $m=m\'$ and the subtrees
+$T_i$ and $T\'_i$ are similar for all $1\le i\le m$.
+
+```rust
+#![feature(coroutine_trait)]
+
+use std::cell::Cell;
+use std::ops::{Coroutine, CoroutineState};
+use std::pin::Pin;
+use coro::{Coro, yield_};
+
+struct Node {
+    children: Vec<Node>,
+}
+
+fn visit(root: &Node, m: &Cell<usize>) {
+    m.set(root.children.len());
+    yield_();
+    for ch in &root.children {
+        visit(ch, m);
+    }
+}
+
+fn similar(first: &Node, second: &Node) -> bool {
+    let m = Cell::new(0);
+    let m_prime = Cell::new(0);
+    let mut first_coro = Coro::new(|| visit(first, &m));
+    let mut second_coro = Coro::new(|| visit(second, &m_prime));
+    loop {
+        match (
+            Pin::new(&mut first_coro).resume(()),
+            Pin::new(&mut second_coro).resume(()),
+        ) {
+            (CoroutineState::Complete(_), CoroutineState::Complete(_)) => return true,
+            (CoroutineState::Yielded(_), CoroutineState::Yielded(_)) if m == m_prime => {}
+            _ => return false,
+        };
+    }
+}
+```
+
+[`yield`]: yield_
+[`resume`]: Coro::resume
+[same size]: STACK_SIZE
+[`libfringe`]: https://github.com/edef1c/libfringe
+[`corosensei`]: https://github.com/Amanieu/corosensei
+[typical example]: https://research.swtch.com/coro
 
 <!-- cargo-sync-readme end -->
 

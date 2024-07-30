@@ -48,9 +48,89 @@
 //!
 //! # Example
 //!
-//! Process the nodes in an extended tree in pairs of two.
-//! ```
+//! As a [typical example] where coroutines are useful, we will write a program
+//! that tests the similarity of two ordered trees. Formally speaking, a _tree_
+//! is a finite set of nodes that consists of a _root_ together with $m\ge0$
+//! disjoint trees. If the relative order of the $m$ subtrees is important, we
+//! say that the tree is an _ordered tree_. Let the subtrees of ordered trees
+//! $T$ and $T\'$ be respectively $T_1,\dots,T_m$ and $T\'\_1,\dots,T\'_{m\'}$.
+//! Then $T$ and $T\'$ are said to be _similar_ if $m=m\'$ and the subtrees
+//! $T_i$ and $T\'_i$ are similar for all $1\le i\le m$.
 //!
+//! ```
+//! #![feature(coroutine_trait)]
+//!
+//! use std::cell::Cell;
+//! use std::ops::{Coroutine, CoroutineState};
+//! use std::pin::Pin;
+//! use coro::{Coro, yield_};
+//!
+//! # #[derive(Clone)]
+//! struct Node {
+//!     children: Vec<Node>,
+//! }
+//!
+//! fn visit(root: &Node, m: &Cell<usize>) {
+//!     m.set(root.children.len());
+//!     yield_();
+//!     for ch in &root.children {
+//!         visit(ch, m);
+//!     }
+//! }
+//!
+//! fn similar(first: &Node, second: &Node) -> bool {
+//!     let m = Cell::new(0);
+//!     let m_prime = Cell::new(0);
+//!     let mut first_coro = Coro::new(|| visit(first, &m));
+//!     let mut second_coro = Coro::new(|| visit(second, &m_prime));
+//!     loop {
+//!         match (
+//!             Pin::new(&mut first_coro).resume(()),
+//!             Pin::new(&mut second_coro).resume(()),
+//!         ) {
+//!             (CoroutineState::Complete(_), CoroutineState::Complete(_)) => return true,
+//!             (CoroutineState::Yielded(_), CoroutineState::Yielded(_)) if m == m_prime => {}
+//!             _ => return false,
+//!         };
+//!     }
+//! }
+//! # let first_tree = Node {
+//! #        children: vec![
+//! #            Node {
+//! #                children: vec![Node { children: vec![] }],
+//! #            },
+//! #            Node {
+//! #                children: vec![
+//! #                    Node { children: vec![] },
+//! #                    Node {
+//! #                        children: vec![Node { children: vec![] }],
+//! #                    },
+//! #                    Node { children: vec![] },
+//! #                ],
+//! #            },
+//! #        ],
+//! #    };
+//! #    let second_tree = first_tree.clone();
+//! #    assert!(similar(&first_tree, &second_tree));
+//! #
+//! #    let second_tree = Node {
+//! #        children: vec![
+//! #            Node {
+//! #                children: vec![Node { children: vec![] }],
+//! #            },
+//! #            Node {
+//! #                children: vec![
+//! #                    Node { children: vec![] },
+//! #                    Node {
+//! #                        children: vec![Node { children: vec![] }],
+//! #                    },
+//! #                    Node { children: vec![] },
+//! #                    Node { children: vec![] },
+//! #                ],
+//! #            },
+//! #        ],
+//! #    };
+//! #    assert!(!similar(&first_tree, &second_tree));
 //! ```
 //!
 //! [`yield`]: yield_
@@ -58,6 +138,7 @@
 //! [same size]: STACK_SIZE
 //! [`libfringe`]: https://github.com/edef1c/libfringe
 //! [`corosensei`]: https://github.com/Amanieu/corosensei
+//! [typical example]: https://research.swtch.com/coro
 
 #![feature(ptr_alignment_type)]
 #![feature(coroutine_trait)]
@@ -138,7 +219,7 @@ impl Control {
 /// The [crate-level documentation] discusses this type in more detail.
 ///
 /// [crate-level documentation]: crate
-pub struct Coro<Return> {
+pub struct Coro<'a, Return> {
     /// The program stack of the coroutine, which [`drop`] returns to the
     /// [thread-local storage pool] when the coroutine is no longer needed.
     ///
@@ -158,7 +239,7 @@ pub struct Coro<Return> {
     /// instance in its [program stack].
     ///
     /// [program stack]: Stack
-    phantom: PhantomData<fn() -> Return>,
+    phantom: PhantomData<&'a fn() -> Return>,
 }
 
 /// The fixed size in bytes of the [program stack] of a [coroutine].
@@ -181,7 +262,7 @@ pub const STACK_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1 << 2
 /// [size]: STACK_SIZE
 pub const STACK_ALIGN: Alignment = unsafe { Alignment::new_unchecked(STACK_SIZE.get()) };
 
-impl<Return> Coro<Return> {
+impl<'a, Return> Coro<'a, Return> {
     /// Creates a coroutine that is to run the provided [`FnOnce`] instance on
     /// an independent [program stack] (of size [`STACK_SIZE`]) from a
     /// thread-local [pool of memory].
@@ -190,7 +271,7 @@ impl<Return> Coro<Return> {
     /// [pool of memory]: COMMON_POOL
     pub fn new<F>(f: F) -> Self
     where
-        F: FnOnce() -> Return + 'static,
+        F: FnOnce() -> Return + 'a,
     {
         COMMON_POOL.with_borrow_mut(|pool| Self::with_stack_from(pool, f))
     }
@@ -209,7 +290,7 @@ impl<Return> Coro<Return> {
     #[allow(rustdoc::broken_intra_doc_links)]
     pub fn with_stack_from<F>(pool: &mut StackPool, f: F) -> Self
     where
-        F: FnOnce() -> Return + 'static,
+        F: FnOnce() -> Return + 'a,
     {
         // Before the first call to `resume` invokes `f`, it needs to save the
         // old context at the top of the current program stack. The default ABI
@@ -217,9 +298,9 @@ impl<Return> Coro<Return> {
         // jump through a trampoline function with an explicit calling convention
         // immediately after `arch::transfer_control` activates the coroutine
         // for the first time.
-        extern "system" fn trampoline<F, Return>() -> !
+        extern "system" fn trampoline<'a, F, Return>() -> !
         where
-            F: FnOnce() -> Return + 'static,
+            F: FnOnce() -> Return + 'a,
         {
             // Make a bitwise copy of the `FnOnce` instance on the new stack,
             // because that's the only way to call it safely.
@@ -310,7 +391,7 @@ impl<Return> Coro<Return> {
     }
 }
 
-impl<Return> Drop for Coro<Return> {
+impl<'a, Return> Drop for Coro<'a, Return> {
     fn drop(&mut self) {
         COMMON_POOL.with_borrow_mut(|pool| {
             // SAFETY: The `self.stack` variable is not used again.
@@ -320,13 +401,14 @@ impl<Return> Drop for Coro<Return> {
     }
 }
 
-impl<Return> Coroutine for Coro<Return> {
+impl<'a, Return> Coroutine for Coro<'a, Return> {
     type Yield = ();
     type Return = Return;
 
     fn resume(self: Pin<&mut Self>, _arg: ()) -> CoroutineState<Self::Yield, Self::Return> {
         // todo: document safety properties.
         let coro = self.get_mut();
+        assert!(!coro.is_finished(), "coroutine resumed after completion");
         {
             let control = coro.control_mut();
             unsafe { arch::transfer_control(control) };

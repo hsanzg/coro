@@ -374,6 +374,12 @@ impl StackPool {
     }
 }
 
+impl Default for StackPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(feature = "std")]
 thread_local! {
     /// A per-thread pool of available program stacks.

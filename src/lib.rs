@@ -46,7 +46,7 @@
 //! together this library for my own education, so significant improvements
 //! are possible.
 //!
-//! # Example
+//! ## Example
 //!
 //! As a [typical example] where coroutines are useful, we will write a program
 //! that tests the similarity of two ordered trees. Formally speaking, a _tree_

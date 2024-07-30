@@ -56,7 +56,7 @@ is inferior with respect to platform support and stack unwinding. I put
 together this library for my own education, so significant improvements
 are possible.
 
-# Example
+## Example
 
 As a [typical example] where coroutines are useful, we will write a program
 that tests the similarity of two ordered trees. Formally speaking, a _tree_
@@ -68,13 +68,12 @@ Then $T$ and $T\'$ are said to be _similar_ if $m=m\'$ and the subtrees
 $T_i$ and $T\'_i$ are similar for all $1\le i\le m$.
 
 ```rust
-#![feature(coroutine_trait)]
-
 use std::cell::Cell;
 use std::ops::{Coroutine, CoroutineState};
 use std::pin::Pin;
 use coro::{Coro, yield_};
 
+#[derive(Clone)]
 struct Node {
     children: Vec<Node>,
 }
@@ -90,8 +89,17 @@ fn visit(root: &Node, m: &Cell<usize>) {
 fn similar(first: &Node, second: &Node) -> bool {
     let m = Cell::new(0);
     let m_prime = Cell::new(0);
+    # #[cfg(feature = "std")]
     let mut first_coro = Coro::new(|| visit(first, &m));
+    # #[cfg(feature = "std")]
     let mut second_coro = Coro::new(|| visit(second, &m_prime));
+    # // Alternate implementation for use in `no_std` environments.
+    # #[cfg(not(feature = "std"))]
+    let mut pool = StackPool::new();
+    # #[cfg(not(feature = "std"))]
+    # let mut first_coro = Coro::with_stack_from(&mut pool, || visit(first, &m));
+    # #[cfg(not(feature = "std"))]
+    # let mut second_coro = Coro::with_stack_from(&mut pool, || visit(second, &m_prime));
     loop {
         match (
             Pin::new(&mut first_coro).resume(()),

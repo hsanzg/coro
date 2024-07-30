@@ -29,6 +29,45 @@ pub extern "system" fn stack_ptr() -> NonNull<u8> {
     unsafe { NonNull::new_unchecked(sp) }
 }
 
+/// Saves the contents of every reserved, callee-saved register under the
+/// current ABI.
+#[cfg(target_family = "unix")]
+macro_rules! save_additional_context {
+    () => {
+        // The System V ABI defines a 128-byte red zone above the top of the
+        // current stack, so there's no need to increase the stack pointer.
+        "mov [rsp - 16], rbp
+         mov [rsp - 8], rbx"
+    };
+}
+
+/// Undoes the effect of [`save_additional_context`].
+#[cfg(target_family = "unix")]
+macro_rules! restore_additional_context {
+    () => {
+        "mov rbp, [rsp - 16]
+         mov rbx, [rsp - 8]"
+    };
+}
+
+#[cfg(target_family = "windows")]
+macro_rules! save_additional_context {
+    () => {
+        // Under the Windows ABI, the contents above the top of the stack may
+        // be overwritten by an interrupt handler. Update the stack pointer.
+        "push rbx
+         push rbp"
+    };
+}
+
+#[cfg(target_family = "windows")]
+macro_rules! restore_additional_context {
+    () => {
+        "pop rbp
+         pop rbx"
+    };
+}
+
 /// Resumes execution of a computation at the point where it was last suspended.
 /// More precisely, this function saves the program's current context and
 /// restores the old context in the given control structure.
@@ -66,10 +105,7 @@ pub unsafe extern "system" fn transfer_control(record: &mut Control) {
         // former is not included in the clobber list because LLVM uses it
         // internally; similarly, Rust does not allow us to specify the frame
         // pointer as an input nor output.
-        // todo: We do not need to increase the stack pointer in non-Windows
-        //       systems, thanks to the 128-byte red zone.
-        "push rbx",
-        "push rbp",
+        save_additional_context!(),
         // Swap the current stack pointer (`sp`) with the pointer address
         // in the control record (`record.stack_ptr`). The stack setup section
         // of code in `Coro::new` ensures that the stack pointer is properly
@@ -90,8 +126,7 @@ pub unsafe extern "system" fn transfer_control(record: &mut Control) {
         "2:",
         // At this point we have come back to the original stack. It remains to
         // restore the contents of all manually-preserved registers.
-        "pop rbp",
-        "pop rbx",
+        restore_additional_context!(),
         in("rdi") record,
         stack_ptr_offset = const offset_of!(Control, stack_ptr),
         instr_ptr_offset = const offset_of!(Control, instr_ptr),

@@ -170,6 +170,7 @@ use crate::arch::STACK_FRAME_ALIGN;
 #[cfg(feature = "std")]
 use crate::stack::COMMON_POOL;
 use crate::stack::{align_alloc, Stack, StackOrientation, StackPool};
+#[cfg(feature = "safe_yield")]
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;

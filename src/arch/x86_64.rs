@@ -36,8 +36,13 @@ macro_rules! save_additional_context {
     () => {
         // The System V ABI defines a 128-byte red zone above the top of the
         // current stack, so there's no need to increase the stack pointer.
+        // Still, we need to update the CFA and indicate that the `rbp` and
+        // `rbx` old register contents are present in the stack.
         "mov [rsp - 16], rbp
-         mov [rsp - 8], rbx"
+         mov [rsp - 8], rbx
+         #.cfi_def_cfa_offset 16
+         .cfi_rel_offset rbp, -16
+         .cfi_rel_offset rbx, -8"
     };
 }
 
@@ -114,6 +119,23 @@ pub unsafe extern "system" fn transfer_control(record: &mut Control) {
         "mov rax, rsp",
         "mov rsp, [rdi + {stack_ptr_offset}]",
         "mov [rdi + {stack_ptr_offset}], rax",
+        "mov rbp, rdi", // todo: can we avoid this renaming? Probably not, because
+                        //       we need a callee-preserved register.
+        // Define the Canonical Frame Address (CFA) of the current computation,
+        // namely the value of the stack pointer just before we jump the control
+        // to the new program. The `DW_CFA_def_cfa_expression` (`0x0F`) call
+        // frame instruction takes a single `DW_FORM_exprloc` value consisting
+        // of a LEB128-encoded length (3) and a DWARF expression that tells the
+        // unwinder how to compute the current CFA. (See Section 2.5 of the
+        // DWARF Version 5 specification for details.) At this point the value
+        // of the `rdi` register is the location of the control record, whose
+        // `stack_ptr` field contains the desired CFA value. Push the offset of
+        // that field (`stack_ptr_offset`) and `DW_OP_breg5` (`0x75`, which
+        // corresponds to the `rdi` register on the x86-64 architecture) onto
+        // the DWARF stack. Next, apply the `DW_OP_deref` (`0x06`) operation to
+        // read the field contents.
+        // todo: replace breg5 (rdi) by breg6 (rbp) in comment above.
+        ".cfi_escape 0x0F, 3, 0x76, {stack_ptr_offset}, 0x06",
         // Fetch the resumption point where we are to jump.
         "mov rax, [rdi + {instr_ptr_offset}]",
         // The new computation may transfer control back to the current program
@@ -124,6 +146,7 @@ pub unsafe extern "system" fn transfer_control(record: &mut Control) {
         // Resume the computation.
         "jmp rax",
         "2:",
+        // todo: Do we need to restore the original CFA?
         // At this point we have come back to the original stack. It remains to
         // restore the contents of all manually-preserved registers.
         restore_additional_context!(),
@@ -168,7 +191,7 @@ pub unsafe extern "system" fn return_control<R>(
         "mov [rdi + {stack_ptr_offset}], rdx",
         "mov rax, [rdi + {instr_ptr_offset}]",
         "mov qword ptr [rdi + {instr_ptr_offset}], 0",
-        // Jump to the last caller.
+        // Jump to the last caller (which takes care of restoring the CFA).
         "jmp rax",
         in("rdi") record,
         in("rdx") ret_val_addr.as_ptr(),

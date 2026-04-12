@@ -1,0 +1,19 @@
+[package]
+name = "coro"
+version = "0.3.0"
+description = "Stackful, first-class asymmetric coroutines."
+authors = ["Hugo Sanz González <hugo@hgsg.me>"]
+license = "MIT"
+documentation = "https://docs.rs/coro"
+repository = "https://github.com/hsanzg/coro"
+keywords = ["coroutines", "stackful"]
+categories = ["concurrency"]
+edition = "2024"
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+[dependencies]
+libc = "0.2"

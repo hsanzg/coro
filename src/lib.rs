@@ -2,6 +2,7 @@
 #![feature(coroutine_trait)]
 #![feature(thread_local)]
 #![feature(adt_const_params)]
+#![feature(core_intrinsics)]
 #![cfg_attr(test, feature(pointer_is_aligned_to))]
 #![no_std]
 
@@ -22,6 +23,7 @@ use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
 use core::ptr;
 use std::alloc::Layout;
+use std::arch::asm;
 use std::marker::{PhantomData, PhantomPinned};
 use std::mem::{MaybeUninit, offset_of};
 use std::println;
@@ -182,6 +184,12 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
     // let control_ptr = addr_of_pin_mut(&control);
     // control.as_mut().set_parent(ACTIVE.replace(control_ptr));
     control.parent = ACTIVE.replace(control);
+    println!(
+      "resume: transferring control to {:?} (sp={:?}, ip={:?})",
+      ptr::from_mut(control),
+      control.stack_ptr,
+      control.inst_ptr
+    );
     unsafe { arch::transfer_control(control) };
     if control.has_finished() {
       let ret_val_addr = control.stack_ptr.cast();
@@ -224,6 +232,12 @@ where
 pub fn suspend() {
   match unsafe { ACTIVE.get().as_mut() } {
     Some(control) => {
+      println!(
+        "suspend: transferring control back, reading from {:?} (sp={:?}, ip={:?})",
+        ptr::from_mut(control),
+        control.stack_ptr,
+        control.inst_ptr
+      );
       // Pop the current coroutine from the stack.
       ACTIVE.set(control.parent);
       unsafe { arch::transfer_control(control) };
@@ -235,11 +249,13 @@ pub fn suspend() {
 impl<R, F: FnOnce() -> R + Unpin> Drop for Coro<R, F> {
   fn drop(&mut self) {
     if self.has_started() {
-      let control = self.control();
+      let Self { stack, bottom } = self;
+      let control = &mut unsafe { bottom.as_mut() }.ctrl;
       if !control.has_finished() {
-        let has_panicked = !self.stack.contains(control.stack_ptr);
+        let has_panicked = !stack.contains(control.stack_ptr);
         if !has_panicked {
-          todo!("unwind since not finished and has not panicked");
+          println!("coroutine has not panicked, unwinding... control={bottom:?}");
+          unsafe { arch::force_unwind(control) };
         }
       }
     } else {

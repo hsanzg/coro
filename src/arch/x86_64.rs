@@ -1,10 +1,24 @@
 use crate::{Bottom, Control};
+use core::panic::PanicInfo;
 use std::arch::{asm, naked_asm};
 use std::mem::offset_of;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::{panic, println, ptr};
 
 pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
+  extern "sysv64-unwind" fn panic(_control: &mut Control) -> ! {
+    /*extern "Rust" {
+      fn __rust_start_panic(payload: *mut &mut dyn core::panic::PanicPayload) -> u32;
+    }*/
+    // __rust_start_panic("");
+    /*unsafe extern "Rust" {
+      fn rust_begin_unwind(_: &PanicInfo<'_>) -> !;
+    }
+    unsafe { rust_begin_unwind(?) };*/
+    std::panic::panic_any(())
+  }
   unsafe {
     asm!(
       // Save additional caller-preserved registers in the current stack.
@@ -24,6 +38,18 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
       "mov [rdi + {ip_off}], rsi",
       "jmp rax",
       //
+      // Note that `rsp` is currently 16-byte aligned, as required by the System V ABI,
+      // because Rust guarantees that it is on entry to the `asm!` block, and we
+      // have moved it 16 bytes down.
+      /*"sub rsp, 16",
+      ".cfi_adjust_cfa_offset 16",
+      "mov [rsp], rdi",
+      ".cfi_rel_offset rdi, 0",*/
+      "call {panic}",
+      /*".cfi_restore rdi",
+      ".cfi_adjust_cfa_offset -16",
+      "nop",*/
+      //
       "2:",
       "mov rbp, [rsp]",
       ".cfi_restore rbp",
@@ -35,6 +61,7 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
       lateout("rax") _, lateout("rsi") _,
       sp_off = const offset_of!(Control, stack_ptr),
       ip_off = const offset_of!(Control, inst_ptr),
+      panic = sym panic,
       clobber_abi("sysv64"),
       options(may_unwind)
     )
@@ -149,4 +176,30 @@ pub unsafe extern "sysv64-unwind" fn return_control<R>(
 
 pub fn initial_sp<F>(bottom: NonNull<Bottom<F>>) -> NonNull<()> {
   unsafe { bottom.byte_add(offset_of!(Control, inst_ptr)) }.cast()
+}
+
+pub unsafe fn force_unwind(control: &mut Control) {
+  control.inst_ptr = unsafe {
+    control.inst_ptr.byte_sub(5 /*14*/)
+  };
+  /*fn raw_transfer_control(control_ptr: *mut u8) {
+    let control = unsafe { &mut *control_ptr.cast() };
+    unsafe { transfer_control(control) };
+  }
+  fn catch(_: *mut u8, _: *mut u8) {}
+  unsafe {
+    core::intrinsics::catch_unwind(raw_transfer_control, ptr::from_mut(control).cast(), catch)
+  };*/
+  let mut control_ref = AssertUnwindSafe(control);
+  let res = panic::catch_unwind(move || unsafe {
+    let sp: *mut u8;
+    let ip: *mut u8;
+    asm!("mov {}, rsp", "lea {}, [rip]", out(reg) sp, out(reg) ip);
+    println!(
+      "force_unwind: transferring control from sp={sp:?}, ip={ip:?}, control={:?}",
+      ptr::from_mut(*control_ref)
+    );
+    transfer_control(*control_ref)
+  });
+  debug_assert!(res.is_err(), "coroutine did not unwind");
 }

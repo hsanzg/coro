@@ -8,7 +8,7 @@ use std::ptr::NonNull;
 use std::{panic, println, ptr};
 
 pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
-  extern "sysv64-unwind" fn panic(_control: &mut Control) -> ! {
+  extern "sysv64-unwind" fn unwind(_control: &mut Control) -> ! {
     /*extern "Rust" {
       fn __rust_start_panic(payload: *mut &mut dyn core::panic::PanicPayload) -> u32;
     }*/
@@ -17,7 +17,8 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
       fn rust_begin_unwind(_: &PanicInfo<'_>) -> !;
     }
     unsafe { rust_begin_unwind(?) };*/
-    std::panic::panic_any(())
+    crate::unwind::start_unwind();
+    // std::panic::panic_any(())
   }
   unsafe {
     asm!(
@@ -45,7 +46,7 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
       ".cfi_adjust_cfa_offset 16",
       "mov [rsp], rdi",
       ".cfi_rel_offset rdi, 0",*/
-      "call {panic}",
+      "call {unwind}",
       /*".cfi_restore rdi",
       ".cfi_adjust_cfa_offset -16",
       "nop",*/
@@ -61,7 +62,7 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
       lateout("rax") _, lateout("rsi") _,
       sp_off = const offset_of!(Control, stack_ptr),
       ip_off = const offset_of!(Control, inst_ptr),
-      panic = sym panic,
+      unwind = sym unwind,
       clobber_abi("sysv64"),
       options(may_unwind)
     )
@@ -142,6 +143,7 @@ where
 {
   naked_asm!(
     ".cfi_startproc",
+    ".cfi_personality 0x1b, {personality_fn}", // DW_EH_PE_pcrel | DW_EH_PE_sdata4:
     ".cfi_offset rsp, -16",
     // ".cfi_offset rsp, -16",
     // "sub rsp, 16",
@@ -153,8 +155,10 @@ where
     "sub rsp, 8",
     ".cfi_adjust_cfa_offset 8",
     "call {second_tramp}",
+    "ud2",
     ".cfi_endproc",
-    second_tramp = sym crate::trampoline::<R, F>
+    second_tramp = sym crate::trampoline::<R, F>,
+    personality_fn = sym crate::unwind::__coro_trampoline_personality
   )
 }
 
@@ -191,7 +195,7 @@ pub unsafe fn force_unwind(control: &mut Control) {
     core::intrinsics::catch_unwind(raw_transfer_control, ptr::from_mut(control).cast(), catch)
   };*/
   let mut control_ref = AssertUnwindSafe(control);
-  let res = panic::catch_unwind(move || unsafe {
+  let res = crate::unwind::catch_unwind(move || unsafe {
     let sp: *mut u8;
     let ip: *mut u8;
     asm!("mov {}, rsp", "lea {}, [rip]", out(reg) sp, out(reg) ip);

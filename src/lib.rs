@@ -3,6 +3,7 @@
 #![feature(thread_local)]
 #![feature(adt_const_params)]
 #![feature(core_intrinsics)]
+#![feature(box_as_ptr)]
 #![cfg_attr(test, feature(pointer_is_aligned_to))]
 #![no_std]
 
@@ -15,6 +16,7 @@ mod arch;
 #[cfg(feature = "std")]
 mod os;
 pub mod stack;
+pub mod unwind;
 
 use crate::stack::{GROWTH_DIR, GrowthDir, Stack, StackPtr, next_slot};
 use core::cell::Cell;

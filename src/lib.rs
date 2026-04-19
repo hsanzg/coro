@@ -1,9 +1,47 @@
+// The following doc comment is kept in sync with the README.md file.
+// Please execute `cargo sync-readme` after modifying its contents.
+//! This crate provides an implementation of first-class stackful
+//! asymmetric coroutines.
+//!
+//! The general notion of _coroutines_, first discussed in the published
+//! literature by M. E. Conway \[_CACM_ **6** (1963), 396–408], extends
+//! the concept of subroutines by allowing them to share and pass data
+//! and control back and forth. An _asymmetric_ coroutine suspends the
+//! execution of its program by invoking a [`suspend`] function, which
+//! returns control to the caller. Invoking the [`resume`] method on a
+//! coroutine resumes execution of its program immediately after the
+//! point where it was last suspended.
+//!
+//! The Rust language has built-in support for asymmetric coroutines,
+//! but one cannot easily suspend their execution from within a nested
+//! function call. One way to solve this issue is to maintain a separate
+//! program stack for each coroutine, at the expense of some extra memory
+//! space. The resulting coroutine implementation is said to be _stackful_.
+//!
+//! The crux of this crate is the [`Coro`] type, which implements the
+//! built-in [`core::ops::Coroutine`] trait using a stackful approach.
+//! Perhaps its most interesting feature is that it allows a coroutine
+//! to return control without the need to pass a "yielder" object around.
+//! (Instead, a thread-local variable keeps track of the currently active
+//! coroutine.)
+//!
+//! The paper "Revisiting Coroutines" by A. L. de Moura and R. Ierusalimschy
+//! \[_ACM TOPLAS_ **31** (2009), 1–31] formally defines the terms "stackful",
+//! "first-class" and "asymmetric" used above.
+//!
+//! `coro` incorporates ideas from two other implementations of stackful
+//! coroutines: [`corosensei`] by A. d'Antras, and [`libfringe`] by edef1c.
+//! Preliminary experiments seem to indicate that the three libraries can
+//! transfer control between coroutines with comparable efficiency, but
+//! `coro` is still inferior with respect to platform support. I mainly
+//! put together this library for my own education, so significant
+//! improvements are likely possible.
+
 #![feature(asm_unwind)]
 #![feature(coroutine_trait)]
 #![feature(thread_local)]
 #![feature(adt_const_params)]
 #![feature(core_intrinsics)]
-#![feature(box_as_ptr)]
 #![cfg_attr(test, feature(pointer_is_aligned_to))]
 #![no_std]
 
@@ -73,21 +111,47 @@ use std::ptr::NonNull;
 // It follows that a coroutine has at most two continuations in its
 // stack, one of them sitting at its bottom.
 
-// todo: mention that when the coroutine is inactive, this object acts as
-//  a continuation. When it is active, it acts as a continuation of its
-//  last caller.
 /// The control record of a [coroutine], used to save or restore the
 /// context needed by the coroutine during a [transfer of control].
 ///
+/// If the coroutine has not completely finished its execution, this
+/// object is essentially a one-shot continuation of its computation
+/// (when suspended) or that of its last caller (when active). See
+/// C. Bruggeman, O. Waddell, and R. Kent Dybvig, _SIGPLAN Notices_
+/// **31**, 5 (May 1996), 99--107.
+///
 /// [coroutine]: Coro
 /// [transfer of control]: arch::transfer_control
-// todo: document that alignment needed to satisfy System V x86-64 ABI
-//  on first call to the architecture-specific trampoline.
-// todo: rename to `FrameBase` or `FirstFrame` or `Activation`?
-#[repr(C, align(16))]
+#[cfg_attr(target_arch = "x86_64", repr(C, align(16)))]
 pub(crate) struct Control {
+  /// The value of the stack pointer just before a transfer of control
+  /// involving the coroutine associated with this control record.
+  ///
+  /// Special cases:
+  /// - if the coroutine has not been activated yet, a pointer to the
+  ///   bottom of its stack;
+  /// - if the coroutine has finished completely, the address of its
+  ///   return value;
+  /// - if the coroutine has panicked, a dangling pointer not derived
+  ///   from the coroutine's stack allocation.
   stack_ptr: StackPtr,
+  /// The value of the instruction pointer just before a transfer of
+  /// control involving the coroutine associated with this control
+  /// record.
+  ///
+  /// Special cases:
+  /// - if the coroutine has not been activated yet, a pointer to the
+  ///   first instruction of a [trampoline function] that immediately
+  ///   bounces to the coroutine's program;
+  /// - if the coroutine has finished completely, a [null pointer];
+  /// - if the coroutine has panicked, an undefined address.
+  ///
+  /// [trampoline function]: trampoline
+  /// [null pointer]: ptr::null
   inst_ptr: *const (),
+  /// If the coroutine is active, the address of the control record
+  /// of the coroutine that last resumed it (with `ptr::null_mut()`
+  /// representing the main program). Otherwise undefined.
   parent: *mut Control,
   _pin: PhantomPinned,
 }
@@ -114,6 +178,8 @@ struct Bottom<F> {
 #[thread_local]
 static ACTIVE: Cell<*mut Control> = Cell::new(ptr::null_mut());
 
+// It is important that the coroutine function object is not address-sensitive,
+// and that is why we require its type `F` to implement `Unpin`.
 pub struct Coro<R, F: FnOnce() -> R + Unpin> {
   bottom: NonNull<Bottom<F>>,
   stack: ManuallyDrop<Stack>,

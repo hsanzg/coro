@@ -1,4 +1,4 @@
-#[cfg_attr(unix, path = "gcc.rs")]
+#[cfg_attr(not(windows), path = "itanium.rs")]
 mod imp;
 
 pub use self::imp::*;

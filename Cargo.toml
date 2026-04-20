@@ -13,7 +13,7 @@ edition = "2024"
 [features]
 default = ["std"]
 std = ["alloc"]
-alloc = []
+alloc = [] # todo: replace by stack_pool.
 
 [dependencies]
 libc = "0.2"

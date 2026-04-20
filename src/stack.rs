@@ -1,9 +1,13 @@
 use crate::Control;
+#[cfg(feature = "std")]
+use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
+use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::num::NonZero;
 use std::pin::Pin;
+use std::thread_local;
 
 /// Describes how the stack pointer changes after a `push` instruction.
 #[derive(PartialEq, Eq, Clone, Copy, Debug, core::marker::ConstParamTy)]
@@ -19,13 +23,7 @@ pub enum GrowthDir {
 /// The [program stack] growth convention on the current platform.
 ///
 /// [program stack]: Stack
-pub const GROWTH_DIR: GrowthDir = const {
-  if cfg!(target_arch = "x86_64") {
-    GrowthDir::Downwards
-  } else {
-    GrowthDir::Upwards
-  }
-};
+pub const GROWTH_DIR: GrowthDir = const { GrowthDir::Downwards };
 
 /// If [program stacks] are set to grow [towards zero], the address of
 /// the top entry in a stack. Otherwise (namely if program stacks grow
@@ -47,6 +45,7 @@ pub type StackPtr = NonNull<()>;
 /// current platform.) The actual stack contents appear on top of
 /// the control record.
 ///
+// todo: say that only in architectures that support memory protection.
 /// To guard against overflows, the topmost page of a program stack
 /// is _protected_. (Again, the meaning of "topmost" depends on the
 /// [stack growth convention] on the current platform.) In this way
@@ -89,8 +88,8 @@ impl Stack {
   ///   returned [`Stack`], and it is not aliased mutably elsewhere;
   /// 3. The topmost page of the allocation (with respect to the stack
   ///   growth direction) must not be accessible by the current process;
-  /// 4. The remaining pages are readable and writable by the current
-  ///   process;
+  /// 4. The remaining pages are readable and writable but not executable
+  ///    by the current process, on architectures that support this feature;
   /// 5. `size` is a multiple of the system's page size.
   ///
   /// Failure to satisfy these requirements may lead to undefined
@@ -209,7 +208,7 @@ impl Stack {
   // care must be taken.
   pub unsafe fn push<T, F: FnOnce(NonNull<T>) -> T>(
     &mut self,
-    sp: StackPtr,
+    sp: StackPtr, // todo: take as `&mut StackPtr`.
     f: F,
   ) -> (NonNull<T>, StackPtr) {
     let loc = next_slot(sp);
@@ -273,13 +272,13 @@ impl Drop for Stack {
 /// [coroutines]: crate::Coro
 #[cfg(feature = "std")]
 #[derive(Default)]
-pub struct StackPool(alloc::vec::Vec<Stack>);
+pub struct StackPool(Vec<Stack>);
 
 #[cfg(feature = "std")]
 impl StackPool {
   /// Creates a new storage pool.
-  pub fn new() -> Self {
-    Self::default()
+  pub const fn new() -> Self {
+    Self(Vec::new())
   }
 
   /// Reserves a program stack that can hold at least `min_size` bytes.
@@ -304,6 +303,12 @@ impl StackPool {
   pub fn give(&mut self, stack: Stack) {
     self.0.push(stack);
   }
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+  /// A per-thread pool of available program stacks.
+  pub(crate) static COMMON_POOL: RefCell<StackPool> = const { RefCell::new(StackPool::new()) };
 }
 
 #[cfg(all(test, feature = "alloc"))]

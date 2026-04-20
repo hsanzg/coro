@@ -180,6 +180,7 @@ pub unsafe extern "sysv64-unwind" fn return_control<R>(
 }
 
 pub fn initial_sp<F>(bottom: NonNull<Bottom<F>>) -> StackPtr {
+  // Note: `bottom` need not be dereferenceable.
   unsafe { bottom.byte_add(offset_of!(Control, inst_ptr)) }.cast()
 }
 

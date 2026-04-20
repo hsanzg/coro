@@ -17,3 +17,6 @@ alloc = [] # todo: replace by stack_pool.
 
 [dependencies]
 libc = "0.2"
+
+[workspace]
+members = ["coro_macros"]

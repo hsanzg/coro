@@ -1,4 +1,5 @@
 use crate::stack::{GROWTH_DIR, GrowthDir};
+use core::ffi::c_int;
 use core::num::NonZeroUsize;
 use core::ptr;
 use core::ptr::NonNull;
@@ -13,7 +14,7 @@ pub fn page_size() -> NonZeroUsize {
   static VAL: AtomicUsize = AtomicUsize::new(0);
   let val = match VAL.load(Ordering::Relaxed) {
     0 => {
-      #[allow(
+      #[expect(
         clippy::cast_possible_truncation,
         reason = "`sysconf` returns -1 or a size smaller than $2^{32}$"
       )]
@@ -28,6 +29,11 @@ pub fn page_size() -> NonZeroUsize {
   unsafe { NonZeroUsize::new_unchecked(val) }
 }
 
+const MAP_STACK: c_int = cfg_select! {
+  any(target_os = "linux", target_os = "freebsd", target_os = "openbsd") => libc::MAP_STACK,
+  _ => 0
+};
+
 pub fn alloc_stack(size: NonZeroUsize) -> NonNull<()> {
   // Reserve a `size`-byte area with read and write permissions only.
   // We pass the `MAP_STACK` flag to indicate that the region will be
@@ -38,7 +44,7 @@ pub fn alloc_stack(size: NonZeroUsize) -> NonNull<()> {
       ptr::null_mut(),
       size.get(),
       libc::PROT_READ | libc::PROT_WRITE,
-      libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+      libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | MAP_STACK,
       -1,
       0,
     )

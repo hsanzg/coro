@@ -2,10 +2,11 @@
 
 use crate::ACTIVE;
 use alloc::boxed::Box;
+use core::ptr;
 use std::println;
 // Taken from https://github.com/rust-lang/rust/blob/main/library/unwind/src/libunwind.rs.
 
-type c_int = std::ffi::c_int; // todo: replace.
+type c_int = core::ffi::c_int;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -30,6 +31,7 @@ type _Unwind_Exception_Cleanup_Fn =
 
 const UNWINDER_PRIVATE_DATA_SIZE: usize = 2;
 
+// todo: rename to `CORO_DROP`?
 const CORO_UNWIND: _Unwind_Exception_Class = u64::from_ne_bytes(*b"CORORUST");
 
 #[repr(C)]
@@ -50,7 +52,7 @@ pub fn start_unwind() -> ! {
   let ex = Box::new(_Unwind_Exception {
     exception_class: CORO_UNWIND,
     exception_cleanup: Some(cleanup),
-    private: [core::ptr::null(); UNWINDER_PRIVATE_DATA_SIZE],
+    private: [ptr::null(); UNWINDER_PRIVATE_DATA_SIZE],
   });
   println!("start_unwind: class={:?}", ex.exception_cleanup);
   let res = unsafe { _Unwind_RaiseException(Box::into_raw(ex)) };
@@ -68,16 +70,19 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
   _ex: *mut _Unwind_Exception,
   _ctx: *mut _Unwind_Context,
 ) -> _Unwind_Reason_Code {
+  // todo: add unlikely.
   if version != 1 {
     return _Unwind_Reason_Code::_URC_FATAL_PHASE1_ERROR;
   }
   if actions & _UA_CLEANUP_PHASE != 0 && ex_class != CORO_UNWIND {
+    // todo: Move to some `cleanup_on_panic` global function in `lib.rs`.
     let cur = ACTIVE.get();
+    // todo: add unlikely.
     if cur.is_null() {
       return _Unwind_Reason_Code::_URC_FATAL_PHASE2_ERROR;
     }
     let cur = unsafe { &*cur };
-    ACTIVE.set(cur.parent);
+    ACTIVE.set(cur.caller);
     println!(
       "changed parent from {:?} to {:?}",
       &raw const *cur,

@@ -11,9 +11,9 @@ categories = ["concurrency"]
 edition = "2024"
 
 [features]
-default = ["std"]
-std = ["alloc"]
-alloc = [] # todo: replace by stack_pool.
+default = ["common_pool"]
+alloc = []
+common_pool = ["alloc"]
 
 [dependencies]
 libc = "0.2"

@@ -3,7 +3,6 @@
 use crate::ACTIVE;
 use alloc::boxed::Box;
 use core::ptr;
-use std::println;
 // Taken from https://github.com/rust-lang/rust/blob/main/library/unwind/src/libunwind.rs.
 
 type c_int = core::ffi::c_int;
@@ -54,7 +53,7 @@ pub fn start_unwind() -> ! {
     exception_cleanup: Some(cleanup),
     private: [ptr::null(); UNWINDER_PRIVATE_DATA_SIZE],
   });
-  println!("start_unwind: class={:?}", ex.exception_cleanup);
+  // println!("start_unwind: class={:?}", ex.exception_cleanup);
   let res = unsafe { _Unwind_RaiseException(Box::into_raw(ex)) };
   panic!("_Unwind_RaiseException failed: {res:?}");
 }
@@ -83,11 +82,11 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
     }
     let cur = unsafe { &*cur };
     ACTIVE.set(cur.caller);
-    println!(
+    /*println!(
       "changed parent from {:?} to {:?}",
       &raw const *cur,
       ACTIVE.get()
-    );
+    );*/
   }
   _Unwind_Reason_Code::_URC_CONTINUE_UNWIND
 }

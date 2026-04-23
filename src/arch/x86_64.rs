@@ -1,12 +1,9 @@
 use crate::stack::StackPtr;
 use crate::{Bottom, Control};
-use core::panic::PanicInfo;
-use std::arch::{asm, naked_asm};
-use std::mem::offset_of;
-use std::panic::AssertUnwindSafe;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::{panic, println, ptr};
+use core::arch::{asm, naked_asm};
+use core::mem::offset_of;
+use core::panic::AssertUnwindSafe;
+use core::ptr::NonNull;
 
 pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
   extern "sysv64-unwind" fn unwind(_control: &mut Control) -> ! {
@@ -198,13 +195,13 @@ pub unsafe fn force_unwind(control: &mut Control) {
   };*/
   let mut control_ref = AssertUnwindSafe(control);
   let res = crate::unwind::catch_unwind(move || unsafe {
-    let sp: *mut u8;
+    /*let sp: *mut u8;
     let ip: *mut u8;
     asm!("mov {}, rsp", "lea {}, [rip]", out(reg) sp, out(reg) ip);
     println!(
       "force_unwind: transferring control from sp={sp:?}, ip={ip:?}, control={:?}",
-      ptr::from_mut(*control_ref)
-    );
+      core::ptr::from_mut(*control_ref)
+    );*/
     transfer_control(*control_ref)
   });
   debug_assert!(res.is_err(), "coroutine did not unwind");

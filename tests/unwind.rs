@@ -14,7 +14,7 @@ impl Drop for DropRecorder<'_> {
 #[test]
 fn no_unwind_when_not_started() {
   let dropped = Cell::new(false);
-  Coro::new(|| {
+  let _ = Coro::new(|| {
     let _rec = DropRecorder(&dropped);
   });
   assert!(!dropped.get());

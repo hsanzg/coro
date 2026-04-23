@@ -86,12 +86,13 @@ pub fn free_stack(base: NonNull<()>, size: NonZeroUsize) {
   );
 }
 
-#[cfg(feature = "std")]
+// todo: rethink `std` strategy.
+/*#[cfg(feature = "std")]
 fn last_os_error() -> std::io::Error {
   std::io::Error::last_os_error()
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "std"))]*/
 fn last_os_error() -> i32 {
   unsafe { *libc::__errno_location() }
 }

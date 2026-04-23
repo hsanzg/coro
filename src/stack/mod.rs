@@ -3,15 +3,12 @@
 mod os;
 
 use crate::Control;
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::num::NonZero;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use std::cell::RefCell;
-use std::mem::MaybeUninit;
-use std::num::NonZero;
-use std::pin::Pin;
-use std::thread_local;
 
 /// Describes how the stack pointer changes after a `push` instruction.
 #[derive(PartialEq, Eq, Clone, Copy, Debug, core::marker::ConstParamTy)]
@@ -112,7 +109,7 @@ impl Stack {
   /// accessible by the current process.
   ///
   ///
-  #[cfg(not(feature = "std"))]
+  #[cfg(not(feature = "alloc"))]
   pub unsafe fn from_raw(base: NonNull<()>, size: NonZeroUsize) -> Self {
     Self { base, size }
   }
@@ -125,7 +122,7 @@ impl Stack {
   /// This method panics if it fails to reserve enough memory for
   /// the stack, or if it cannot protect the guard page against
   /// access by the current process.
-  #[cfg(feature = "std")]
+  #[cfg(feature = "alloc")]
   #[must_use]
   pub fn allocate(min_size: usize) -> Self {
     // The size of the stack must be a multiple of the page size, since
@@ -212,16 +209,17 @@ impl Stack {
   // care must be taken.
   pub unsafe fn push<T, F: FnOnce(NonNull<T>) -> T>(
     &mut self,
-    sp: StackPtr, // todo: take as `&mut StackPtr`.
+    sp: &mut StackPtr,
     f: F,
-  ) -> (NonNull<T>, StackPtr) {
-    let loc = next_slot(sp);
+  ) -> NonNull<T> {
+    let loc = next_slot(*sp);
     unsafe { loc.write(f(loc)) };
-    let sp = match GROWTH_DIR {
+    *sp = match GROWTH_DIR {
       GrowthDir::Upwards => unsafe { loc.add(1) },
       GrowthDir::Downwards => loc,
-    };
-    (loc, sp.cast())
+    }
+    .cast();
+    loc
   }
 
   /*fn control_addr(&self) -> NonNull<MaybeUninit<Control>> {
@@ -263,7 +261,7 @@ pub(crate) fn next_slot<T>(sp: StackPtr) -> NonNull<T> {
   .cast()
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 impl Drop for Stack {
   fn drop(&mut self) {
     os::free_stack(self.base, self.size);
@@ -274,11 +272,11 @@ impl Drop for Stack {
 /// of [coroutines].
 ///
 /// [coroutines]: crate::Coro
-#[cfg(feature = "std")]
 #[derive(Default)]
+#[cfg(feature = "alloc")]
 pub struct StackPool(Vec<Stack>);
 
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 impl StackPool {
   /// Creates a new storage pool.
   pub const fn new() -> Self {
@@ -309,23 +307,30 @@ impl StackPool {
   }
 }
 
-#[cfg(feature = "std")]
-thread_local! {
-  /// A per-thread pool of available program stacks.
-  pub(crate) static COMMON_POOL: RefCell<StackPool> = const { RefCell::new(StackPool::new()) };
+/// Returns a mutable reference to a per-thread pool of available
+/// program stacks.
+///
+/// # Safety
+///
+/// This function is sound to call only if there are no active
+/// references (mutable or not) to the thread-local common pool.
+#[cfg(feature = "common_pool")]
+pub(crate) unsafe fn common_pool() -> &'static mut StackPool {
+  #[thread_local]
+  static POOL: UnsafeCell<StackPool> = const { UnsafeCell::new(StackPool::new()) };
+  unsafe { &mut *POOL.get() }
 }
 
 #[cfg(all(test, feature = "alloc"))]
 mod stack_tests {
   use super::*;
-  use std::ptr;
 
-  #[cfg(feature = "std")]
+  #[cfg(feature = "alloc")]
   fn alloc_stack(min_size: usize) -> ((), Stack) {
     ((), Stack::allocate(min_size))
   }
 
-  #[cfg(not(feature = "std"))]
+  #[cfg(not(feature = "alloc"))]
   fn alloc_stack(size: usize) -> (Box<[u8]>, Stack) {
     let reg = alloc::boxed::Box::new_uninit_slice(size);
     let stack = unsafe { Stack::new_unchecked(reg.as_ptr(), size) };
@@ -337,7 +342,7 @@ mod stack_tests {
     let min_size = 1 << 13;
     let (_reg, stack) = alloc_stack(min_size);
     assert!(stack.size.get() >= min_size);
-    #[cfg(feature = "std")]
+    #[cfg(feature = "alloc")]
     {
       let page_size = os::page_size().get();
       assert!(stack.base.is_aligned_to(page_size));
@@ -377,7 +382,7 @@ mod stack_tests {
   }*/
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(all(test, feature = "alloc"))]
 mod pool_tests {
   use super::*;
 

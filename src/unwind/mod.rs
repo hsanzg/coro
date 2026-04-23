@@ -2,8 +2,9 @@
 mod imp;
 
 pub use self::imp::*;
-use std::mem::ManuallyDrop;
+use core::mem::ManuallyDrop;
 
+#[expect(clippy::result_unit_err)]
 pub fn catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, ()> {
   union Data<F, R> {
     f: ManuallyDrop<F>,

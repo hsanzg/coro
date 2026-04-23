@@ -48,8 +48,8 @@
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
-#[cfg(feature = "std")]
-extern crate std;
+//#[cfg(feature = "std")]
+//extern crate std;
 
 mod arch;
 pub mod stack;
@@ -64,7 +64,6 @@ use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
 use core::ptr;
 use core::ptr::NonNull;
-use std::println;
 
 // The big picture:
 // A coroutine stores a nonnull pointer to a "continuation", which contains
@@ -164,6 +163,8 @@ static ACTIVE: Cell<*mut Control> = Cell::new(ptr::null_mut());
 
 #[repr(C)]
 struct Bottom<F> {
+  /// A control record used to store status information during
+  /// transfers of control that involve this coroutine.
   ctrl: Control,
   func: ManuallyDrop<F>,
 }
@@ -174,36 +175,76 @@ struct Bottom<F> {
 // Another way to say this: for ergonomic reasons, we would like `Coro` to be
 // `Unpin`, i.e. not address-sensitive.
 
+/// The default size in bytes of the [program stack] of a [coroutine].
+/// We currently use Rust's [default stack size] for a thread, 2 MiB.
+///
+/// [program stack]: Stack
+/// [coroutine]: Coro
+/// [default stack size]: std::thread#stack-size
+pub const DEFAULT_STACK_SIZE: usize = 1 << 21;
+
 /// A first-class stackful asymmetric coroutine.
 ///
 /// The [crate-level documentation] discusses this type in more detail.
 ///
 /// [crate-level documentation]: crate
 pub struct Coro<R, F: FnOnce() -> R + Unpin> {
-  /// This record is stored at the bottom of the coroutine's stack.
   bottom: NonNull<Bottom<F>>,
+  // todo: finish comment.
   /// The program stack of the coroutine.
-  #[cfg(feature = "std")]
   stack: ManuallyDrop<Stack>,
 }
 
 impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
+  /// Creates a new coroutine that is to execute the given [`FnOnce`]
+  /// instance on a separate [stack] of size [`DEFAULT_STACK_SIZE`].
+  ///
+  /// The program stack is taken from a common thread-local pool of
+  /// memory; the coroutine's destructor returns it to that same pool.
+  ///
+  /// [stack]: Stack
+  #[cfg(feature = "common_pool")]
+  #[must_use = "method creates a coroutine but does not begin its execution"]
   pub fn new(f: F) -> Self {
-    let stack = Stack::allocate(1 << 21);
+    let stack = {
+      // SAFETY: We have exclusive access to the thread-local pool.
+      let pool = unsafe { stack::common_pool() };
+      pool.take(DEFAULT_STACK_SIZE)
+    };
     Self::with_stack(f, stack)
   }
 
+  /// Creates a new coroutine that is to execute the given [`FnOnce`]
+  /// instance on the provided program stack.
+  ///
+  /// If the `common_pool` feature is enabled, [`Coro::drop`] returns
+  /// the stack to the thread-local storage pool when the coroutine is
+  /// no longer needed. Otherwise, if feature `alloc` is enabled, you
+  /// may use [`drop_and_take_stack`] to reclaim the stack before the
+  /// coroutine's destructor deallocates it.
+  ///
+  /// [`drop_and_take_stack`]: Self::drop_and_take_stack
+  #[must_use = "method creates a coroutine but does not begin its execution"]
   pub fn with_stack(f: F, stack: Stack) -> Self {
     let mut stack = ManuallyDrop::new(stack);
-    let sp = stack.bottom();
-    let (bottom, _) = unsafe {
-      stack.push(sp, |loc| Bottom {
+    let mut sp = stack.bottom();
+    let bottom = unsafe {
+      stack.push(&mut sp, |loc| Bottom {
         ctrl: Control {
           stack_ptr: arch::initial_sp(loc),
           inst_ptr: arch::trampoline::<R, F> as *const _,
           caller: ptr::null_mut(),
           _pin: PhantomPinned,
         },
+        // todo: finish comment.
+        // Make a bitwise copy of the `FnOnce` instance on the new stack, in
+        // order to pin it to a fixed memory location.
+        // that its location in memory remains stable across context switches.
+        //
+
+        // order to pin it in a stable place across control transfers.
+        // (Leaving it in the `Coro` is not an option, because the coroutine is
+        // `Unpin` and thus free to be moved around in memory.)
         func: ManuallyDrop::new(f),
       })
     };
@@ -221,10 +262,6 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   }
 
   /// Returns an exclusive reference to the control record of this coroutine.
-  ///
-  /// # Safety
-  ///
-  ///
   #[inline]
   fn control(&self) -> &Control {
     // SAFETY:
@@ -242,6 +279,8 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
     &mut unsafe { self.bottom.as_mut() }.ctrl
   }
 
+  /// Returns a mutable reference to the [`FnOnce`] instance,
+  /// placed in its program stack.
   #[inline]
   fn func(&mut self) -> &mut ManuallyDrop<F> {
     &mut unsafe { self.bottom.as_mut() }.func
@@ -257,7 +296,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
     self.control().inst_ptr != arch::trampoline::<R, F> as *const _
   }
 
-  // todo: find better name?
+  // todo: find better name? `is_suspended`?
   #[must_use]
   pub fn is_paused(&self) -> bool {
     let ctrl = self.control();
@@ -303,12 +342,12 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
     // Push ourselves to the stack of active coroutines.
     let ctrl = self.control_mut();
     ctrl.caller = ACTIVE.replace(ctrl);
-    println!(
+    /*println!(
       "resume: transferring control to {:?} (sp={:?}, ip={:?})",
       ptr::from_mut(ctrl),
       ctrl.stack_ptr,
       ctrl.inst_ptr
-    );
+    );*/
     // SAFETY: The coroutine has exclusive access to its stack at this point.
     unsafe { arch::transfer_control(ctrl) };
     // The coroutine's computation has transferred control back.
@@ -328,9 +367,20 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
     }
   }
 
-  // todo: add cfg for non common stack pool.
-  unsafe fn take_stack(mut self) -> Stack {
-    unsafe { ManuallyDrop::take(&mut self.stack) }
+  /// Consumes the (suspended) coroutine, and returns its program stack.
+  ///
+  /// The stack is filled with undefined information, but it can be
+  /// passed to [`Coro::with_stack`] to construct a new coroutine.
+  ///
+  // todo: complete with details: (or document these in `drop`)
+  /// first unwinds the stack if necessary, destroys the coroutine,
+  /// and then returns the stack.
+  #[cfg(all(feature = "alloc", not(feature = "common_pool")))]
+  unsafe fn drop_and_take_stack(mut self) -> Stack {
+    // SAFETY: We forget `self` immediately after calling `drop_`.
+    let stack = unsafe { drop_(&mut self) };
+    core::mem::forget(self);
+    stack
   }
 }
 
@@ -359,23 +409,20 @@ extern "C-unwind" fn trampoline<R, F>(mut bottom: NonNull<Bottom<F>>) -> !
 where
   F: FnOnce() -> R + Unpin,
 {
-  /*let control_bot = match GROWTH_DIR {
-    GrowthDir::Upwards => control_ptr,
-    GrowthDir::Downwards => unsafe { control_ptr.add(1) },
-  };
-  let mut f_ptr = next_slot::<_, { GROWTH_DIR.rev() }>(control_bot.cast());
-  println!("reading f_ptr={f_ptr:?}");
-  let f: &mut ManuallyDrop<F> = unsafe { f_ptr.as_mut() };*/
-
   // SAFETY: `arch::transfer_control` passes the address of the control
-  //         record at the bottom of the stack of a coroutine, in the
-  //         register for the `bottom` argument, according to the current ABI.
+  //  record at the bottom of the stack of a coroutine, in the register
+  //  for the `bottom` argument, according to the current ABI. We have
+  //  exclusive access to the `Bottom` object, so it is sound to convert
+  //  `bottom` into a unique reference. To see why, notice that calling
+  //  `Coro::resume` is the only way to reach this trampoline function:
+  //  that function calls `arch::transfer_control`, which borrows the
+  //  control recrd mutably and jumps to the trampoline from assembly
+  //  code.
   let f = &mut unsafe { bottom.as_mut() }.func;
   // SAFETY: The destructor of `Coro` drops the `func` field only if the
-  //         coroutine is never activated (that is, if this trampoline
-  //         function is never invoked). And this trampoline is called
-  //         only once, so there's no risk to move out `func` from the
-  //         coroutine twice.
+  //  coroutine is never activated (that is, if this trampoline function
+  //  is never invoked). And this trampoline is called only once, hence
+  //  there's no risk to move out `func` from the coroutine twice.
   let f = unsafe { ManuallyDrop::take(f) };
   // Execute the actual coroutine's program.
   let ret_val = ManuallyDrop::new(f());
@@ -394,12 +441,12 @@ where
 pub fn suspend() {
   match unsafe { ACTIVE.get().as_mut() } {
     Some(control) => {
-      println!(
+      /*println!(
         "suspend: transferring control back, reading from {:?} (sp={:?}, ip={:?})",
         ptr::from_mut(control),
         control.stack_ptr,
         control.inst_ptr
-      );
+      );*/
       // Pop the current coroutine from the stack.
       ACTIVE.set(control.caller);
       unsafe { arch::transfer_control(control) };
@@ -408,31 +455,57 @@ pub fn suspend() {
   }
 }
 
+type DropReturn = cfg_select! {
+  feature = "common_pool" => (),
+  feature = "alloc" => Stack,
+  _ => ()
+};
+
+///
+/// # Safety
+///
+/// This function is sound to call only once with the same coroutine.
+/// Such coroutine may not be used again, and that includes calling
+/// its `drop` method. Thus the only safe way to proceed after calling
+/// `drop_(&mut coro)` is to do `core::mem::forget(coro)`.
+unsafe fn drop_<R, F: FnOnce() -> R + Unpin>(coro: &mut Coro<R, F>) -> DropReturn {
+  if likely(coro.has_started()) {
+    // We need to unwind the coroutine's stack manually if it was left in progress.
+    if coro.is_paused() {
+      let ctrl = coro.control_mut();
+      // println!("coroutine has not panicked, unwinding... control={ctrl:?}");
+      unsafe { arch::force_unwind(ctrl) };
+    }
+  } else {
+    // The coroutine was never activated, so `self.func`
+    // still holds the coroutine's program. Drop it now.
+    unsafe { ManuallyDrop::drop(coro.func()) };
+  }
+  // SAFETY: `self.stack` is not used again.
+  let stack = unsafe { ManuallyDrop::take(&mut coro.stack) };
+  cfg_select! {
+    feature = "common_pool" => {
+      // SAFETY: We have exclusive access to the thread-local pool.
+      let pool = unsafe { stack::common_pool() };
+      pool.give(stack);
+    },
+    feature = "alloc" => stack,
+    _ => {}
+  }
+}
+
 impl<R, F: FnOnce() -> R + Unpin> Drop for Coro<R, F> {
   fn drop(&mut self) {
-    if likely(self.has_started()) {
-      // We need to unwind the coroutine's stack manually if it was left in progress.
-      if self.is_paused() {
-        let ctrl = self.control_mut();
-        println!("coroutine has not panicked, unwinding... control={ctrl:?}");
-        unsafe { arch::force_unwind(ctrl) };
-      }
-    } else {
-      // The coroutine was never activated, so `self.func`
-      // still holds the coroutine's program. Drop it now.
-      unsafe { ManuallyDrop::drop(self.func()) };
-    }
-    #[cfg(feature = "std")]
-    stack::COMMON_POOL.with_borrow_mut(|pool| {
-      // SAFETY: `self.stack` is not used again.
-      let stack = unsafe { ManuallyDrop::take(&mut self.stack) };
-      pool.give(stack);
-    })
+    // SAFETY: This is the only exception to the rule, since we are
+    // already inside `Coro`'s destructor.
+    unsafe { drop_(self) };
   }
 }
 
 #[cfg(test)]
 mod tests {
+  extern crate std;
+
   use super::*;
   use std::println;
 

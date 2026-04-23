@@ -52,8 +52,6 @@ extern crate alloc;
 extern crate std;
 
 mod arch;
-#[cfg(feature = "std")]
-mod os;
 pub mod stack;
 pub mod unwind;
 

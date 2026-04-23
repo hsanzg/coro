@@ -1,3 +1,7 @@
+//! Platform-specific functionality for the current operating system.
+#[cfg_attr(unix, path = "unix.rs")]
+mod os;
+
 use crate::Control;
 #[cfg(feature = "std")]
 use alloc::vec::Vec;
@@ -128,14 +132,14 @@ impl Stack {
     // we need to align the guard page to a page boundary. It also needs
     // to be larger than the page size, because otherwise the stack would
     // consist of a single guard page with no space available for data.
-    let page_size = crate::os::page_size();
+    let page_size = os::page_size();
     let size = min_size
       .max(2 * page_size.get())
       .checked_next_multiple_of(page_size.get())
       .expect("stack size overflows a `usize` after page alignment");
     // SAFETY: We have `size >= 2 * page_size > 0`.
     let size = unsafe { NonZeroUsize::new_unchecked(size) };
-    let base = crate::os::alloc_stack(size);
+    let base = os::alloc_stack(size);
     Self { base, size }
   }
 
@@ -262,7 +266,7 @@ pub(crate) fn next_slot<T>(sp: StackPtr) -> NonNull<T> {
 #[cfg(feature = "std")]
 impl Drop for Stack {
   fn drop(&mut self) {
-    crate::os::free_stack(self.base, self.size);
+    os::free_stack(self.base, self.size);
   }
 }
 
@@ -335,7 +339,7 @@ mod stack_tests {
     assert!(stack.size.get() >= min_size);
     #[cfg(feature = "std")]
     {
-      let page_size = crate::os::page_size().get();
+      let page_size = os::page_size().get();
       assert!(stack.base.is_aligned_to(page_size));
     }
   }

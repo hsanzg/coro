@@ -1,4 +1,4 @@
-use crate::stack::{GROWTH_DIR, GrowthDir};
+use super::{GROWTH_DIR, GrowthDir};
 use core::ffi::c_int;
 use core::num::NonZeroUsize;
 use core::ptr;

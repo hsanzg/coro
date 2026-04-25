@@ -1,6 +1,11 @@
+mod common;
+
+use common::*;
+use core::cell::Cell;
+use core::panic::AssertUnwindSafe;
 use coro::{Coro, suspend};
-use std::cell::Cell;
-use std::panic::AssertUnwindSafe;
+use std::panic::{catch_unwind, resume_unwind};
+use std::thread::panicking;
 
 /// Sets `self.0` to `true` when dropped.
 struct DropRecorder<'a>(&'a Cell<bool>);
@@ -14,7 +19,7 @@ impl Drop for DropRecorder<'_> {
 #[test]
 fn no_unwind_when_not_started() {
   let dropped = Cell::new(false);
-  let _ = Coro::new(|| {
+  let _ = new_coro(|| {
     let _rec = DropRecorder(&dropped);
   });
   assert!(!dropped.get());
@@ -23,14 +28,14 @@ fn no_unwind_when_not_started() {
 #[test]
 fn unwind_when_finished() {
   let dropped = Cell::new(false);
-  let mut coro = Coro::new(|| {
+  let mut coro = new_coro(|| {
     let _rec = DropRecorder(&dropped);
     suspend();
     123
   });
   coro.resume();
+  assert!(!dropped.get());
   coro.resume();
-  assert!(coro.has_finished());
   assert!(dropped.get());
 }
 
@@ -42,72 +47,148 @@ fn unwind_on_drop_before_finished() {
     suspend();
   });
   coro.resume();
-  assert!(!coro.has_finished());
+  assert!(!dropped.get());
   drop(coro);
   assert!(dropped.get());
 }
 
 #[test]
+fn unwind_when_finished_within_pausing_coro() {
+  let inner_dropped = Cell::new(false);
+  let mut inner = new_coro(|| {
+    let _rec = DropRecorder(&inner_dropped);
+    suspend();
+  });
+  let mut outer = new_coro(|| {
+    inner.resume();
+    assert!(!inner_dropped.get());
+    suspend();
+    assert!(!inner_dropped.get());
+    inner.resume();
+    assert!(inner_dropped.get());
+  });
+  outer.resume();
+  outer.resume();
+}
+
+#[test]
 fn unwind_unfinished_inner_when_outer_finishes() {
   let inner_dropped = Cell::new(false);
-  let inner_dropped_ref = AssertUnwindSafe(&inner_dropped);
   let mut outer = Coro::new(|| {
     let mut inner = Coro::new(|| {
-      let _rec = DropRecorder(*inner_dropped_ref);
+      let _rec = DropRecorder(&inner_dropped);
       suspend();
     });
     inner.resume();
   });
   outer.resume();
   assert!(inner_dropped.get());
-  drop(outer);
 }
 
 #[test]
-fn do_not_unwind_unfinished_inner_when_outer_finishes_if_decl_outside() {
+fn do_not_unwind_unfinished_inner_when_it_outlives_outer() {
   let inner_dropped = Cell::new(false);
-  let inner_dropped_ref = AssertUnwindSafe(&inner_dropped);
-  let mut inner = Coro::new(|| {
-    let _rec = DropRecorder(*inner_dropped_ref);
+  let mut inner = new_coro(|| {
+    let _rec = DropRecorder(&inner_dropped);
     suspend();
   });
-  Coro::new(|| inner.resume()).resume();
+  let mut outer = Coro::new(|| {
+    inner.resume();
+  });
+  outer.resume();
   assert!(!inner_dropped.get());
+  drop(outer);
+  assert!(!inner_dropped.get());
+  drop(inner);
+  assert!(inner_dropped.get());
 }
 
 #[test]
 fn unwind_unfinished_inner_on_outer_drop_before_finished() {
   let inner_dropped = Cell::new(false);
-  let inner_dropped_ref = AssertUnwindSafe(&inner_dropped);
-  let mut outer = Coro::new(move || {
+  let mut outer = Coro::new(|| {
     let mut inner = Coro::new(|| {
-      let _rec = DropRecorder(*inner_dropped_ref);
+      let _rec = DropRecorder(&inner_dropped);
       suspend();
     });
     inner.resume();
     // The only difference between `unwind_unfinished_inner_when_outer_finishes`
-    // and this test is that here we call `suspend` to drop the outer subroutine
-    // before it completely finishes execution.
+    // and this test is that here we call `suspend` to drop the
+    // outer subroutine before it completely finishes execution.
     suspend();
   });
   outer.resume();
+  assert!(!inner_dropped.get());
   drop(outer);
   assert!(inner_dropped.get());
+}
+
+#[test]
+fn user_unwind() {
+  let dropped = Cell::new(false);
+  let dropped_ref = AssertUnwindSafe(&dropped);
+  let res = catch_unwind(move || {
+    Coro::new(|| {
+      let _rec = DropRecorder(*dropped_ref);
+      resume_unwind(Box::new(()));
+    })
+    .resume();
+  });
+  assert!(res.is_err());
+  assert!(dropped.get());
+}
+
+/// On drop, checks that the current thread is unwinding
+/// because of a panic.
+struct PanicObserver;
+
+impl Drop for PanicObserver {
+  fn drop(&mut self) {
+    assert!(panicking());
+  }
 }
 
 #[test]
 fn unwind_on_panic() {
   let dropped = Cell::new(false);
   let dropped_ref = AssertUnwindSafe(&dropped);
-  let res = std::panic::catch_unwind(move || {
+  let res = catch_unwind(move || {
     Coro::new(|| {
       let _rec = DropRecorder(*dropped_ref);
+      let _obs = PanicObserver;
       panic!("help");
     })
     .resume()
   });
-  assert!(res.is_err());
+  assert_eq!(
+    res.expect_err("coro must panic").downcast_ref(),
+    Some(&"help")
+  );
   assert!(dropped.get());
+}
+
+#[test]
+fn unwind_on_panic_after_many_suspends_from_recursive_fn() {
+  const COUNTDOWN: u32 = 100;
+  let mut coro = new_coro(|| {
+    fn tick(t: u32) {
+      let _obs = PanicObserver;
+      if t == 0 {
+        panic!("boom");
+      }
+      suspend();
+      tick(t - 1)
+    }
+    tick(COUNTDOWN);
+  });
+  for _ in 0..COUNTDOWN {
+    coro.resume();
+  }
+  let res = catch_unwind(move || coro.resume());
+  assert_eq!(
+    res.expect_err("coro must panic").downcast_ref(),
+    Some(&"boom")
+  );
 }
 
 #[test]
@@ -118,17 +199,55 @@ fn nested_unwinds_on_inner_panic() {
   let outer_dropped_ref = AssertUnwindSafe(&outer_dropped);
   let mut inner = Coro::new(|| {
     let _rec = DropRecorder(*inner_dropped_ref);
+    let _obs = PanicObserver;
     panic!("inner");
   });
-  let res = std::panic::catch_unwind(move || {
+  let res = catch_unwind(move || {
     Coro::new(|| {
       let _rec = DropRecorder(*outer_dropped_ref);
+      let _obs = PanicObserver;
       inner.resume();
     })
     .resume()
   });
-  assert!(res.is_err());
+  assert_eq!(
+    res.expect_err("inner must panic").downcast_ref(),
+    Some(&"inner")
+  );
   assert!(inner_dropped.get());
+  assert!(outer_dropped.get());
+}
+
+#[test]
+fn doubly_nested_unwinds_on_inner_panic() {
+  let inner_dropped = Cell::new(false);
+  let middle_dropped = Cell::new(false);
+  let outer_dropped = Cell::new(false);
+  let inner_dropped_ref = AssertUnwindSafe(&inner_dropped);
+  let middle_dropped_ref = AssertUnwindSafe(&middle_dropped);
+  let outer_dropped_ref = AssertUnwindSafe(&outer_dropped);
+  let mut outer = Coro::new(|| {
+    let _rec = DropRecorder(*outer_dropped_ref);
+    let _obs = PanicObserver;
+    Coro::new(|| {
+      let _rec = DropRecorder(*middle_dropped_ref);
+      let _obs = PanicObserver;
+      Coro::new(|| {
+        let _rec = DropRecorder(*inner_dropped_ref);
+        let _obs = PanicObserver;
+        panic!("inner");
+      })
+      .resume();
+    })
+    .resume();
+  });
+  let res = catch_unwind(move || outer.resume());
+  assert_eq!(
+    res.expect_err("inner must panic").downcast_ref(),
+    Some(&"inner")
+  );
+  assert!(inner_dropped.get());
+  assert!(middle_dropped.get());
   assert!(outer_dropped.get());
 }
 
@@ -140,34 +259,95 @@ fn nested_unwinds_on_outer_panic() {
   let outer_dropped_ref = AssertUnwindSafe(&outer_dropped);
   let mut inner = Coro::new(|| {
     let _rec = DropRecorder(*inner_dropped_ref);
+    let _obs = PanicObserver;
     suspend();
   });
-  let res = std::panic::catch_unwind(move || {
+  let res = catch_unwind(move || {
     Coro::new(|| {
       let _rec = DropRecorder(*outer_dropped_ref);
+      let _obs = PanicObserver;
       inner.resume();
       panic!("outer");
     })
     .resume()
   });
-  assert!(res.is_err());
-  println!("outer coroutine panicked, and caught it: {res:?}");
+  assert_eq!(
+    res.expect_err("outer must panic").downcast_ref(),
+    Some(&"outer")
+  );
   assert!(inner_dropped.get());
   assert!(outer_dropped.get());
 }
 
 #[test]
-fn nested_unwinds_within_coroutine() {
-  Coro::new(nested_unwinds_on_outer_panic).resume();
+fn doubly_nested_unwinds_on_outer_panic() {
+  let inner_dropped = Cell::new(false);
+  let middle_dropped = Cell::new(false);
+  let outer_dropped = Cell::new(false);
+  let inner_dropped_ref = AssertUnwindSafe(&inner_dropped);
+  let middle_dropped_ref = AssertUnwindSafe(&middle_dropped);
+  let outer_dropped_ref = AssertUnwindSafe(&outer_dropped);
+  let mut outer = Coro::new(|| {
+    let _rec = DropRecorder(*outer_dropped_ref);
+    let _obs = PanicObserver;
+    // Note that the stack of the inner coroutines is not unwound
+    // as a direct consequence of the panic, but rather because
+    // their destructor is called. It is therefore incorrect to
+    // attach a `PanicObserver` to them.
+    Coro::new(|| {
+      let _rec = DropRecorder(*middle_dropped_ref);
+      Coro::new(|| {
+        let _rec = DropRecorder(*inner_dropped_ref);
+        suspend();
+      })
+      .resume();
+      suspend();
+    })
+    .resume();
+    panic!("outer");
+  });
+  let res = catch_unwind(move || outer.resume());
+  assert_eq!(
+    res.expect_err("outer must panic").downcast_ref(),
+    Some(&"outer")
+  );
+  assert!(inner_dropped.get());
+  assert!(middle_dropped.get());
+  assert!(outer_dropped.get());
 }
 
 #[test]
-fn panic_with_payload() {
-  let res = std::panic::catch_unwind(|| {
-    Coro::new(|| {
-      panic!("foo");
-    })
-    .resume()
+fn catch_panic_unwind_within_coro() {
+  Coro::new(|| {
+    let res = catch_unwind(|| panic!("help"));
+    assert!(res.is_err());
+  })
+  .resume();
+}
+
+#[test]
+fn catch_unwind_of_inner_coro_within_coro() {
+  let thrower_dropped = Cell::new(false);
+  let catcher_dropped = Cell::new(false);
+  let thrower_dropped_ref = AssertUnwindSafe(&thrower_dropped);
+  let mut catcher = Coro::new(|| {
+    let _rec = DropRecorder(&catcher_dropped);
+    let mut thrower = Coro::new(|| {
+      let _rec = DropRecorder(*thrower_dropped_ref);
+      panic!("bet you can't catch me!");
+    });
+    let res = catch_unwind(move || {
+      thrower.resume();
+    });
+    assert_eq!(
+      res.expect_err("thrower must panic").downcast_ref(),
+      Some(&"bet you can't catch me!")
+    );
+    assert!(thrower_dropped.get());
+    suspend();
   });
-  println!("{:?}", res.err());
+  catcher.resume();
+  assert!(!catcher_dropped.get());
+  catcher.resume();
+  assert!(catcher_dropped.get());
 }

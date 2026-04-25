@@ -225,7 +225,8 @@ pub(crate) fn next_slot<T>(sp: StackPtr) -> NonNull<T> {
 #[cfg(feature = "stack_alloc")]
 impl Drop for Stack {
   fn drop(&mut self) {
-    os::free_stack(self.base, self.size);
+    // SAFETY: This stack was allocated by `os::alloc_stack`.
+    unsafe { os::free_stack(self.base, self.size) };
   }
 }
 
@@ -271,21 +272,22 @@ impl StackPool {
   }
 }
 
-/// Returns a mutable reference to the thread-local common pool
+/// Acquires a mutable reference to the thread-local common pool
 /// of available program stacks.
 ///
 /// # Safety
 ///
 /// This function is sound to call only if there are no active
 /// references (mutable or not) to the thread-local common pool.
+/// In effect, this means that `f` must not call this function.
 #[cfg(feature = "common_pool")]
-pub(crate) unsafe fn common_pool() -> &'static mut StackPool {
+pub(crate) unsafe fn borrow_common_pool<R, F: FnOnce(&mut StackPool) -> R>(f: F) -> R {
   use core::cell::UnsafeCell;
 
   #[thread_local]
   static POOL: UnsafeCell<StackPool> = UnsafeCell::new(StackPool::new());
   // SAFETY: The caller upholds the aliasing rules.
-  unsafe { &mut *POOL.get() }
+  f(unsafe { &mut *POOL.get() })
 }
 
 #[cfg(test)]

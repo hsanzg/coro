@@ -51,7 +51,7 @@
 )]
 #![feature(core_intrinsics)]
 #![feature(likely_unlikely)]
-#![cfg_attr(test, feature(pointer_is_aligned_to))]
+#![cfg_attr(all(test, feature = "stack_alloc"), feature(pointer_is_aligned_to))]
 #![no_std]
 #[cfg(feature = "stack_alloc")]
 extern crate alloc;
@@ -211,11 +211,8 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   #[cfg(feature = "common_pool")]
   #[must_use = "method creates a coroutine but does not begin its execution"]
   pub fn new(f: F) -> Self {
-    let stack = {
-      // SAFETY: We have exclusive access to the thread-local pool.
-      let pool = unsafe { stack::common_pool() };
-      pool.take(DEFAULT_STACK_SIZE)
-    };
+    // SAFETY: We have exclusive access to the thread-local pool.
+    let stack = unsafe { stack::borrow_common_pool(|pool| pool.take(DEFAULT_STACK_SIZE)) };
     Self::with_stack(f, stack)
   }
 
@@ -491,8 +488,7 @@ unsafe fn drop_<R, F: FnOnce() -> R + Unpin>(coro: &mut Coro<R, F>) -> DropRetur
   cfg_select! {
     feature = "common_pool" => {
       // SAFETY: We have exclusive access to the thread-local pool.
-      let pool = unsafe { stack::common_pool() };
-      pool.give(stack);
+      unsafe { stack::borrow_common_pool(|pool| pool.give(stack)) };
     },
     feature = "stack_alloc" => stack,
     _ => {}

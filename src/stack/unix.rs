@@ -3,7 +3,6 @@ use core::num::NonZeroUsize;
 use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use libc::__errno_location;
 
 /// Returns the default page size on the current architecture.
 pub fn page_size() -> NonZeroUsize {
@@ -85,11 +84,12 @@ pub fn alloc_stack(size: NonZeroUsize) -> NonNull<u8> {
   unsafe { NonNull::new_unchecked(base.cast()) }
 }
 
-/// Deallocates
+/// Frees a memory area previously allocated by [`alloc_stack`].
 ///
 /// # Safety
 ///
-/// must have been previously allocated by [`alloc_stack`].
+/// The pointer `base` must be the return value of a previous
+/// call to [`alloc_stack`] with argument `size`.
 pub unsafe fn free_stack(base: NonNull<u8>, size: NonZeroUsize) {
   // Delete the mappings for the stack's address range.
   assert_eq!(

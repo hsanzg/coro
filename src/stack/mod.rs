@@ -281,9 +281,11 @@ impl StackPool {
 /// references (mutable or not) to the thread-local common pool.
 /// In effect, this means that `f` must not call this function.
 #[cfg(feature = "common_pool")]
-pub(crate) unsafe fn borrow_common_pool<R, F: FnOnce(&mut StackPool) -> R>(f: F) -> R {
+pub(crate) unsafe fn borrow_common_pool<R, F>(f: F) -> R
+where
+  F: FnOnce(&mut StackPool) -> R,
+{
   use core::cell::UnsafeCell;
-
   #[thread_local]
   static POOL: UnsafeCell<StackPool> = UnsafeCell::new(StackPool::new());
   // SAFETY: The caller upholds the aliasing rules.

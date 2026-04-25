@@ -2,7 +2,6 @@
 #[cfg_attr(unix, path = "unix.rs")]
 mod os;
 
-use crate::Control;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
@@ -33,22 +32,15 @@ pub const GROWTH_DIR: GrowthDir = const { GrowthDir::Downwards };
 /// [program stacks]: Stack
 /// [towards zero]: GrowthDir::Downwards
 /// [upwards]: GrowthDir::Upwards
-pub type StackPtr = NonNull<()>;
+pub type StackPtr = NonNull<u8>;
 
 /// A set of contiguous memory pages where a [coroutine] is free to
 /// store any data.
 ///
-// todo: this is incorrect; the bottom taken by the `FnOnce` instance.
-/// The [`resume`] and [`suspend`] operations employ the bottommost
-/// [`Control::SIZE`] bytes of a coroutine's stack to record status
-/// information during transfers of control. (Here the meaning of
-/// "bottommost" depends on the [stack growth convention] on the
-/// current platform.) The actual stack contents appear on top of
-/// the control record.
-///
-// todo: say that only in architectures that support memory protection.
-/// To guard against overflows, the topmost page of a program stack
-/// is _protected_. (Again, the meaning of "topmost" depends on the
+/// The page table systems of almost all modern computers support
+/// memory protection via permission bits. In such computers, to
+/// guard against overflows, the topmost page of a program stack
+/// is _protected_. (Here the meaning of "topmost" depends on the
 /// [stack growth convention] on the current platform.) In this way
 /// the process does not have permission to read from nor write to
 /// any memory location within this [_guard page_]; any attempt to
@@ -62,22 +54,12 @@ pub type StackPtr = NonNull<()>;
 /// [stack growth direction]: GROWTH_DIR
 /// [_guard page_]: https://devblogs.microsoft.com/oldnewthing/20220203-00/?p=106215
 pub struct Stack {
-  // todo: Finish doc comment.
-  /// The lowest address of any memory cell in the stack.
-  ///
-  /// this is not necessarily the
-  ///
-  /// It is important to note that this field does not
-  /// necessarily point to the [bottom] of the stack.
-  ///
-  /// [bottom]: Self::bottom
-  base: NonNull<()>,
-  /// The number of bytes occupied by the stack, including its
-  /// guard page.
-  size: NonZeroUsize,
+  base: NonNull<u8>,
+  size: NonZeroUsize, // bytes.
 }
 
 impl Stack {
+  // todo: finish doc comment.
   /// Assigns an area of memory to a new program stack.
   ///
   /// # Safety
@@ -90,8 +72,9 @@ impl Stack {
   /// 3. The topmost page of the allocation (with respect to the stack
   ///   growth direction) must not be accessible by the current process;
   /// 4. The remaining pages are readable and writable but not executable
-  ///    by the current process, on architectures that support this feature;
+  ///    by the current process, on architectures that support memory protection;
   /// 5. `size` is a multiple of the system's page size.
+  /// 6. `base` must be aligned to a page boundary.
   ///
   /// Failure to satisfy these requirements may lead to undefined
   /// behavior, including memory corruption or failure to detect
@@ -102,7 +85,7 @@ impl Stack {
   /// This method does not initialize the stack contents; the caller
   /// is responsible for ensuring that any data written to the stack
   /// is properly initialized before being read.
-  /// The `MaybeUninit` type may be of help.
+  /// The [`MaybeUninit`] type may be of help in this respect.
   ///
   /// a (possibly partly-uninitialized) region of memory that can be used
   /// as a program stack. The topmost page of this region must not be
@@ -110,7 +93,7 @@ impl Stack {
   ///
   ///
   #[cfg(not(feature = "alloc"))]
-  pub unsafe fn from_raw(base: NonNull<()>, size: NonZeroUsize) -> Self {
+  pub unsafe fn from_raw(base: NonNull<u8>, size: NonZeroUsize) -> Self {
     Self { base, size }
   }
 
@@ -122,6 +105,19 @@ impl Stack {
   /// This method panics if it fails to reserve enough memory for
   /// the stack, or if it cannot protect the guard page against
   /// access by the current process.
+  ///
+  /// # Example
+  ///
+  /// Allocate an 8-kilobyte program stack:
+  ///
+  /// ```
+  /// use coro::stack::Stack;
+  ///
+  /// let min_size = 1 << 13;
+  /// let stack = Stack::allocate(min_size);
+  ///
+  /// assert!(stack.size().get() >= min_size);
+  /// ```
   #[cfg(feature = "alloc")]
   #[must_use]
   pub fn allocate(min_size: usize) -> Self {
@@ -140,10 +136,33 @@ impl Stack {
     Self { base, size }
   }
 
+  /// Returns the smallest memory location within the stack area,
+  /// including its guard page. This address is aligned with the
+  /// beginning of a page.
+  ///
+  /// It is important to note that the returned pointer does not
+  /// necessarily point to the [bottom] of the stack; this occurs
+  /// if and only if program stacks grow [upwards] on the current
+  /// platform.
+  ///
+  /// [bottom]: Self::bottom
+  /// [upwards]: GrowthDir::Upwards
+  pub fn base(&self) -> NonNull<u8> {
+    self.base
+  }
+
+  /// Returns the number of bytes occupied by the stack, including
+  /// its guard page. This value is a multiple of the system's
+  /// [page size](os::page_size).
+  pub fn size(&self) -> NonZeroUsize {
+    self.size
+  }
+
   /// If the stack grows [towards zero], returns the location one
   /// byte below the bottom of the stack. Otherwise (namely if the
   /// stack grows [upwards]) it gives the address of the item that
-  /// would appear at the bottom of the stack.
+  /// would appear at the bottom of the stack. In both cases the
+  /// address is aligned with the beginning of a page.
   ///
   /// This concept should not be confused with the [base address]
   /// of the stack.
@@ -151,46 +170,15 @@ impl Stack {
   /// [upwards]: GrowthDir::Upwards
   /// [downwards]: GrowthDir::Downwards
   /// [base address]: Self::base
-  pub(crate) fn bottom(&self) -> NonNull<()> {
+  pub(crate) fn bottom(&self) -> NonNull<u8> {
     match GROWTH_DIR {
-      GrowthDir::Upwards => unsafe { self.base.byte_add(Control::SIZE) },
-      // SAFETY: The last location of the stack is `base + size - 1`.
-      GrowthDir::Downwards => unsafe { self.base.byte_add(self.size.get() - Control::SIZE) },
+      GrowthDir::Upwards => self.base,
+      // SAFETY: The last byte of the stack is at address `base + size - 1`.
+      GrowthDir::Downwards => unsafe { self.base.add(self.size.get()) },
     }
   }
 
-  /// Returns a pointer that refers to the location `count` bytes
-  /// above the [bottom] of the stack, following the [stack growth
-  /// direction] on the current platform.
-  ///
-  /// # Safety
-  ///
-  /// This operation is always safe, but using the resulting pointer
-  /// is not. For example, the pointer might link to an uninitialized
-  /// position in the stack. Further offsetting operations might cause
-  /// overflow, underflow, or produce the [zero address].
-  ///
-  /// # Panics
-  ///
-  /// This method panics if the result is not a memory location within
-  /// the stack area.
-  ///
-  /// [bottom]: Self::bottom
-  /// [stack growth direction]: GROWTH_DIR
-  /// [zero address]: core::ptr::null
-  // todo: is this method needed?
-  pub fn byte_offset(&self, count: usize) -> NonNull<()> {
-    assert!(
-      count <= self.size.get(),
-      "offset {count} overflows the stack"
-    );
-    match GROWTH_DIR {
-      GrowthDir::Upwards => unsafe { self.base.byte_add(count) },
-      GrowthDir::Downwards => unsafe { self.bottom().byte_sub(count) },
-    }
-  }
-
-  /// Returns whether `addr` refers to a location within the stack
+  /// Returns whether `addr` refers to a location within this stack
   /// or its guard page. The [bottom location] of the stack is part
   /// of the stack if and only if program stacks grow [upwards] on
   /// the [current platform].
@@ -198,8 +186,7 @@ impl Stack {
   /// [bottom location]: Self::bottom
   /// [upwards]: GrowthDir::Upwards
   /// [current platform]: GROWTH_DIR
-  // todo: is this method needed?
-  pub fn contains(&self, addr: NonNull<()>) -> bool {
+  pub fn contains(&self, addr: NonNull<u8>) -> bool {
     let offset = addr.addr().get().wrapping_sub(self.base.addr().get());
     offset < self.size.get()
   }
@@ -221,30 +208,6 @@ impl Stack {
     .cast();
     loc
   }
-
-  /*fn control_addr(&self) -> NonNull<MaybeUninit<Control>> {
-    match GROWTH_DIR {
-      GrowthDir::Upwards => self.base,
-      GrowthDir::Downwards => self.bottom(),
-    }
-    .cast()
-  }*/
-
-  /*/// Returns a reference to the control record in this stack.
-  pub(crate) unsafe fn control(&self) -> Pin<&MaybeUninit<Control>> {
-    // SAFETY:
-    let control = unsafe { self.control_addr().cast().as_ref() };
-    unsafe { Pin::new_unchecked(control) }
-  }
-
-  /// Returns a mutable reference to the control record in this stack.
-  pub(crate) unsafe fn control_mut(&mut self) -> Pin<&mut MaybeUninit<Control>> {
-    // SAFETY:
-    // todo: document that caller guarantees that we have exclusive
-    //  access to the control record.
-    let control = unsafe { self.control_addr().cast().as_mut() };
-    unsafe { Pin::new_unchecked(control) }
-  }*/
 }
 
 pub(crate) fn next_slot<T>(sp: StackPtr) -> NonNull<T> {
@@ -272,9 +235,12 @@ impl Drop for Stack {
 /// of [coroutines].
 ///
 /// [coroutines]: crate::Coro
-#[derive(Default)]
 #[cfg(feature = "alloc")]
-pub struct StackPool(Vec<Stack>);
+#[derive(Default)]
+pub struct StackPool(
+  /// The list of available (currently unused) program stacks.
+  Vec<Stack>,
+);
 
 #[cfg(feature = "alloc")]
 impl StackPool {
@@ -307,8 +273,8 @@ impl StackPool {
   }
 }
 
-/// Returns a mutable reference to a per-thread pool of available
-/// program stacks.
+/// Returns a mutable reference to the thread-local common pool
+/// of available program stacks.
 ///
 /// # Safety
 ///
@@ -318,68 +284,56 @@ impl StackPool {
 pub(crate) unsafe fn common_pool() -> &'static mut StackPool {
   #[thread_local]
   static POOL: UnsafeCell<StackPool> = const { UnsafeCell::new(StackPool::new()) };
+  // SAFETY: The caller upholds the aliasing rules.
   unsafe { &mut *POOL.get() }
 }
 
-#[cfg(all(test, feature = "alloc"))]
+#[cfg(test)]
 mod stack_tests {
   use super::*;
 
-  #[cfg(feature = "alloc")]
-  fn alloc_stack(min_size: usize) -> ((), Stack) {
-    ((), Stack::allocate(min_size))
-  }
-
+  #[test]
   #[cfg(not(feature = "alloc"))]
-  fn alloc_stack(size: usize) -> (Box<[u8]>, Stack) {
-    let reg = alloc::boxed::Box::new_uninit_slice(size);
-    let stack = unsafe { Stack::new_unchecked(reg.as_ptr(), size) };
-    (reg, stack)
-  }
+  fn from_raw() {
+    use alloc::alloc::*;
 
-  #[test]
-  fn new() {
-    let min_size = 1 << 13;
-    let (_reg, stack) = alloc_stack(min_size);
-    assert!(stack.size.get() >= min_size);
-    #[cfg(feature = "alloc")]
-    {
-      let page_size = os::page_size().get();
-      assert!(stack.base.is_aligned_to(page_size));
-    }
-  }
-
-  #[test]
-  fn byte_offset_in_bounds() {
-    let (_reg, stack) = alloc_stack(16);
-    let addr = stack.byte_offset(4);
-    let offset = unsafe { addr.byte_offset_from(stack.bottom()) };
-    let expected = match GROWTH_DIR {
-      GrowthDir::Upwards => 4,
-      GrowthDir::Downwards => -4,
+    let size = NonZeroUsize::new(1 << 12).unwrap();
+    let page_size = os::page_size().get();
+    let layout = Layout::from_size_align(size.get(), page_size).unwrap();
+    let Some(base) = NonNull::new(unsafe { alloc(layout) }) else {
+      handle_alloc_error(layout);
     };
-    assert_eq!(offset, expected);
+    let stack = unsafe { Stack::from_raw(base, size) };
+
+    assert_eq!(stack.base(), base);
+    assert_eq!(stack.size(), size);
+
+    drop(stack);
+    unsafe { dealloc(base.as_ptr(), layout) };
   }
 
   #[test]
-  #[should_panic]
-  fn byte_offset_panics_on_overflow() {
-    let (_reg, stack) = alloc_stack(4);
-    let _ = stack.byte_offset(stack.size.get() + 1);
+  #[cfg(feature = "alloc")]
+  fn alloc_stack_is_page_aligned() {
+    let stack = Stack::allocate(1);
+    let page_size = os::page_size().get();
+    assert!(stack.base().is_aligned_to(page_size));
+    assert!(stack.size().get().is_multiple_of(page_size));
+    assert!(stack.bottom().is_aligned_to(page_size));
   }
 
-  /*#[test]
+  #[test]
+  #[cfg(feature = "alloc")]
   fn contains() {
-    let (_reg, stack) = alloc_stack(1 << 10);
-    assert!(stack.contains(stack.base));
-    let in_bounds = unsafe { stack.base.byte_add(1 << 8) };
-    assert!(stack.contains(in_bounds));
-    assert!(!stack.contains(NonNull::dangling()));
+    let stack = Stack::allocate(1 << 12);
+    assert!(stack.contains(stack.base()));
+    let last_byte = unsafe { stack.base().add(stack.size().get() - 1) };
+    assert!(stack.contains(last_byte));
     assert_eq!(
       stack.contains(stack.bottom()),
       GROWTH_DIR == GrowthDir::Upwards
     );
-  }*/
+  }
 }
 
 #[cfg(all(test, feature = "alloc"))]

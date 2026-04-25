@@ -1,5 +1,4 @@
 use super::{GROWTH_DIR, GrowthDir};
-use core::ffi::c_int;
 use core::num::NonZeroUsize;
 use core::ptr;
 use core::ptr::NonNull;
@@ -29,12 +28,7 @@ pub fn page_size() -> NonZeroUsize {
   unsafe { NonZeroUsize::new_unchecked(val) }
 }
 
-const MAP_STACK: c_int = cfg_select! {
-  any(target_os = "linux", target_os = "freebsd", target_os = "openbsd") => libc::MAP_STACK,
-  _ => 0
-};
-
-pub fn alloc_stack(size: NonZeroUsize) -> NonNull<()> {
+pub fn alloc_stack(size: NonZeroUsize) -> NonNull<u8> {
   // Reserve a `size`-byte area with read and write permissions only.
   // We pass the `MAP_STACK` flag to indicate that the region will be
   // used to store a program stack. On success, the kernel promises
@@ -44,7 +38,12 @@ pub fn alloc_stack(size: NonZeroUsize) -> NonNull<()> {
       ptr::null_mut(),
       size.get(),
       libc::PROT_READ | libc::PROT_WRITE,
-      libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | MAP_STACK,
+      libc::MAP_PRIVATE
+        | libc::MAP_ANONYMOUS
+        | cfg_select! {
+          any(target_os = "linux", target_os = "freebsd", target_os = "openbsd") => libc::MAP_STACK,
+          _ => 0
+        },
       -1,
       0,
     )
@@ -76,7 +75,7 @@ pub fn alloc_stack(size: NonZeroUsize) -> NonNull<()> {
   unsafe { NonNull::new_unchecked(base.cast()) }
 }
 
-pub fn free_stack(base: NonNull<()>, size: NonZeroUsize) {
+pub fn free_stack(base: NonNull<u8>, size: NonZeroUsize) {
   // Delete the mappings for the stack's address range.
   assert_eq!(
     unsafe { libc::munmap(base.cast().as_ptr(), size.get()) },

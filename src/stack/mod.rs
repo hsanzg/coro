@@ -1,12 +1,8 @@
 //! Program stacks for coroutines, and other related utilities.
 
-/// Platform-specific functionality for the current operating system.
 #[cfg_attr(unix, path = "unix.rs")]
 mod os;
 
-#[cfg(feature = "stack_alloc")]
-use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use core::num::NonZero;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
@@ -61,40 +57,40 @@ pub struct Stack {
 }
 
 impl Stack {
-  // todo: finish doc comment.
   /// Assigns an area of memory to a new program stack.
   ///
   /// # Safety
   ///
-  /// The following invariants must hold before calling this method:
-  /// 1. All addresses in the range `[base, base+size)` must point to
-  ///   the same (contiguous) allocation;
-  /// 2. The allocation remains valid for the entire lifetime of the
-  ///   returned [`Stack`], and it is not aliased mutably elsewhere; // todo: aliased in general, mutably or not. but rewrite somehow to say that coroutines may alias it.
-  /// 3. On architectures that support memory protection, the topmost
-  ///    page of the allocation (with respect to the stack growth direction)
-  ///    must not be accessible by the current process;
-  /// 4. The remaining pages are readable and writable but not executable
-  ///    by the current process;
-  /// 5. `size` is a multiple of the system's page size.
-  /// 6. `base` must be aligned to a page boundary.
+  /// The following conditions must hold before calling this method:
+  /// - Locations `base` through `base + size - 1`, inclusive, belong
+  ///   to the same [allocation];
+  /// - The allocation remains valid for the entire lifetime of the
+  ///   returned [`Stack`].
   ///
-  /// Failure to satisfy these requirements may lead to undefined
-  /// behavior, including memory corruption or failure to detect
-  /// stack overflows.
+  /// Moreover, on architectures that support memory protection,
+  /// - The pointer `base` is aligned with the beginning of a page;
+  /// - The system's page size evenly divides `size`;
+  /// - The topmost page of the stack (with respect to the stack's
+  ///   [growth direction]) is inaccessible by the current process;
+  /// - The current process also lacks permission to execute from
+  ///   any other page belonging to the stack.
+  ///
+  /// Failure to satisfy these requirements results in undefined
+  /// behavior, which may manifest itself in the form of memory
+  /// corruption and/or a stack overflow.
   ///
   /// # Notes
   ///
   /// This method does not initialize the stack contents; the caller
   /// is responsible for ensuring that any data written to the stack
-  /// is properly initialized before being read.
-  /// The [`MaybeUninit`] type and the [`ptr::write`] subroutine may be of help in this respect.
+  /// is properly initialized before being read. In this respect the
+  /// [`MaybeUninit`] type and the [`ptr::write`] function are often
+  /// useful.
   ///
-  /// a (possibly partly-uninitialized) region of memory that can be used
-  /// as a program stack. The topmost page of this region must not be
-  /// accessible by the current process.
-  ///
-  ///
+  /// [allocation]: https://doc.rust-lang.org/std/ptr/index.html#allocation
+  /// [growth direction]: GROWTH_DIR
+  /// [`MaybeUninit`]: core::mem::MaybeUninit
+  /// [`ptr::write`]: core::ptr::write
   #[cfg(not(feature = "stack_alloc"))]
   pub unsafe fn from_raw(base: NonNull<u8>, size: NonZeroUsize) -> Self {
     Self { base, size }
@@ -241,14 +237,14 @@ impl Drop for Stack {
 #[derive(Default)]
 pub struct StackPool(
   /// The list of available (currently unused) program stacks.
-  Vec<Stack>,
+  alloc::vec::Vec<Stack>,
 );
 
 #[cfg(feature = "stack_alloc")]
 impl StackPool {
   /// Creates a new storage pool.
   pub const fn new() -> Self {
-    Self(Vec::new())
+    Self(alloc::vec::Vec::new())
   }
 
   /// Reserves a program stack that can hold at least `min_size` bytes.
@@ -284,8 +280,10 @@ impl StackPool {
 /// references (mutable or not) to the thread-local common pool.
 #[cfg(feature = "common_pool")]
 pub(crate) unsafe fn common_pool() -> &'static mut StackPool {
+  use core::cell::UnsafeCell;
+
   #[thread_local]
-  static POOL: UnsafeCell<StackPool> = const { UnsafeCell::new(StackPool::new()) };
+  static POOL: UnsafeCell<StackPool> = UnsafeCell::new(StackPool::new());
   // SAFETY: The caller upholds the aliasing rules.
   unsafe { &mut *POOL.get() }
 }

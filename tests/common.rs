@@ -1,9 +1,10 @@
 use coro::Coro;
 
 pub fn new_coro<R, F: FnOnce() -> R + Unpin>(f: F) -> Coro<R, F> {
+  // todo: handle non-alloc case.
   cfg_select! {
     feature = "common_pool" => Coro::new(f),
-    feature = "alloc" => {
+    feature = "stack_alloc" => {
       use coro::stack::Stack;
       let stack = Stack::allocate(coro::DEFAULT_STACK_SIZE);
       Coro::with_stack(f, stack)

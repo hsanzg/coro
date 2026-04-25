@@ -45,15 +45,16 @@
 #![feature(coroutine_trait)]
 #![feature(thread_local)]
 #![feature(adt_const_params)]
+#![expect(
+  internal_features,
+  reason = "we unwind coroutine stacks by throwing a non-Rust exception type, and need `catch_unwind` to catch it"
+)]
 #![feature(core_intrinsics)]
 #![feature(likely_unlikely)]
 #![cfg_attr(test, feature(pointer_is_aligned_to))]
 #![no_std]
-
-#[cfg(feature = "alloc")]
+#[cfg(feature = "stack_alloc")]
 extern crate alloc;
-//#[cfg(feature = "std")]
-//extern crate std;
 
 mod arch;
 pub mod stack;
@@ -379,7 +380,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   // todo: complete with details: (or document these in `drop`)
   /// first unwinds the stack if necessary, destroys the coroutine,
   /// and then returns the stack.
-  #[cfg(all(feature = "alloc", not(feature = "common_pool")))]
+  #[cfg(all(feature = "stack_alloc", not(feature = "common_pool")))]
   pub unsafe fn drop_and_take_stack(mut self) -> Stack {
     // SAFETY: We forget `self` immediately after calling `drop_`.
     let stack = unsafe { drop_(&mut self) };
@@ -461,7 +462,7 @@ pub fn suspend() {
 
 type DropReturn = cfg_select! {
   feature = "common_pool" => (),
-  feature = "alloc" => Stack,
+  feature = "stack_alloc" => Stack,
   _ => ()
 };
 
@@ -493,7 +494,7 @@ unsafe fn drop_<R, F: FnOnce() -> R + Unpin>(coro: &mut Coro<R, F>) -> DropRetur
       let pool = unsafe { stack::common_pool() };
       pool.give(stack);
     },
-    feature = "alloc" => stack,
+    feature = "stack_alloc" => stack,
     _ => {}
   }
 }

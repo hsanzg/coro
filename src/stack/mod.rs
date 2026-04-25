@@ -4,7 +4,7 @@
 #[cfg_attr(unix, path = "unix.rs")]
 mod os;
 
-#[cfg(feature = "alloc")]
+#[cfg(feature = "stack_alloc")]
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::num::NonZero;
@@ -70,11 +70,12 @@ impl Stack {
   /// 1. All addresses in the range `[base, base+size)` must point to
   ///   the same (contiguous) allocation;
   /// 2. The allocation remains valid for the entire lifetime of the
-  ///   returned [`Stack`], and it is not aliased mutably elsewhere;
-  /// 3. The topmost page of the allocation (with respect to the stack
-  ///   growth direction) must not be accessible by the current process;
+  ///   returned [`Stack`], and it is not aliased mutably elsewhere; // todo: aliased in general, mutably or not. but rewrite somehow to say that coroutines may alias it.
+  /// 3. On architectures that support memory protection, the topmost
+  ///    page of the allocation (with respect to the stack growth direction)
+  ///    must not be accessible by the current process;
   /// 4. The remaining pages are readable and writable but not executable
-  ///    by the current process, on architectures that support memory protection;
+  ///    by the current process;
   /// 5. `size` is a multiple of the system's page size.
   /// 6. `base` must be aligned to a page boundary.
   ///
@@ -87,14 +88,14 @@ impl Stack {
   /// This method does not initialize the stack contents; the caller
   /// is responsible for ensuring that any data written to the stack
   /// is properly initialized before being read.
-  /// The [`MaybeUninit`] type may be of help in this respect.
+  /// The [`MaybeUninit`] type and the [`ptr::write`] subroutine may be of help in this respect.
   ///
   /// a (possibly partly-uninitialized) region of memory that can be used
   /// as a program stack. The topmost page of this region must not be
   /// accessible by the current process.
   ///
   ///
-  #[cfg(not(feature = "alloc"))]
+  #[cfg(not(feature = "stack_alloc"))]
   pub unsafe fn from_raw(base: NonNull<u8>, size: NonZeroUsize) -> Self {
     Self { base, size }
   }
@@ -120,7 +121,7 @@ impl Stack {
   ///
   /// assert!(stack.size().get() >= min_size);
   /// ```
-  #[cfg(feature = "alloc")]
+  #[cfg(feature = "stack_alloc")]
   #[must_use]
   pub fn allocate(min_size: usize) -> Self {
     // The size of the stack must be a multiple of the page size, since
@@ -225,7 +226,7 @@ pub(crate) fn next_slot<T>(sp: StackPtr) -> NonNull<T> {
   .cast()
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(feature = "stack_alloc")]
 impl Drop for Stack {
   fn drop(&mut self) {
     os::free_stack(self.base, self.size);
@@ -236,14 +237,14 @@ impl Drop for Stack {
 /// of [coroutines].
 ///
 /// [coroutines]: crate::Coro
-#[cfg(feature = "alloc")]
+#[cfg(feature = "stack_alloc")]
 #[derive(Default)]
 pub struct StackPool(
   /// The list of available (currently unused) program stacks.
   Vec<Stack>,
 );
 
-#[cfg(feature = "alloc")]
+#[cfg(feature = "stack_alloc")]
 impl StackPool {
   /// Creates a new storage pool.
   pub const fn new() -> Self {
@@ -294,8 +295,9 @@ mod stack_tests {
   use super::*;
 
   #[test]
-  #[cfg(not(feature = "alloc"))]
+  #[cfg(not(feature = "stack_alloc"))]
   fn from_raw() {
+    extern crate alloc;
     use alloc::alloc::*;
 
     let size = NonZeroUsize::new(1 << 12).unwrap();
@@ -314,7 +316,7 @@ mod stack_tests {
   }
 
   #[test]
-  #[cfg(feature = "alloc")]
+  #[cfg(feature = "stack_alloc")]
   fn alloc_stack_is_page_aligned() {
     let stack = Stack::allocate(1);
     let page_size = os::page_size().get();
@@ -324,7 +326,7 @@ mod stack_tests {
   }
 
   #[test]
-  #[cfg(feature = "alloc")]
+  #[cfg(feature = "stack_alloc")]
   fn contains() {
     let stack = Stack::allocate(1 << 12);
     assert!(stack.contains(stack.base()));
@@ -337,7 +339,7 @@ mod stack_tests {
   }
 }
 
-#[cfg(all(test, feature = "alloc"))]
+#[cfg(all(test, feature = "stack_alloc"))]
 mod pool_tests {
   use super::*;
 

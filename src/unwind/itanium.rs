@@ -1,7 +1,8 @@
 #![allow(non_camel_case_types)]
 
 use crate::ACTIVE;
-use alloc::boxed::Box;
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use core::ptr;
 // Taken from https://github.com/rust-lang/rust/blob/main/library/unwind/src/libunwind.rs.
 
@@ -48,13 +49,22 @@ unsafe extern "C-unwind" {
 
 pub fn start_unwind() -> ! {
   extern "C" fn cleanup(_code: _Unwind_Reason_Code, _ex: *mut _Unwind_Exception) {}
-  let ex = Box::new(_Unwind_Exception {
-    exception_class: CORO_UNWIND,
-    exception_cleanup: Some(cleanup),
-    private: [ptr::null(); UNWINDER_PRIVATE_DATA_SIZE],
-  });
+
+  #[thread_local]
+  static EXCEPTION: UnsafeCell<MaybeUninit<_Unwind_Exception>> =
+    UnsafeCell::new(MaybeUninit::uninit());
+
+  unsafe {
+    EXCEPTION.get().write(MaybeUninit::new(_Unwind_Exception {
+      exception_class: CORO_UNWIND,
+      exception_cleanup: Some(cleanup),
+      private: [ptr::null(); UNWINDER_PRIVATE_DATA_SIZE],
+    }))
+  };
+
+  let ex_ptr = EXCEPTION.get().cast();
   // println!("start_unwind: class={:?}", ex.exception_cleanup);
-  let res = unsafe { _Unwind_RaiseException(Box::into_raw(ex)) };
+  let res = unsafe { _Unwind_RaiseException(ex_ptr) };
   panic!("_Unwind_RaiseException failed: {res:?}");
 }
 

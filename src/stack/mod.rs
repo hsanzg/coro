@@ -1,4 +1,6 @@
-//! Platform-specific functionality for the current operating system.
+//! Program stacks for coroutines, and other related utilities.
+
+/// Platform-specific functionality for the current operating system.
 #[cfg_attr(unix, path = "unix.rs")]
 mod os;
 
@@ -142,8 +144,7 @@ impl Stack {
   ///
   /// It is important to note that the returned pointer does not
   /// necessarily point to the [bottom] of the stack; this occurs
-  /// if and only if program stacks grow [upwards] on the current
-  /// platform.
+  /// only if program stacks grow [upwards] on the current platform.
   ///
   /// [bottom]: Self::bottom
   /// [upwards]: GrowthDir::Upwards
@@ -153,7 +154,7 @@ impl Stack {
 
   /// Returns the number of bytes occupied by the stack, including
   /// its guard page. This value is a multiple of the system's
-  /// [page size](os::page_size).
+  /// page size.
   pub fn size(&self) -> NonZeroUsize {
     self.size
   }
@@ -170,7 +171,7 @@ impl Stack {
   /// [upwards]: GrowthDir::Upwards
   /// [downwards]: GrowthDir::Downwards
   /// [base address]: Self::base
-  pub(crate) fn bottom(&self) -> NonNull<u8> {
+  pub fn bottom(&self) -> NonNull<u8> {
     match GROWTH_DIR {
       GrowthDir::Upwards => self.base,
       // SAFETY: The last byte of the stack is at address `base + size - 1`.
@@ -194,7 +195,7 @@ impl Stack {
   // the reason for taking a closure is to allow for objects to depend
   // on their own address; note that for address sensitivity to be safe,
   // care must be taken.
-  pub unsafe fn push<T, F: FnOnce(NonNull<T>) -> T>(
+  pub(crate) unsafe fn push<T, F: FnOnce(NonNull<T>) -> T>(
     &mut self,
     sp: &mut StackPtr,
     f: F,

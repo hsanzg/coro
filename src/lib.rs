@@ -36,6 +36,10 @@
 //! `coro` is still inferior with respect to platform support. I mainly
 //! put together this library for my own education, so significant
 //! improvements are likely possible.
+//!
+//! [`resume`]: Coro::resume
+//! [`corosensei`]: https://github.com/Amanieu/corosensei
+//! [`libfringe`]: https://github.com/edef1c/libfringe
 
 #![feature(asm_unwind)]
 #![feature(coroutine_trait)]
@@ -53,7 +57,7 @@ extern crate alloc;
 
 mod arch;
 pub mod stack;
-pub mod unwind;
+mod unwind;
 
 use crate::stack::{Stack, StackPtr};
 use core::cell::Cell;
@@ -376,7 +380,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   /// first unwinds the stack if necessary, destroys the coroutine,
   /// and then returns the stack.
   #[cfg(all(feature = "alloc", not(feature = "common_pool")))]
-  unsafe fn drop_and_take_stack(mut self) -> Stack {
+  pub unsafe fn drop_and_take_stack(mut self) -> Stack {
     // SAFETY: We forget `self` immediately after calling `drop_`.
     let stack = unsafe { drop_(&mut self) };
     core::mem::forget(self);

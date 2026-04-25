@@ -3,6 +3,7 @@ use core::num::NonZeroUsize;
 use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use libc::__errno_location;
 
 /// Returns the default page size on the current architecture.
 pub fn page_size() -> NonZeroUsize {
@@ -29,10 +30,16 @@ pub fn page_size() -> NonZeroUsize {
 }
 
 pub fn alloc_stack(size: NonZeroUsize) -> NonNull<u8> {
+  let page_size = page_size().get();
+  assert!(
+    size.get().is_multiple_of(page_size),
+    "stack size must be a multiple of the system's page size"
+  );
   // Reserve a `size`-byte area with read and write permissions only.
-  // We pass the `MAP_STACK` flag to indicate that the region will be
-  // used to store a program stack. On success, the kernel promises
-  // that address `base` is page-aligned.
+  // If the current platform understands the `MAP_STACK` flag, we use
+  // it to specify that the region will be used to store a program
+  // stack. On success, the kernel promises that address `base` is
+  // page-aligned.
   let base = unsafe {
     libc::mmap(
       ptr::null_mut(),
@@ -51,7 +58,7 @@ pub fn alloc_stack(size: NonZeroUsize) -> NonNull<u8> {
   assert_ne!(
     base,
     libc::MAP_FAILED,
-    "stack alloc failed: {}",
+    "stack allocation failed: {}",
     last_os_error()
   );
   // Make the topmost page of the stack inaccessible to this process.
@@ -60,12 +67,15 @@ pub fn alloc_stack(size: NonZeroUsize) -> NonNull<u8> {
   // "overflow" area (called the _guard page_). The operating system
   // will arrange things so that a memory-protection interrupt occurs
   // on any such attempt.
-  let page_size = page_size().get();
   let guard_base = match GROWTH_DIR {
+    // SAFETY: Since `size` is a positive multiple of `page_size`,
+    //  offset `size - page_size` is in bounds of the `size`-byte
+    //  stack allocation.
     GrowthDir::Upwards => unsafe { base.byte_add(size.get() - page_size) },
     GrowthDir::Downwards => base,
   };
   assert_ne!(
+    // Note that `guard_base` is aligned to a page boundary.
     unsafe { libc::mprotect(guard_base, page_size, libc::PROT_NONE) },
     -1,
     "could not apply memory protection to guard page: {}",
@@ -75,7 +85,12 @@ pub fn alloc_stack(size: NonZeroUsize) -> NonNull<u8> {
   unsafe { NonNull::new_unchecked(base.cast()) }
 }
 
-pub fn free_stack(base: NonNull<u8>, size: NonZeroUsize) {
+/// Deallocates
+///
+/// # Safety
+///
+/// must have been previously allocated by [`alloc_stack`].
+pub unsafe fn free_stack(base: NonNull<u8>, size: NonZeroUsize) {
   // Delete the mappings for the stack's address range.
   assert_eq!(
     unsafe { libc::munmap(base.cast().as_ptr(), size.get()) },
@@ -85,13 +100,18 @@ pub fn free_stack(base: NonNull<u8>, size: NonZeroUsize) {
   );
 }
 
-// todo: rethink `std` strategy.
-/*#[cfg(feature = "std")]
-fn last_os_error() -> std::io::Error {
-  std::io::Error::last_os_error()
-}
-
-#[cfg(not(feature = "std"))]*/
+/// Returns the value identifying the last error reported by a system
+/// call or library function (if any), as found in variable `errno`.
 fn last_os_error() -> i32 {
-  unsafe { *libc::__errno_location() }
+  unsafe extern "C" {
+    #[cfg_attr(target_os = "linux", link_name = "__errno_location")]
+    #[cfg_attr(
+      any(target_vendor = "apple", target_os = "freebsd"),
+      link_name = "__error"
+    )]
+    #[cfg_attr(target_os = "openbsd", link_name = "__errno")]
+    safe fn errno_location() -> *mut libc::c_int;
+  }
+  // SAFETY: This is equivalent to accessing `errno` in C.
+  unsafe { *errno_location() }
 }

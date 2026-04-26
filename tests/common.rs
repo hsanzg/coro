@@ -8,7 +8,8 @@ pub fn new_coro<R, F: FnOnce() -> R + Unpin>(f: F) -> Coro<R, F> {
       use coro::stack::Stack;
       let stack = Stack::allocate(coro::DEFAULT_STACK_SIZE);
       Coro::with_stack(f, stack)
-    }
+    },
+    _ => panic!("this test requires the `stack_alloc` feature"),
   }
 }
 

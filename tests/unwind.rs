@@ -42,7 +42,7 @@ fn unwind_when_finished() {
 #[test]
 fn unwind_on_drop_before_finished() {
   let dropped = Cell::new(false);
-  let mut coro = Coro::new(|| {
+  let mut coro = new_coro(|| {
     let _rec = DropRecorder(&dropped);
     suspend();
   });
@@ -74,8 +74,8 @@ fn unwind_when_finished_within_pausing_coro() {
 #[test]
 fn unwind_unfinished_inner_when_outer_finishes() {
   let inner_dropped = Cell::new(false);
-  let mut outer = Coro::new(|| {
-    let mut inner = Coro::new(|| {
+  let mut outer = new_coro(|| {
+    let mut inner = new_coro(|| {
       let _rec = DropRecorder(&inner_dropped);
       suspend();
     });
@@ -92,7 +92,7 @@ fn do_not_unwind_unfinished_inner_when_it_outlives_outer() {
     let _rec = DropRecorder(&inner_dropped);
     suspend();
   });
-  let mut outer = Coro::new(|| {
+  let mut outer = new_coro(|| {
     inner.resume();
   });
   outer.resume();
@@ -106,8 +106,8 @@ fn do_not_unwind_unfinished_inner_when_it_outlives_outer() {
 #[test]
 fn unwind_unfinished_inner_on_outer_drop_before_finished() {
   let inner_dropped = Cell::new(false);
-  let mut outer = Coro::new(|| {
-    let mut inner = Coro::new(|| {
+  let mut outer = new_coro(|| {
+    let mut inner = new_coro(|| {
       let _rec = DropRecorder(&inner_dropped);
       suspend();
     });
@@ -128,7 +128,7 @@ fn user_unwind() {
   let dropped = Cell::new(false);
   let dropped_ref = AssertUnwindSafe(&dropped);
   let res = catch_unwind(move || {
-    Coro::new(|| {
+    new_coro(|| {
       let _rec = DropRecorder(*dropped_ref);
       resume_unwind(Box::new(()));
     })
@@ -153,7 +153,7 @@ fn unwind_on_panic() {
   let dropped = Cell::new(false);
   let dropped_ref = AssertUnwindSafe(&dropped);
   let res = catch_unwind(move || {
-    Coro::new(|| {
+    new_coro(|| {
       let _rec = DropRecorder(*dropped_ref);
       let _obs = PanicObserver;
       panic!("help");
@@ -197,13 +197,13 @@ fn nested_unwinds_on_inner_panic() {
   let outer_dropped = Cell::new(false);
   let inner_dropped_ref = AssertUnwindSafe(&inner_dropped);
   let outer_dropped_ref = AssertUnwindSafe(&outer_dropped);
-  let mut inner = Coro::new(|| {
+  let mut inner = new_coro(|| {
     let _rec = DropRecorder(*inner_dropped_ref);
     let _obs = PanicObserver;
     panic!("inner");
   });
   let res = catch_unwind(move || {
-    Coro::new(|| {
+    new_coro(|| {
       let _rec = DropRecorder(*outer_dropped_ref);
       let _obs = PanicObserver;
       inner.resume();
@@ -226,13 +226,13 @@ fn doubly_nested_unwinds_on_inner_panic() {
   let inner_dropped_ref = AssertUnwindSafe(&inner_dropped);
   let middle_dropped_ref = AssertUnwindSafe(&middle_dropped);
   let outer_dropped_ref = AssertUnwindSafe(&outer_dropped);
-  let mut outer = Coro::new(|| {
+  let mut outer = new_coro(|| {
     let _rec = DropRecorder(*outer_dropped_ref);
     let _obs = PanicObserver;
-    Coro::new(|| {
+    new_coro(|| {
       let _rec = DropRecorder(*middle_dropped_ref);
       let _obs = PanicObserver;
-      Coro::new(|| {
+      new_coro(|| {
         let _rec = DropRecorder(*inner_dropped_ref);
         let _obs = PanicObserver;
         panic!("inner");
@@ -257,13 +257,13 @@ fn nested_unwinds_on_outer_panic() {
   let outer_dropped = Cell::new(false);
   let inner_dropped_ref = AssertUnwindSafe(&inner_dropped);
   let outer_dropped_ref = AssertUnwindSafe(&outer_dropped);
-  let mut inner = Coro::new(|| {
+  let mut inner = new_coro(|| {
     let _rec = DropRecorder(*inner_dropped_ref);
     let _obs = PanicObserver;
     suspend();
   });
   let res = catch_unwind(move || {
-    Coro::new(|| {
+    new_coro(|| {
       let _rec = DropRecorder(*outer_dropped_ref);
       let _obs = PanicObserver;
       inner.resume();
@@ -287,16 +287,16 @@ fn doubly_nested_unwinds_on_outer_panic() {
   let inner_dropped_ref = AssertUnwindSafe(&inner_dropped);
   let middle_dropped_ref = AssertUnwindSafe(&middle_dropped);
   let outer_dropped_ref = AssertUnwindSafe(&outer_dropped);
-  let mut outer = Coro::new(|| {
+  let mut outer = new_coro(|| {
     let _rec = DropRecorder(*outer_dropped_ref);
     let _obs = PanicObserver;
     // Note that the stack of the inner coroutines is not unwound
     // as a direct consequence of the panic, but rather because
     // their destructor is called. It is therefore incorrect to
     // attach a `PanicObserver` to them.
-    Coro::new(|| {
+    new_coro(|| {
       let _rec = DropRecorder(*middle_dropped_ref);
-      Coro::new(|| {
+      new_coro(|| {
         let _rec = DropRecorder(*inner_dropped_ref);
         suspend();
       })
@@ -318,7 +318,7 @@ fn doubly_nested_unwinds_on_outer_panic() {
 
 #[test]
 fn catch_panic_unwind_within_coro() {
-  Coro::new(|| {
+  new_coro(|| {
     let res = catch_unwind(|| panic!("help"));
     assert!(res.is_err());
   })
@@ -330,9 +330,9 @@ fn catch_unwind_of_inner_coro_within_coro() {
   let thrower_dropped = Cell::new(false);
   let catcher_dropped = Cell::new(false);
   let thrower_dropped_ref = AssertUnwindSafe(&thrower_dropped);
-  let mut catcher = Coro::new(|| {
+  let mut catcher = new_coro(|| {
     let _rec = DropRecorder(&catcher_dropped);
-    let mut thrower = Coro::new(|| {
+    let mut thrower = new_coro(|| {
       let _rec = DropRecorder(*thrower_dropped_ref);
       panic!("bet you can't catch me!");
     });

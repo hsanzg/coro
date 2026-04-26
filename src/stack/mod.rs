@@ -8,7 +8,7 @@ use core::num::NonZeroUsize;
 use core::ptr::NonNull;
 
 /// Describes how the stack pointer changes after a `push` instruction.
-#[derive(PartialEq, Eq, Clone, Copy, Debug, core::marker::ConstParamTy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum GrowthDir {
   /// A program stack grows towards _higher_ memory addresses;
   /// that is, a `push` instruction _increases_ the stack pointer.

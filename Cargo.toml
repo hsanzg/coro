@@ -18,5 +18,12 @@ common_pool = ["stack_alloc"]
 [dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+criterion = "0.8"
+
 [workspace]
 members = ["macros"]
+
+[[bench]]
+name = "control_transfers"
+harness = false

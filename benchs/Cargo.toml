@@ -1,0 +1,19 @@
+[package]
+name = "coro_benchs"
+version = "1.0.0"
+description = "Benchmarks for the `coro` crate."
+authors = ["Hugo Sanz González <hugo@hgsg.me>"]
+license = "MIT"
+repository = "https://github.com/hsanzg/coro"
+publish = false
+edition = "2024"
+
+[dependencies]
+coro = { path = ".." }
+corosensei = "0.3"
+criterion = "0.8"
+
+[[bench]]
+name = "benchs"
+path = "src/main.rs"
+harness = false

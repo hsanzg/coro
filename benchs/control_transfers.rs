@@ -1,4 +1,4 @@
-use coro::{Coro, suspend};
+/*use coro::{Coro, suspend};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 fn control_transfers(c: &mut Criterion) {
@@ -18,3 +18,4 @@ fn control_transfers(c: &mut Criterion) {
 
 criterion_group!(benches, control_transfers);
 criterion_main!(benches);
+*/

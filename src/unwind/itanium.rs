@@ -6,6 +6,13 @@ use core::mem::MaybeUninit;
 use core::ptr;
 // Taken from https://github.com/rust-lang/rust/blob/main/library/unwind/src/libunwind.rs.
 
+// the great [blog post] on faster exception handling in Rust
+// by A. Sireneva; her `lithium` crate was also a source of
+// inspiration.
+// The reason for not using is that I personally wanted to
+// learn about unwinding mechanisms; in the future I might
+// replace them if some form of control transfers becomes
+// too convoluted.
 type c_int = core::ffi::c_int;
 
 #[repr(C)]
@@ -79,6 +86,14 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
   _ex: *mut _Unwind_Exception,
   _ctx: *mut _Unwind_Context,
 ) -> _Unwind_Reason_Code {
+  // todo: remove me.
+  let sp: *mut u8;
+  unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp) };
+  extern crate std;
+  std::println!("sp at eh_personality={sp:?}; &active={:?}", ACTIVE.get());
+  // unsafe { core::arch::asm!("int3") };
+  // todo: end of remove me.
+
   // todo: add unlikely.
   if version != 1 {
     return _Unwind_Reason_Code::_URC_FATAL_PHASE1_ERROR;
@@ -92,11 +107,11 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
     }
     let cur = unsafe { &*cur };
     ACTIVE.set(cur.caller);
-    /*println!(
-      "changed parent from {:?} to {:?}",
+    std::println!(
+      "changed ACTIVE from {:?} to {:?}",
       &raw const *cur,
       ACTIVE.get()
-    );*/
+    );
   }
   _Unwind_Reason_Code::_URC_CONTINUE_UNWIND
 }

@@ -18,12 +18,16 @@ common_pool = ["stack_alloc"]
 [dependencies]
 libc = "0.2"
 
-[dev-dependencies]
-criterion = "0.8"
+#[dev-dependencies]
+#criterion = "0.8"
 
 [workspace]
 members = ["macros"]
 
-[[bench]]
-name = "control_transfers"
-harness = false
+#[[bench]]
+#name = "control_transfers"
+#harness = false
+
+# todo: remove me.
+[profile.release]
+debug = true

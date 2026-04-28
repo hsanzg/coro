@@ -5,13 +5,84 @@ use core::mem::offset_of;
 use core::panic::AssertUnwindSafe;
 use core::ptr::NonNull;
 
+#[unsafe(naked)]
+pub unsafe extern "sysv64-unwind" fn transfer_control(_target: &mut Control) {
+  extern "sysv64-unwind" fn unwind() -> ! {
+    crate::unwind::start_unwind()
+  }
+  naked_asm!(
+    ".cfi_startproc",
+    "sub rsp, 56", // mod 16 = 8.
+    ".cfi_adjust_cfa_offset 56",
+    "mov [rsp], rbp",
+    ".cfi_rel_offset rbp, 0",
+    "mov [rsp + 8], rbx",
+    ".cfi_rel_offset rbx, 8",
+    "mov [rsp + 16], r12",
+    ".cfi_rel_offset r12, 16",
+    "mov [rsp + 24], r13",
+    ".cfi_rel_offset r13, 24",
+    "mov [rsp + 32], r14",
+    ".cfi_rel_offset r14, 32",
+    "mov [rsp + 40], r15",
+    ".cfi_rel_offset r15, 40",
+
+    "mov rax, [rdi + {sp_off}]",
+    "mov [rdi + {sp_off}], rsp",
+    "mov rsp, rax",
+
+    "mov rax, [rdi + {ip_off}]",
+    "lea rsi, [rip + 2f]",
+    "mov [rdi + {ip_off}], rsi",
+
+    "jmp rax",
+
+    "call {unwind}",
+
+    "2:",
+    "mov rbp, [rsp]",
+    ".cfi_restore rbp",
+    "mov rbx, [rsp + 8]",
+    ".cfi_restore rbx",
+    "mov r12, [rsp + 16]",
+    ".cfi_restore r12",
+    "mov r13, [rsp + 24]",
+    ".cfi_restore r13",
+    "mov r14, [rsp + 32]",
+    ".cfi_restore r14",
+    "mov r15, [rsp + 40]",
+    ".cfi_restore r15",
+    "add rsp, 56",
+    ".cfi_adjust_cfa_offset -56",
+    "ret",
+    ".cfi_endproc",
+    sp_off = const offset_of!(Control, stack_ptr),
+    ip_off = const offset_of!(Control, inst_ptr),
+    unwind = sym unwind,
+  )
+}
+
 /// Resumes execution of a computation at the point where it was last
 /// suspended. This function saves the context of the current program
 /// and restores the old context from the given control record.
-pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
-  extern "sysv64-unwind" fn unwind(_control: &mut Control) -> ! {
+pub unsafe extern "sysv64-unwind" fn transfer_control2(target: &mut Control) {
+  extern "sysv64-unwind" fn unwind() -> ! {
+    // todo: remove the indirection and call directly from assembly?
+    //  That will require adding `extern "C-unwind"` to `start_unwind`.
     crate::unwind::start_unwind();
   }
+  // todo: remove me.
+  extern crate std;
+  let bx: *mut u8;
+  unsafe { core::arch::asm!("mov {}, rbx", out(reg) bx) };
+  std::println!(
+    "transfer_control: &ctrl={:?}, ctrl.sp={:?}, ctlr.ip={:?}, rbx={bx:?}",
+    core::ptr::from_mut(target),
+    target.stack_ptr,
+    target.inst_ptr
+  );
+  // unsafe { core::arch::asm!("int3") };
+  // todo: end of remove me.
   // The transfer of control consists of three steps: saving the previous
   // register contents, replacing the program stack, and jumping to the
   // location following the place where the action was last suspended.
@@ -36,6 +107,12 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
       // in the current stack. The ABI clobber list does not include
       // the frame pointer `bp` nor `bx` (which LLVM uses internally
       // as a "base pointer" for functions with complex stack frames).
+      // todo: note that Rust guarantees that the stack is aligned to
+      //  a 16-byte boundary on entry to an `asm!` block.
+      // todo: can we use the red zone and avoid modifying the sp?
+      //  this will require adding the sub below, right before calling
+      //  the `force_unwind` subroutine, since otherwise that would
+      //  overwrite the saved contents of rbx and rbp.
       "sub rsp, 16",
       ".cfi_adjust_cfa_offset 16",
       "mov [rsp + 8], rbx",
@@ -73,12 +150,16 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
       ".cfi_restore rbx",
       "add rsp, 16",
       ".cfi_adjust_cfa_offset -16",
-      inlateout("rdi") target => _,
-      lateout("rax") _, lateout("rsi") _,
+      in("rdi") target,
       sp_off = const offset_of!(Control, stack_ptr),
       ip_off = const offset_of!(Control, inst_ptr),
       unwind = sym unwind,
       clobber_abi("sysv64"),
+      // todo: remove these, since they are callee-preserved.
+      lateout("r12") _, lateout("r13") _,
+      lateout("r14") _, lateout("r15") _,
+      // todo: also these two:
+      lateout("rdi") _, lateout("rsi") _,
       options(may_unwind)
     )
   }
@@ -126,6 +207,7 @@ where
   naked_asm!(
     ".cfi_startproc",
     ".cfi_personality 0x1b, {personality_fn}", // DW_EH_PE_pcrel | DW_EH_PE_sdata4
+    // todo: Can we avoid this `sub` by defining the CFA directly?
     ".cfi_offset rsp, -16",
     "sub rsp, 8",
     ".cfi_adjust_cfa_offset 8",
@@ -187,8 +269,19 @@ pub unsafe fn force_unwind(control: &mut Control) {
   // `transfer_control`, by moving the resumption address of the
   // coroutine (local label `2` in that function) five bytes back
   // (the length of the `call {unwind}` instruction).
-  control.inst_ptr = unsafe { control.inst_ptr.byte_sub(5) };
+  control.inst_ptr = unsafe {
+    control.inst_ptr.byte_sub(5 /*14*/)
+  };
   let mut control_ref = AssertUnwindSafe(control);
+  // todo: remove me.
+  extern crate std;
+  std::println!(
+    "force_unwind: &ctrl={:?}, ctrl.sp={:?}, ctrl.ip={:?}",
+    core::ptr::from_mut(*control_ref),
+    (*control_ref).stack_ptr,
+    (*control_ref).inst_ptr
+  );
+  // todo: end of remove me.
   let res = crate::unwind::catch_unwind(move || unsafe { transfer_control(*control_ref) });
   debug_assert!(res.is_err(), "coroutine did not unwind");
 }

@@ -169,19 +169,17 @@ where
   //  but it does not require
   // unsafe { bottom.byte_add(offset_of!(Control, inst_ptr)) }.cast()
   let ret_addr = unsafe { bottom.byte_sub(8) }.cast::<*const u8>();
-  unsafe { ret_addr.write((trampoline::<R, F> as *const u8).byte_add(1)) }
+  unsafe { ret_addr.write((trampoline as *const u8).byte_add(1)) }
   ret_addr.cast()
 }
 
+// todo: this is now wrong; rename to `first_coro_frame`.
 /// The initial sequence of instructions executed by a coroutine
 /// after it is activated for the first time.
 ///
 /// See [`crate::trampoline`] for some ABI-related considerations.
 #[unsafe(naked)]
-pub extern "sysv64-unwind" fn trampoline<R, F>(_bottom: NonNull<Bottom<F>>) -> !
-where
-  F: FnOnce() -> R + Unpin,
-{
+pub extern "sysv64-unwind" fn trampoline() -> ! {
   // todo: finish comment. Reference `initial_sp` and make clear
   //  that the control record is actually part of the first frame
   //  in the coroutine's program stack. That way we get linkage

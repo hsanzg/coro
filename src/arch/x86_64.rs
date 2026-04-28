@@ -143,10 +143,9 @@ pub unsafe extern "sysv64-unwind" fn transfer_control2(target: &mut Control) {
       ip_off = const offset_of!(Control, inst_ptr),
       unwind = sym unwind,
       clobber_abi("sysv64"),
-      // todo: remove these, since they are callee-preserved.
       lateout("r12") _, lateout("r13") _,
       lateout("r14") _, lateout("r15") _,
-      // todo: also these two:
+      // todo: remove these, since they aren't callee-preserved.
       lateout("rdi") _, lateout("rsi") _,
       options(may_unwind)
     )
@@ -159,13 +158,19 @@ pub unsafe extern "sysv64-unwind" fn transfer_control2(target: &mut Control) {
 /// deferrenceable).
 ///
 /// [transferring control]: transfer_control
-pub fn initial_sp<F>(bottom: NonNull<Bottom<F>>) -> StackPtr {
+pub fn initial_sp<R, F>(bottom: NonNull<Bottom<F>>) -> StackPtr
+where
+  F: FnOnce() -> R + Unpin,
+{
   // todo: finish comment. Explain why stack pointer is pointed
   //  to where it is, and prove that location is aligned to a
   //  16-byte boundary.
   // SAFETY: This is similar to `&raw const bottom.ctrl.inst_ptr`,
   //  but it does not require
-  unsafe { bottom.byte_add(offset_of!(Control, inst_ptr)) }.cast()
+  // unsafe { bottom.byte_add(offset_of!(Control, inst_ptr)) }.cast()
+  let ret_addr = unsafe { bottom.byte_sub(8) }.cast::<*const u8>();
+  unsafe { ret_addr.write((trampoline::<R, F> as *const u8).byte_add(1)) }
+  ret_addr.cast()
 }
 
 /// The initial sequence of instructions executed by a coroutine
@@ -195,15 +200,14 @@ where
   naked_asm!(
     ".cfi_startproc",
     ".cfi_personality 0x1b, {personality_fn}", // DW_EH_PE_pcrel | DW_EH_PE_sdata4
-    // todo: Can we avoid this `sub` by defining the CFA directly?
+    ".cfi_def_cfa_offset 16",
     ".cfi_offset rsp, -16",
-    "sub rsp, 8",
-    ".cfi_adjust_cfa_offset 8",
     // Bounce off to the second, architecture-independent trampoline.
-    "call {second_tramp}",
+    // "call {second_tramp}",
+    "nop",
     "ud2",
     ".cfi_endproc",
-    second_tramp = sym crate::trampoline::<R, F>,
+    // second_tramp = sym crate::trampoline::<R, F>,
     personality_fn = sym crate::unwind::__coro_trampoline_personality
   )
 }

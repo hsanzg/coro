@@ -206,7 +206,8 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
       stack.push(&mut sp, |loc| Bottom {
         ctrl: Control {
           stack_ptr: arch::initial_sp(loc),
-          inst_ptr: arch::trampoline::<R, F> as *const _,
+          // inst_ptr: arch::trampoline::<R, F> as *const _,
+          inst_ptr: trampoline::<R, F> as *const _,
           caller: ptr::null_mut(),
           _pin: PhantomPinned,
         },
@@ -257,7 +258,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   #[must_use]
   #[inline]
   pub fn has_started(&self) -> bool {
-    self.control().inst_ptr != arch::trampoline::<R, F> as *const _
+    self.control().inst_ptr != trampoline::<R, F> as *const _
   }
 
   // todo: find better name? `is_suspended`? not good enough, since

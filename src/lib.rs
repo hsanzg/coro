@@ -79,7 +79,6 @@ use core::ptr::NonNull;
 ///
 /// [coroutine]: Coro
 /// [transfer of control]: arch::transfer_control
-#[cfg_attr(target_arch = "x86_64", repr(C, align(16)))]
 #[derive(Debug)]
 struct Control {
   /// The value of the stack pointer just before a transfer of control
@@ -131,12 +130,11 @@ static ACTIVE: Cell<*mut Control> = Cell::new(ptr::null_mut());
 ///
 /// The actual stack contents appear on top of this structure.
 #[repr(C)]
+#[cfg_attr(target_arch = "x86_64", repr(C, align(16)))]
 struct Bottom<F> {
   /// A control record used to store status information during
   /// transfers of control that involve this coroutine.
   ctrl: Control,
-  // todo: can we eliminate the padding bytes between the two
-  //  fields on x86-64?
   func: ManuallyDrop<F>,
 }
 

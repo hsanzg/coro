@@ -3,6 +3,7 @@
 mod common;
 
 use common::*;
+use core::cell::RefCell;
 use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
 use coro::{Coro, suspend};
@@ -164,4 +165,43 @@ fn triply_nested_coros() {
   }
   assert_eq!(outer.resume(), CoroutineState::Complete("outer"));
   assert_complete(&outer, false);
+}
+
+#[test]
+fn resume_two_coros_in_tandem() {
+  let mut first = new_coro(|| {
+    suspend();
+    suspend();
+  });
+  let mut second = new_coro(|| {
+    suspend();
+    suspend();
+  });
+  for _ in 0..3 {
+    first.resume();
+    second.resume();
+  }
+}
+
+#[test]
+fn resume_from_different_coros() {
+  let play = RefCell::new(new_coro(|| {
+    suspend();
+    789
+  }));
+  let mut actor = new_coro(|| {
+    assert_eq!(play.borrow_mut().resume(), CoroutineState::Yielded(()));
+    assert_paused(&*play.borrow());
+    suspend();
+  });
+  let mut actress = new_coro(|| {
+    assert_paused(&*play.borrow());
+    assert_eq!(play.borrow_mut().resume(), CoroutineState::Complete(789));
+    assert_complete(&*play.borrow(), false);
+  });
+  assert_eq!(actor.resume(), CoroutineState::Yielded(()));
+  assert_paused(&actor);
+  assert_eq!(actress.resume(), CoroutineState::Complete(()));
+  assert_complete(&actress, false);
+  assert_paused(&actor);
 }

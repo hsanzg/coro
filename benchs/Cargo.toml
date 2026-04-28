@@ -13,6 +13,9 @@ coro = { path = ".." }
 corosensei = "0.3"
 criterion = "0.8"
 
+[profile.bench]
+debug = true
+
 [[bench]]
 name = "benchs"
 path = "src/main.rs"

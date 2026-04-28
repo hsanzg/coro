@@ -70,7 +70,6 @@ pub fn start_unwind() -> ! {
   };
 
   let ex_ptr = EXCEPTION.get().cast();
-  // println!("start_unwind: class={:?}", ex.exception_cleanup);
   let res = unsafe { _Unwind_RaiseException(ex_ptr) };
   panic!("_Unwind_RaiseException failed: {res:?}");
 }
@@ -86,14 +85,6 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
   _ex: *mut _Unwind_Exception,
   _ctx: *mut _Unwind_Context,
 ) -> _Unwind_Reason_Code {
-  // todo: remove me.
-  let sp: *mut u8;
-  unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp) };
-  extern crate std;
-  std::println!("sp at eh_personality={sp:?}; &active={:?}", ACTIVE.get());
-  // unsafe { core::arch::asm!("int3") };
-  // todo: end of remove me.
-
   // todo: add unlikely.
   if version != 1 {
     return _Unwind_Reason_Code::_URC_FATAL_PHASE1_ERROR;
@@ -107,11 +98,6 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
     }
     let cur = unsafe { &*cur };
     ACTIVE.set(cur.caller);
-    std::println!(
-      "changed ACTIVE from {:?} to {:?}",
-      &raw const *cur,
-      ACTIVE.get()
-    );
   }
   _Unwind_Reason_Code::_URC_CONTINUE_UNWIND
 }

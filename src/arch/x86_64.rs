@@ -71,18 +71,6 @@ pub unsafe extern "sysv64-unwind" fn transfer_control2(target: &mut Control) {
     //  That will require adding `extern "C-unwind"` to `start_unwind`.
     crate::unwind::start_unwind();
   }
-  // todo: remove me.
-  extern crate std;
-  let bx: *mut u8;
-  unsafe { core::arch::asm!("mov {}, rbx", out(reg) bx) };
-  std::println!(
-    "transfer_control: &ctrl={:?}, ctrl.sp={:?}, ctlr.ip={:?}, rbx={bx:?}",
-    core::ptr::from_mut(target),
-    target.stack_ptr,
-    target.inst_ptr
-  );
-  // unsafe { core::arch::asm!("int3") };
-  // todo: end of remove me.
   // The transfer of control consists of three steps: saving the previous
   // register contents, replacing the program stack, and jumping to the
   // location following the place where the action was last suspended.
@@ -273,15 +261,6 @@ pub unsafe fn force_unwind(control: &mut Control) {
     control.inst_ptr.byte_sub(5 /*14*/)
   };
   let mut control_ref = AssertUnwindSafe(control);
-  // todo: remove me.
-  extern crate std;
-  std::println!(
-    "force_unwind: &ctrl={:?}, ctrl.sp={:?}, ctrl.ip={:?}",
-    core::ptr::from_mut(*control_ref),
-    (*control_ref).stack_ptr,
-    (*control_ref).inst_ptr
-  );
-  // todo: end of remove me.
   let res = crate::unwind::catch_unwind(move || unsafe { transfer_control(*control_ref) });
   debug_assert!(res.is_err(), "coroutine did not unwind");
 }

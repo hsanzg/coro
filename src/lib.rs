@@ -224,36 +224,6 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
         func: ManuallyDrop::new(f),
       })
     };
-    // todo: remove me.
-    extern crate std;
-    std::println!(
-      "control align={}, bot align={}, ctrl offset in bot={}",
-      align_of::<Control>(),
-      align_of::<Bottom<F>>(),
-      core::mem::offset_of!(Bottom<F>, ctrl)
-    );
-    let bot = unsafe { bottom.as_ref() };
-    std::println!(
-      "with_stack: &bot={:?}, &bot.ctrl={:?}, &ctrl.sp={:?}, &ctrl.ip={:?}, ctrl.sp={:?}, ctlr.ip={:?}",
-      bottom,
-      &raw const bot.ctrl,
-      &raw const bot.ctrl.stack_ptr,
-      &raw const bot.ctrl.inst_ptr,
-      bot.ctrl.stack_ptr,
-      bot.ctrl.inst_ptr
-    );
-    // unsafe { core::arch::asm!("ud2") };
-    // todo: end of remove me.
-    /*let (f_ptr, sp) = unsafe { stack.push(sp, |_| ManuallyDrop::new(f)) };
-    let (control, _) = unsafe {
-      stack.push(sp, |loc| Control {
-        stack_ptr: arch::initial_sp(loc),
-        inst_ptr: arch::trampoline::<R, F> as *const _,
-        parent: ptr::null_mut(),
-        _pin: PhantomPinned,
-      })
-    };
-    println!("f_ptr={f_ptr:?}, control={control:?}");*/
     Self { bottom, stack }
   }
 
@@ -347,24 +317,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
       ctrl.inst_ptr
     );*/
     // SAFETY: The coroutine has exclusive access to its stack at this point.
-    // todo: remove me.
-    extern crate std;
-    std::println!(
-      "resume: &ctrl={:?}, ctrl.sp={:?}, ctlr.ip={:?}",
-      ptr::from_mut(ctrl),
-      ctrl.stack_ptr,
-      ctrl.inst_ptr
-    );
-    // unsafe { core::arch::asm!("ud2") };
-    // todo: end of remove me.
     unsafe { arch::transfer_control(ctrl) };
-    // todo: remove me.
-    std::println!(
-      "resume: got control back! ctrl.sp={:?}, ctrl.ip={:?}",
-      ctrl.stack_ptr,
-      ctrl.inst_ptr
-    );
-    // todo: end of remove me.
     // The coroutine's computation has transferred control back.
     if ctrl.inst_ptr.is_null() {
       // The computation finished. Copy the return value to the current stack,
@@ -438,20 +391,6 @@ where
   //  coroutine is never activated (that is, if this trampoline function
   //  is never invoked). And this trampoline is called only once, hence
   //  there's no risk to move out `func` from the coroutine twice.
-  // todo: remove me.
-  extern crate std;
-  let bot = unsafe { bottom.as_ref() };
-  std::println!(
-    "trampoline: &bot={:?}, derived &bot={:?}, &bot.ctrl={:?}, ctrl.sp={:?}, ctlr.ip={:?}, &func={:?}",
-    bottom,
-    ptr::from_ref(bot),
-    &raw const bot.ctrl,
-    bot.ctrl.stack_ptr,
-    bot.ctrl.inst_ptr,
-    &raw const bot.func,
-  );
-  // unsafe { core::arch::asm!("ud2") };
-  // todo: end of remove me.
   let f = unsafe { ManuallyDrop::take(f) };
   // Execute the actual coroutine's program.
   let ret_val = ManuallyDrop::new(f());
@@ -498,16 +437,6 @@ type DropReturn = cfg_select! {
 /// its `drop` method. Thus the only safe way to proceed after calling
 /// `drop_(&mut coro)` is to do `core::mem::forget(coro)`.
 unsafe fn drop_<R, F: FnOnce() -> R + Unpin>(coro: &mut Coro<R, F>) -> DropReturn {
-  // todo: remove me.
-  extern crate std;
-  std::println!(
-    "drop_: &bottom={:?}, ctrl.sp={:?}, ctrl.ip={:?}",
-    coro.bottom,
-    coro.control().stack_ptr,
-    coro.control().inst_ptr
-  );
-  // unsafe { core::arch::asm!("int3") };
-  // todo: end of remove me.
   if coro.has_started() {
     // We need to unwind the coroutine's stack manually if it was left in progress.
     if coro.is_paused() {
@@ -523,7 +452,6 @@ unsafe fn drop_<R, F: FnOnce() -> R + Unpin>(coro: &mut Coro<R, F>) -> DropRetur
   }
   // SAFETY: `self.stack` is not used again.
   let stack = unsafe { ManuallyDrop::take(&mut coro.stack) };
-  std::println!("took stack from coro");
   cfg_select! {
     feature = "common_pool" => {
       // SAFETY: We have exclusive access to the thread-local pool.
@@ -532,7 +460,6 @@ unsafe fn drop_<R, F: FnOnce() -> R + Unpin>(coro: &mut Coro<R, F>) -> DropRetur
     feature = "stack_alloc" => stack,
     _ => {}
   }
-  std::println!("gave it to common pool");
 }
 
 impl<R, F: FnOnce() -> R + Unpin> Drop for Coro<R, F> {

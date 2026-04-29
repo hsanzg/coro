@@ -12,20 +12,20 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(_target: &mut Control) {
   }
   naked_asm!(
     ".cfi_startproc",
+    "mov [rsp - 48], rbp",
+    ".cfi_rel_offset rbp, -48",
+    "mov [rsp - 40], rbx",
+    ".cfi_rel_offset rbx, -40",
+    "mov [rsp - 32], r12",
+    ".cfi_rel_offset r12, -32",
+    "mov [rsp - 24], r13",
+    ".cfi_rel_offset r13, -24",
+    "mov [rsp - 16], r14",
+    ".cfi_rel_offset r14, -16",
+    "mov [rsp - 8], r15",
+    ".cfi_rel_offset r15, -8",
     "sub rsp, 56", // mod 16 = 8.
     ".cfi_adjust_cfa_offset 56",
-    "mov [rsp], rbp",
-    ".cfi_rel_offset rbp, 0",
-    "mov [rsp + 8], rbx",
-    ".cfi_rel_offset rbx, 8",
-    "mov [rsp + 16], r12",
-    ".cfi_rel_offset r12, 16",
-    "mov [rsp + 24], r13",
-    ".cfi_rel_offset r13, 24",
-    "mov [rsp + 32], r14",
-    ".cfi_rel_offset r14, 32",
-    "mov [rsp + 40], r15",
-    ".cfi_rel_offset r15, 40",
 
     "mov rax, [rdi + {sp_off}]",
     "mov [rdi + {sp_off}], rsp",
@@ -40,17 +40,17 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(_target: &mut Control) {
     "call {unwind}",
 
     "2:",
-    "mov rbp, [rsp]",
+    "mov rbp, [rsp + 8]",
     ".cfi_restore rbp",
-    "mov rbx, [rsp + 8]",
+    "mov rbx, [rsp + 16]",
     ".cfi_restore rbx",
-    "mov r12, [rsp + 16]",
+    "mov r12, [rsp + 24]",
     ".cfi_restore r12",
-    "mov r13, [rsp + 24]",
+    "mov r13, [rsp + 32]",
     ".cfi_restore r13",
-    "mov r14, [rsp + 32]",
+    "mov r14, [rsp + 40]",
     ".cfi_restore r14",
-    "mov r15, [rsp + 40]",
+    "mov r15, [rsp + 48]",
     ".cfi_restore r15",
     "add rsp, 56",
     ".cfi_adjust_cfa_offset -56",
@@ -62,7 +62,7 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(_target: &mut Control) {
   )
 }
 
-/// Resumes execution of a computation at the point where it was last
+/*/// Resumes execution of a computation at the point where it was last
 /// suspended. This function saves the context of the current program
 /// and restores the old context from the given control record.
 pub unsafe extern "sysv64-unwind" fn transfer_control2(target: &mut Control) {
@@ -150,7 +150,7 @@ pub unsafe extern "sysv64-unwind" fn transfer_control2(target: &mut Control) {
       options(may_unwind)
     )
   }
-}
+}*/
 
 /// Returns the value that the stack pointer should have after
 /// [transferring control] to the coroutine associated with the

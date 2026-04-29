@@ -435,6 +435,7 @@ type DropReturn = cfg_select! {
 /// Such coroutine may not be used again, and that includes calling
 /// its `drop` method. Thus the only safe way to proceed after calling
 /// `drop_(&mut coro)` is to do `core::mem::forget(coro)`.
+#[cfg_attr(feature = "common_pool", inline(always))]
 unsafe fn drop_<R, F: FnOnce() -> R + Unpin>(coro: &mut Coro<R, F>) -> DropReturn {
   if coro.has_started() {
     // We need to unwind the coroutine's stack manually if it was left in progress.

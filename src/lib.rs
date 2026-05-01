@@ -249,9 +249,6 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   #[inline]
   fn func(&mut self) -> &mut ManuallyDrop<F> {
     &mut unsafe { self.bottom.as_mut() }.func
-    /*let mut f_ptr = next_slot(self.stack.bottom());
-    // SAFETY:
-    unsafe { f_ptr.as_mut() }*/
   }
 
   /// Checks whether the coroutine has begun execution.
@@ -309,12 +306,6 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
     // Push ourselves to the stack of active coroutines.
     let ctrl = self.control_mut();
     ctrl.caller = ACTIVE.replace(ctrl);
-    /*println!(
-      "resume: transferring control to {:?} (sp={:?}, ip={:?})",
-      ptr::from_mut(ctrl),
-      ctrl.stack_ptr,
-      ctrl.inst_ptr
-    );*/
     // SAFETY: The coroutine has exclusive access to its stack at this point.
     unsafe { arch::transfer_control(ctrl) };
     // The coroutine's computation has transferred control back.

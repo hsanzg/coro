@@ -20,4 +20,3 @@ libc = "0.2"
 
 [workspace]
 members = ["macros", "benchs"]
-

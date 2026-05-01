@@ -2,6 +2,7 @@
 
 use crate::ACTIVE;
 use core::cell::UnsafeCell;
+use core::hint::cold_path;
 use core::mem::MaybeUninit;
 use core::ptr;
 // Taken from https://github.com/rust-lang/rust/blob/main/library/unwind/src/libunwind.rs.
@@ -54,7 +55,7 @@ unsafe extern "C-unwind" {
   fn _Unwind_RaiseException(exception: *mut _Unwind_Exception) -> _Unwind_Reason_Code;
 }
 
-pub fn start_unwind() -> ! {
+pub extern "C-unwind" fn start_unwind() -> ! {
   extern "C" fn cleanup(_code: _Unwind_Reason_Code, _ex: *mut _Unwind_Exception) {}
 
   #[thread_local]
@@ -87,6 +88,7 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
 ) -> _Unwind_Reason_Code {
   // todo: add unlikely.
   if version != 1 {
+    cold_path();
     return _Unwind_Reason_Code::_URC_FATAL_PHASE1_ERROR;
   }
   if actions & _UA_CLEANUP_PHASE != 0 && ex_class != CORO_UNWIND {

@@ -3,10 +3,169 @@ use crate::{Bottom, Control};
 use core::arch::{asm, naked_asm};
 use core::mem::offset_of;
 use core::panic::AssertUnwindSafe;
+use core::ptr;
 use core::ptr::NonNull;
 
+// Invariant: return address always stored at `control.sp`.
+
+pub unsafe extern "sysv64-unwind" fn resume_coro(target: &mut Control) {
+  unsafe {
+    asm!(
+    // Preserve reserved registers.
+    "mov [rsp - 16], rbx",
+    "mov [rsp - 24], rbp",
+
+    "mov rcx, [rdi + {sp_off}]",
+    "call [rcx]",
+
+    // Switch back to the parent stack.
+    "mov [rdi + {sp_off}], rsp",
+    "lea rsp, [rcx + 8]",
+
+    // Restore reserved registers.
+    "mov [rsp - 24], rbp",
+    "mov [rsp - 16], rbx",
+
+    in("rdi") target, lateout("rcx") _,
+    clobber_abi("sysv64"),
+    sp_off = const offset_of!(Control, stack_ptr),
+    options(may_unwind),
+    )
+  }
+}
+
+pub fn initial_sp<R, F>(bottom: NonNull<Bottom<F>>) -> StackPtr
+where
+  F: FnOnce() -> R + Unpin,
+{
+  let ret_addr = unsafe { bottom.byte_sub(8) }.cast::<*const ()>();
+  unsafe { ret_addr.write(first_tramp::<R, F> as *const _) };
+  ret_addr.cast()
+}
+
 #[unsafe(naked)]
-pub unsafe extern "sysv64-unwind" fn transfer_control(_target: &mut Control) {
+pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
+  _active: &mut Control,
+) -> ! {
+  naked_asm!(
+    ".cfi_startproc",
+    ".cfi_personality 0x1b, {personality_fn}", // DW_EH_PE_pcrel | DW_EH_PE_sdata4
+    ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0
+    ".cfi_signal_frame", // hack to allow backtrace generation with gdb.
+
+    // Preserve old stack pointer.
+    "mov [rdi + {sp_off}], rsp",
+
+    // Switch to the bottom of the new stack.
+    "lea rsp, [rcx + 8]",
+    ".cfi_def_cfa rsp, 0",
+
+    // DW_OP_plus_uconst 16 is 0x23, 0x10
+    // ".cfi_offset rsp, 0",
+    // DW_CFA_val_expression rsp, DW_FORM_block(len=3, DW_OP_deref DW_OP_plus_uconst 8)
+    ".cfi_escape 0x16, 0x07, 3, 0x06, 0x23, 8",
+
+    // DW_CFA_expression rbp, DW_FORM_block(len=3, DW_OP_deref DW_OP_lit16 DW_OP_minus)
+    ".cfi_escape 0x10, 0x06, 3, 0x06, 0x40, 0x1c",
+    // DW_CFA_expression rbx, DW_FORM_block(len=3, DW_OP_deref DW_OP_lit8 DW_OP_minus)
+    ".cfi_escape 0x10, 0x03, 3, 0x06, 0x38, 0x1c",
+    // DW_CFA_expression rip, DW_FORM_block(len=1, DW_OP_deref)
+    ".cfi_escape 0x10, 0x10, 1, 0x06",
+    // ".cfi_adjust_cfa_offset 8",
+
+    // Bounce off to the arch-independent trampoline.
+    "call {second_tramp}",
+    "2:",
+    "ud2",
+    ".cfi_endproc",
+    sp_off = const offset_of!(Control, stack_ptr),
+    personality_fn = sym crate::unwind::__coro_trampoline_personality,
+    second_tramp = sym crate::trampoline::<R, F>,
+  )
+}
+
+pub unsafe extern "sysv64" fn suspend_coro(active: &mut Control) {
+  unsafe {
+    asm!(
+      // Preserve reserved registers.
+      "push rbx",
+      "push rbp",
+
+      "mov rcx, [rdi + {sp_off}]",
+      "call [rcx]",
+      "2:",
+      // Switch back to our own stack.
+      // Remember, the return location at this point is at `rsp`.
+      "mov [rdi + {sp_off}], rsp", // now at `active.stack_ptr`.
+      "lea rsp, [rcx + 24]",
+
+      // Restore reserved registers.
+      "mov [rsp - 16], rbp",
+      "mov [rsp - 8], rbx",
+      in("rdi") active, lateout("rcx") _,
+      clobber_abi("sysv64"),
+      lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
+      sp_off = const offset_of!(Control, stack_ptr),
+    )
+  }
+}
+
+#[unsafe(naked)]
+pub unsafe extern "sysv64" fn return_control<R>(_active: &mut Control, _ret_val: NonNull<R>) -> ! {
+  naked_asm!(
+    "mov qword ptr [rdi + {sp_off} - 8], 0",
+    "mov rcx, [rdi + {sp_off}]",
+    "jmp [rcx]",
+    sp_off = const offset_of!(Control, stack_ptr),
+  )
+}
+
+pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
+  unsafe {
+    asm!(
+      "mov [rsp - 8], rbx",
+      // ".cfi_adjust_cfa_offset 8",
+      // ".cfi_rel_offset rbx, -8",
+      "mov [rsp - 16], rbp",
+      // ".cfi_rel_offset rbp, -16",
+      // ".cfi_adjust_cfa_offset 8",
+      // ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0
+
+      "mov rax, [rdi + {sp_off}]",
+      "mov [rdi + {sp_off}], rsp",
+      "mov rsp, rax",
+
+      "mov rax, [rdi + {ip_off}]",
+      "lea rsi, [rip + 2f]",
+      "mov [rdi + {ip_off}], rsi",
+      "jmp rax",
+
+      "mov rbp, [rsp - 16]",
+      "mov rbx, [rsp - 8]",
+      "call {unwind}",
+
+      "2:",
+      "mov rbp, [rsp - 16]",
+      // ".cfi_restore rbp",
+      // ".cfi_adjust_cfa_offset -8",
+      "mov rbx, [rsp - 8]",
+      // ".cfi_adjust_cfa_offset -8",
+      // ".cfi_restore rbx",
+      in("rdi") target, lateout("rsi") _,
+      clobber_abi("sysv64"),
+      lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
+      sp_off = const offset_of!(Control, stack_ptr),
+      ip_off = const offset_of!(Control, inst_ptr),
+      unwind = sym crate::unwind::start_unwind,
+      options(may_unwind)
+    )
+  };
+  // extern crate std;
+  // std::println!("returning from transfer_control");
+}
+
+#[unsafe(naked)]
+pub unsafe extern "sysv64-unwind" fn transfer_control2(_target: &mut Control) {
   #[inline(always)]
   unsafe extern "sysv64-unwind" fn inner(target: &mut Control) {
     unsafe {
@@ -61,7 +220,7 @@ pub unsafe extern "sysv64-unwind" fn transfer_control(_target: &mut Control) {
 /// deferrenceable).
 ///
 /// [transferring control]: transfer_control
-pub fn initial_sp<R, F>(bottom: NonNull<Bottom<F>>) -> StackPtr
+pub fn initial_sp2<R, F>(bottom: NonNull<Bottom<F>>) -> StackPtr
 where
   F: FnOnce() -> R + Unpin,
 {
@@ -101,6 +260,8 @@ pub extern "sysv64-unwind" fn first_frame() -> ! {
   naked_asm!(
     ".cfi_startproc",
     ".cfi_personality 0x1b, {personality_fn}", // DW_EH_PE_pcrel | DW_EH_PE_sdata4
+    ".cfi_signal_frame", // hack to allow backtrace generation with gdb.
+    ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0
     ".cfi_def_cfa rsp, 16",
     ".cfi_rel_offset rsp, 0",
     // DW_CFA_expression DW_OP_reg6 (rbp) DW_FORM_block(len, DW_OP_lit16 DW_OP_minus DW_OP_deref DW_OP_plus_uconst 8 DW_OP_deref)
@@ -135,22 +296,22 @@ pub extern "sysv64-unwind" fn first_frame() -> ! {
 /// [`resume`]: crate::Coro::resume
 /// [coroutine]: crate::Coro
 #[unsafe(naked)]
-pub unsafe extern "sysv64-unwind" fn return_control<R>(
+pub unsafe extern "sysv64-unwind" fn return_control2<R>(
   _control: &mut Control,    // in `rdi`.
   _ret_val_addr: NonNull<R>, // in `rsi`.
 ) -> ! {
   naked_asm!(
     // Switch back to the previous stack.
-    "mov rsp, [rdi + {stack_ptr_off}]",
+    "mov rsp, [rdi + {sp_off}]",
     // Record the coroutine's return value location.
-    "mov [rdi + {stack_ptr_off}], rsi",
+    "mov [rdi + {sp_off}], rsi",
     // Mark the coroutine as finished and return to the previous
     // computation.
-    "mov rsi, [rdi + {inst_ptr_off}]",
-    "mov qword ptr [rdi + {inst_ptr_off}], 0",
+    "mov rsi, [rdi + {ip_off}]",
+    "mov qword ptr [rdi + {ip_off}], 0",
     "jmp rsi",
-    stack_ptr_off = const offset_of!(Control, stack_ptr),
-    inst_ptr_off = const offset_of!(Control, inst_ptr),
+    sp_off = const offset_of!(Control, stack_ptr),
+    ip_off = const offset_of!(Control, inst_ptr),
   )
 }
 
@@ -161,15 +322,42 @@ pub unsafe extern "sysv64-unwind" fn return_control<R>(
 /// have started but not be completely finished.
 ///
 /// [paused]: crate::Coro::is_paused
+// todo: note that caller is responsible for marking the coroutine as finished, if necessary.
 pub unsafe fn force_unwind(control: &mut Control) {
   // Transfer control back to the `call {unwind}` instruction in
   // `transfer_control`, by moving the resumption address of the
   // coroutine (local label `2` in that function) five bytes back
   // (the length of the `call {unwind}` instruction).
   control.inst_ptr = unsafe {
-    control.inst_ptr.byte_sub(5 /*14*/)
+    control.inst_ptr.byte_sub(15 /*5*/)
   };
+  // crate::ACTIVE.set(&raw mut *control);
   let mut control_ref = AssertUnwindSafe(control);
   let res = crate::unwind::catch_unwind(move || unsafe { transfer_control(*control_ref) });
   debug_assert!(res.is_err(), "coroutine did not unwind");
+}
+
+// https://sourceware.org/git/?p=valgrind.git;a=blob;f=include/valgrind.h.in;h=ed7d8c68e24b896e912fb19e17cc906730a82a4c;hb=refs/heads/master#l409
+fn valgrind_do_client_request(default: usize, args: &[usize; 6]) -> usize {
+  let result: usize;
+  unsafe {
+    asm!(
+      "rol rdi, 3; rol rdi, 13",
+      "rol rdi, 61; rol rdi, 51",
+      "xchg rbx, rbx",
+      inlateout("rdx") default => result,
+      in("rax") args,
+      // The sum of the rotation offsets is 128, so
+      // the original contents of `rdi` are left intact.
+    )
+  };
+  result
+}
+
+pub fn valgrind_stack_register(start: *mut u8, end: *mut u8) -> usize {
+  valgrind_do_client_request(0, &[0x1501, start as _, end as _, 0, 0, 0])
+}
+
+pub fn valgrind_stack_deregister(id: usize) {
+  valgrind_do_client_request(0, &[0x1502, id, 0, 0, 0, 0]);
 }

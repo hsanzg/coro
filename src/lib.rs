@@ -42,13 +42,14 @@
 //! [`libfringe`]: https://github.com/edef1c/libfringe
 
 #![feature(asm_unwind)]
+#![feature(core_intrinsics)]
 #![feature(coroutine_trait)]
+#![feature(rustc_attrs)]
 #![feature(thread_local)]
 #![expect(
   internal_features,
   reason = "we unwind coroutine stacks by throwing a non-Rust exception type, and need `catch_unwind` to catch it"
 )]
-#![feature(core_intrinsics)]
 #![cfg_attr(all(test, feature = "stack_alloc"), feature(pointer_is_aligned_to))]
 #![no_std]
 #[cfg(feature = "stack_alloc")]
@@ -111,6 +112,13 @@ struct Control {
   /// representing the main program). Otherwise undefined.
   caller: *mut Control,
   _pin: PhantomPinned,
+}
+
+impl Control {
+  #[inline(always)]
+  fn inst_ptr(&self) -> *const () {
+    unsafe { self.stack_ptr.cast().read() }
+  }
 }
 
 /// The control record of the currently active coroutine, if any.
@@ -255,7 +263,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   #[must_use]
   #[inline]
   pub fn has_started(&self) -> bool {
-    self.control().inst_ptr != trampoline::<R, F> as *const _
+    self.control().inst_ptr() != arch::first_tramp::<R, F> as *const _
   }
 
   // todo: find better name? `is_suspended`? not good enough, since
@@ -264,7 +272,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   #[must_use]
   pub fn is_paused(&self) -> bool {
     let ctrl = self.control();
-    !ctrl.inst_ptr.is_null() && self.stack.contains(ctrl.stack_ptr)
+    !ctrl.inst_ptr().is_null() && self.stack.contains(ctrl.stack_ptr)
   }
 
   /// Checks if the coroutine has completely finished its execution
@@ -272,7 +280,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   #[must_use]
   #[inline]
   pub fn has_finished(&self) -> bool {
-    self.control().inst_ptr.is_null()
+    self.control().inst_ptr().is_null()
   }
 
   /// Checks if the coroutine has panicked via the [`panic!`] macro
@@ -307,9 +315,9 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
     let ctrl = self.control_mut();
     ctrl.caller = ACTIVE.replace(ctrl);
     // SAFETY: The coroutine has exclusive access to its stack at this point.
-    unsafe { arch::transfer_control(ctrl) };
+    unsafe { arch::resume_coro(ctrl) };
     // The coroutine's computation has transferred control back.
-    if ctrl.inst_ptr.is_null() {
+    if ctrl.inst_ptr().is_null() {
       // The computation finished. Copy the return value to the current stack,
       // because the stack of the coroutine might be about to get dropped.
       let ret_val_addr = ctrl.stack_ptr.cast();
@@ -407,7 +415,7 @@ pub fn suspend() {
       );*/
       // Pop the current coroutine from the stack.
       ACTIVE.set(control.caller);
-      unsafe { arch::transfer_control(control) };
+      unsafe { arch::suspend_coro(control) };
     }
     None => panic!("cannot suspend from outside a coroutine"),
   }

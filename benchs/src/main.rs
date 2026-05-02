@@ -15,7 +15,7 @@ fn switch(c: &mut Criterion) {
       yielder.suspend(());
     }
   });
-  c.bench_function("corosensei", |b| b.iter(|| coro.resume(())));
+  // c.bench_function("corosensei", |b| b.iter(|| coro.resume(())));
 }
 
 // todo: repeat this benchmark, but without stack pooling.
@@ -33,5 +33,5 @@ fn call(c: &mut Criterion) {
   });
 }
 
-criterion_group!(benchs, switch, call);
+criterion_group!(benchs, switch /*call*/,);
 criterion_main!(benchs);

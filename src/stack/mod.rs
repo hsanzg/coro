@@ -132,6 +132,11 @@ impl Stack {
     // SAFETY: We have `size >= 2 * page_size > 0`.
     let size = unsafe { NonZeroUsize::new_unchecked(size) };
     let base = os::alloc_stack(size);
+    // todo: handle deregistration.
+    crate::arch::valgrind_stack_register(
+      base.as_ptr(),
+      unsafe { base.byte_add(size.get()) }.as_ptr(),
+    );
     Self { base, size }
   }
 

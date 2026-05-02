@@ -71,6 +71,7 @@ pub extern "C-unwind" fn start_unwind() -> ! {
   };
 
   let ex_ptr = EXCEPTION.get().cast();
+  // panic!("manual unwind");
   let res = unsafe { _Unwind_RaiseException(ex_ptr) };
   panic!("_Unwind_RaiseException failed: {res:?}");
 }
@@ -86,7 +87,6 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
   _ex: *mut _Unwind_Exception,
   _ctx: *mut _Unwind_Context,
 ) -> _Unwind_Reason_Code {
-  // todo: add unlikely.
   if version != 1 {
     cold_path();
     return _Unwind_Reason_Code::_URC_FATAL_PHASE1_ERROR;
@@ -94,8 +94,8 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
   if actions & _UA_CLEANUP_PHASE != 0 && ex_class != CORO_UNWIND {
     // todo: Move to some `cleanup_on_panic` global function in `lib.rs`.
     let cur = ACTIVE.get();
-    // todo: add unlikely.
     if cur.is_null() {
+      cold_path();
       return _Unwind_Reason_Code::_URC_FATAL_PHASE2_ERROR;
     }
     let cur = unsafe { &*cur };

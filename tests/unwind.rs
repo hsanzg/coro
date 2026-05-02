@@ -351,3 +351,5 @@ fn catch_unwind_of_inner_coro_within_coro() {
   catcher.resume();
   assert!(catcher_dropped.get());
 }
+
+// todo: add `resume_another_coro_when_being_dropped` (due to panic and due to drop).

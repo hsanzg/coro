@@ -91,15 +91,22 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
     cold_path();
     return _Unwind_Reason_Code::_URC_FATAL_PHASE1_ERROR;
   }
-  if actions & _UA_CLEANUP_PHASE != 0 && ex_class != CORO_UNWIND {
+  extern crate std;
+  std::println!("tramp_personality: actions={actions:x}, ex_class={ex_class:x}");
+  // Poison the active coroutine as soon as possible, before the second phase starts.
+  if actions & _UA_SEARCH_PHASE != 0
+  /* && ex_class != CORO_UNWIND*/
+  {
+    // todo: poison the active coroutine.
     // todo: Move to some `cleanup_on_panic` global function in `lib.rs`.
     let cur = ACTIVE.get();
     if cur.is_null() {
       cold_path();
       return _Unwind_Reason_Code::_URC_FATAL_PHASE2_ERROR;
     }
-    let cur = unsafe { &*cur };
-    ACTIVE.set(cur.caller);
+    let cur = unsafe { &mut *cur };
+    cur.poisoned = true;
+    std::println!("poisoned active {:?}", &raw const cur);
   }
   _Unwind_Reason_Code::_URC_CONTINUE_UNWIND
 }

@@ -128,11 +128,12 @@ fn user_unwind() {
   let dropped = Cell::new(false);
   let dropped_ref = AssertUnwindSafe(&dropped);
   let res = catch_unwind(move || {
-    new_coro(|| {
+    let mut coro = new_coro(|| {
       let _rec = DropRecorder(*dropped_ref);
       resume_unwind(Box::new(()));
-    })
-    .resume();
+    });
+    coro.resume();
+    assert_complete(&coro, true);
   });
   assert!(res.is_err());
   assert!(dropped.get());
@@ -184,11 +185,13 @@ fn unwind_on_panic_after_many_suspends_from_recursive_fn() {
   for _ in 0..COUNTDOWN {
     coro.resume();
   }
-  let res = catch_unwind(move || coro.resume());
+  let mut coro_ref = AssertUnwindSafe(&mut coro);
+  let res = catch_unwind(move || coro_ref.resume());
   assert_eq!(
     res.expect_err("coro must panic").downcast_ref(),
     Some(&"boom")
   );
+  assert_complete(&coro, true);
 }
 
 #[test]
@@ -241,11 +244,13 @@ fn doubly_nested_unwinds_on_inner_panic() {
     })
     .resume();
   });
-  let res = catch_unwind(move || outer.resume());
+  let mut outer_ref = AssertUnwindSafe(&mut outer);
+  let res = catch_unwind(move || outer_ref.resume());
   assert_eq!(
     res.expect_err("inner must panic").downcast_ref(),
     Some(&"inner")
   );
+  assert_complete(&outer, true);
   assert!(inner_dropped.get());
   assert!(middle_dropped.get());
   assert!(outer_dropped.get());
@@ -318,11 +323,12 @@ fn doubly_nested_unwinds_on_outer_panic() {
 
 #[test]
 fn catch_panic_unwind_within_coro() {
-  new_coro(|| {
+  let mut coro = new_coro(|| {
     let res = catch_unwind(|| panic!("help"));
     assert!(res.is_err());
-  })
-  .resume();
+  });
+  coro.resume();
+  assert_complete(&coro, false);
 }
 
 #[test]
@@ -336,20 +342,52 @@ fn catch_unwind_of_inner_coro_within_coro() {
       let _rec = DropRecorder(*thrower_dropped_ref);
       panic!("bet you can't catch me!");
     });
-    let res = catch_unwind(move || {
-      thrower.resume();
-    });
+    let mut thrower_ref = AssertUnwindSafe(&mut thrower);
+    let res = catch_unwind(move || thrower_ref.resume());
     assert_eq!(
       res.expect_err("thrower must panic").downcast_ref(),
       Some(&"bet you can't catch me!")
     );
+    assert_complete(&thrower, true);
     assert!(thrower_dropped.get());
     suspend();
   });
   catcher.resume();
+  assert_paused(&catcher);
   assert!(!catcher_dropped.get());
   catcher.resume();
+  assert_complete(&catcher, false);
   assert!(catcher_dropped.get());
 }
 
+/// Calls [`suspend`] when dropped.
+struct SuspendOnDrop;
+impl Drop for SuspendOnDrop {
+  fn drop(&mut self) {
+    println!("suspend from drop");
+    suspend();
+  }
+}
+
+#[test]
+#[should_panic]
+fn suspend_from_paused_coro_being_dropped_aborts() {
+  new_coro(|| {
+    let _drop = SuspendOnDrop;
+    suspend();
+  })
+  .resume();
+}
+
+#[test]
+fn suspend_from_coro_being_unwound_due_to_panic_aborts() {
+  new_coro(|| {
+    let _drop = SuspendOnDrop;
+    panic!();
+  })
+  .resume();
+}
+
+// todo: add `suspend_from_dropping_coro_panics`.
+// todo: add `resume_from_dropping_coro`.
 // todo: add `resume_another_coro_when_being_dropped` (due to panic and due to drop).

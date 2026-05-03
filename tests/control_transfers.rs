@@ -7,6 +7,7 @@ use core::cell::RefCell;
 use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
 use coro::{Coro, suspend};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[test]
 #[should_panic]
@@ -36,6 +37,15 @@ fn resume_after_finishing_panics() {
   let mut coro = new_coro(|| {});
   coro.resume();
   coro.resume(); // panics.
+}
+
+#[test]
+#[should_panic]
+fn resume_after_panicking_panics() {
+  let mut coro = new_coro(|| panic!());
+  let mut coro_ref = AssertUnwindSafe(&mut coro);
+  let _ = catch_unwind(move || coro_ref.resume());
+  coro.resume();
 }
 
 #[test]

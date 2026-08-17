@@ -91,6 +91,20 @@ fn many_control_transfers() {
   assert_complete(&coro, false);
 }
 
+// todo: remove this or adapt; its purpose is to reproduce the failure observed
+//  in the benchmark.
+#[test]
+fn non_terminating_coro() {
+  let mut coro = new_coro(|| {
+    loop {
+      suspend();
+    }
+  });
+  for _ in 0..1000000 {
+    coro.resume();
+  }
+}
+
 #[test]
 fn resume_after_move() {
   let mut coro = new_coro(|| {

@@ -370,7 +370,7 @@ impl Drop for SuspendOnDrop {
 }
 
 #[test]
-#[should_panic]
+#[ignore = "aborts the test process; uncomment and test manually"]
 fn suspend_from_paused_coro_being_dropped_aborts() {
   new_coro(|| {
     let _drop = SuspendOnDrop;
@@ -380,6 +380,7 @@ fn suspend_from_paused_coro_being_dropped_aborts() {
 }
 
 #[test]
+#[ignore = "aborts the test process; uncomment and test manually"]
 fn suspend_from_coro_being_unwound_due_to_panic_aborts() {
   new_coro(|| {
     let _drop = SuspendOnDrop;

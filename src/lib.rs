@@ -135,12 +135,12 @@ static ACTIVE: Cell<*mut Control> = Cell::new(ptr::null_mut());
 struct ActivateOnDrop(*mut Control);
 impl Drop for ActivateOnDrop {
   fn drop(&mut self) {
-    extern crate std;
+    /*extern crate std;
     std::println!(
       "setting ACTIVE back to {:?}, was {:?}",
       self.0,
       ACTIVE.get()
-    );
+    );*/
     ACTIVE.set(self.0);
   }
 }
@@ -323,6 +323,11 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
     !self.stack.contains(self.control().stack_ptr)
   }
 
+  // todo: remove.
+  pub fn is_poisoned(&self) -> bool {
+    self.control().poisoned
+  }
+
   /// Resumes execution of this coroutine's program where it last left off.
   ///
   /// This method is essentially equivalent to [`Coroutine::resume`],
@@ -453,22 +458,36 @@ where
 pub fn suspend() {
   match unsafe { ACTIVE.get().as_mut() } {
     Some(control) => {
-      extern crate std;
       if control.poisoned {
-        panic!("cannot suspend unwinding coroutine");
+        cold_path();
+        suspend_during_unwind();
       }
+      /*extern crate std;
       std::println!(
         "suspend: transferring control back, reading from {:?} (sp={:?}, ip={:?})",
         ptr::from_mut(control),
         control.stack_ptr,
         control.inst_ptr
-      );
+      );*/
       // Pop the current coroutine from the stack.
       // ACTIVE.set(control.caller);
       unsafe { arch::suspend_coro(control) };
     }
-    None => panic!("cannot suspend from outside a coroutine"),
+    None => {
+      cold_path();
+      suspend_from_outside()
+    }
   }
+}
+
+#[inline(never)]
+fn suspend_during_unwind() -> ! {
+  panic!("cannot suspend unwinding coroutine");
+}
+
+#[inline(never)]
+fn suspend_from_outside() -> ! {
+  panic!("cannot suspend from outside a coroutine")
 }
 
 type DropReturn = cfg_select! {

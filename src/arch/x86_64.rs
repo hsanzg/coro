@@ -77,12 +77,9 @@ global_asm!(
   ".uleb128 0",          // start instruction.
   ".uleb128 0xffffffff", // length of the instructions.
   ".uleb128 0",          // there's no landing pad.
-  // The action to take is to continue unwinding.
+  // The action to take is to clean up and continue unwinding.
   ".uleb128 0", // 1 + action table index. // todo: zero is a special case meaning "cleanup".
   ".Lcs_table_end:",
-  //// Declare the action table.
-  //".uleb128 ",
-  //".uleb128 0" // no more actions.
 );
 
 #[unsafe(naked)]
@@ -122,6 +119,7 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
   )
 }
 
+#[inline(always)]
 pub unsafe fn suspend_coro(active: &mut Control) {
   unsafe {
     asm!(
@@ -163,6 +161,7 @@ pub unsafe fn suspend_coro(active: &mut Control) {
   };
 }
 
+#[inline(always)]
 pub unsafe fn return_control(active: &mut Control) -> ! {
   unsafe {
     asm!(

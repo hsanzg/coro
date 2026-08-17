@@ -31,7 +31,7 @@ pub fn catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, ()> {
   fn do_catch<F: FnOnce() -> R, R>(_data: *mut u8, _payload: *mut u8) {}
 
   let data_ptr = (&raw mut data) as *mut u8;
-  if unsafe { core::intrinsics::catch_unwind(do_call::<F, R>, data_ptr, do_catch::<F, R>) } == 0 {
+  if unsafe { !core::intrinsics::catch_unwind(do_call::<F, R>, data_ptr, do_catch::<F, R>) } {
     Ok(ManuallyDrop::into_inner(unsafe { data.r }))
   } else {
     Err(())

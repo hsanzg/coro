@@ -73,6 +73,7 @@ pub extern "C-unwind" fn start_unwind() -> ! {
   let ex_ptr = EXCEPTION.get().cast();
   // panic!("manual unwind");
   let res = unsafe { _Unwind_RaiseException(ex_ptr) };
+  // todo: abort better than panic.
   panic!("_Unwind_RaiseException failed: {res:?}");
 }
 

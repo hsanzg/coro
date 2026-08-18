@@ -7,6 +7,7 @@ use core::ptr::NonNull;
 
 // Invariant: return address always stored at `control.sp`.
 
+#[inline(always)]
 pub unsafe fn resume_coro(target: &mut Control) {
   unsafe {
     asm!(
@@ -98,16 +99,18 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
     ".cfi_startproc simple",
     ".cfi_personality 0x1b, {personality_fn}", // 0x1b = DW_EH_PE_pcrel | DW_EH_PE_sdata4
     ".cfi_lsda 0x10, __coro_tramp_lsda",
-    ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0
     // todo: This seems to cause the unwinder to use the unwind info
     //  corresponding the instruction _following_ the return address;
     //  check that all relevant `asm!` blocks do not end with a `ret`
     //  or a `jmp` not followed by e.g. a dummy `nop` or `ud2`.
-    ".cfi_signal_frame", // hack to allow backtrace generation with gdb.
+    // ".cfi_signal_frame", // hack to allow backtrace generation with gdb.
 
     // Place this frame on the parent stack.
-    // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=4, DW_OP_reg7/rsp DW_OP_deref DW_OP_plus_uconst 16)
-    ".cfi_escape 0x0f, 4, 0x57, 0x06, 0x23, 16",
+    // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=5, DW_OP_breg7/rsp 0 DW_OP_deref DW_OP_plus_uconst 16)
+    // In theory we could use `DW_OP_reg7` instead of `DW_OP_breg7 +0`.
+    // Alas, gdb doesn't accept the former operation when it appears
+    // within `DW_CFA_def_cfa_expression`.
+    ".cfi_escape 0x0f, 5, 0x77, 0, 0x06, 0x23, 16",
     // LLVM doesn't support `DW_CFA_val_offset`. // todo: is this still up to date? Record LLVM version.
     // DW_CFA_val_expression rsp, DW_FORM_block(len=2, DW_OP_plus_uconst 8)
     ".cfi_escape 0x16, 0x07, 2, 0x23, 8", // on entry to the `asm!` block of `resume_coro`.
@@ -133,6 +136,7 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
     // Switch to the new stack.
     "mov rsp, rsi",
     // Bounce into the architecture-independent trampoline.
+    ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0
     "jmp {second_tramp}", // todo: replace by call and skip the manual stack adjustment in `initial_sp`?
     "ud2",
     ".cfi_endproc",
@@ -151,8 +155,8 @@ pub unsafe fn suspend_coro(active: &mut Control) {
       "push rbx",
       "push rbp",
       // Also record the resumption program address.
-      "lea rcx, [rip + 2f]",
-      "push rcx",
+      "lea rax, [rip + 2f]",
+      "push rax",
       // Switch to the parent stack.
       "mov [rdi + {sp_off}], rsp",
       "mov rsp, rsi",
@@ -205,6 +209,7 @@ pub unsafe fn return_control(active: &mut Control) -> ! {
   }
 }
 
+#[inline]
 pub unsafe fn force_unwind2(target: &mut Control) {
   let mut target_ref = AssertUnwindSafe(target);
   let res = crate::unwind::catch_unwind(move || unsafe {
@@ -212,21 +217,21 @@ pub unsafe fn force_unwind2(target: &mut Control) {
     asm!(
       // Create a frame on the parent stack.
       "push rbx",
-      "lea rcx, [rip + 2f]",
-      "push rcx",
+      "lea rax, [rip + 2f]",
+      "push rax",
       "push rbp",
       // Record the current stack pointer value.
       "mov [rdi + {sp_off}], rsp",
       // Switch to the coroutine stack.
       "mov rsp, rsi",
       // Restore the previous contents of the reserved registers.
-      "pop rcx",
+      "pop rax",
       "pop rbp",
       "pop rbx",
       // Begin the unwinding.
       // todo: Say that this is to set the return address of `start_unwind` to the original resumption point of the coroutine.
-      "push rcx",
       ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size 0
+      "push rax",
       "jmp {start_unwind}",
       "2:",
       // It may be the case that the coroutine program catches the exception

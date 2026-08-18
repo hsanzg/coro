@@ -46,6 +46,14 @@ where
   unsafe { bottom.byte_sub(8).cast() }
 }
 
+pub fn first_inst_addr<R, F>() -> *const ()
+where
+  F: FnOnce() -> R + Unpin,
+{
+  // See `first_tramp` for the reason behind the 1-byte offset.
+  unsafe { (first_tramp::<R, F> as *const ()).byte_add(1) }
+}
+
 pub fn prepare_stack<R, F>(bottom: NonNull<Bottom<R, F>>)
 where
   F: FnOnce() -> R + Unpin,
@@ -53,7 +61,7 @@ where
   let ret_addr = unsafe { bottom.byte_add(8).cast() };
   unsafe { ret_addr.write(resume_coro as *const ()) };
   let tramp_ret_addr = unsafe { bottom.byte_sub(8).cast() };
-  unsafe { tramp_ret_addr.write(first_tramp::<R, F> as *const ()) };
+  unsafe { tramp_ret_addr.write(first_inst_addr::<R, F>()) };
 }
 
 // Define an LSDA for the personality function of the trampoline function.
@@ -88,7 +96,7 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
   _parent_sp: StackPtr,
 ) -> ! {
   naked_asm!(
-    ".cfi_startproc",
+    ".cfi_startproc simple",
     ".cfi_personality 0x1b, {personality_fn}", // 0x1b = DW_EH_PE_pcrel | DW_EH_PE_sdata4
     ".cfi_lsda 0x10, __coro_tramp_lsda",
     ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0
@@ -97,12 +105,23 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
     // Place this frame on the parent stack.
     // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=4, DW_OP_reg7/rsp DW_OP_deref DW_OP_plus_uconst 16)
     ".cfi_escape 0x0f, 4, 0x57, 0x06, 0x23, 16",
-    // LLVM doesn't support `DW_CFA_val_offset`.
+    // LLVM doesn't support `DW_CFA_val_offset`. // todo: is this still up to date? Record LLVM version.
     // DW_CFA_val_expression rsp, DW_FORM_block(len=2, DW_OP_plus_uconst 8)
     ".cfi_escape 0x16, 0x07, 2, 0x23, 8", // on entry to the `asm!` block of `resume_coro`.
     ".cfi_offset rbx, 0",
     ".cfi_offset rip, -8",
     ".cfi_offset rbp, -16",
+
+    // LLDB subtracts 1 from the return address of a frame before
+    // resolving the function symbol that it points to. The return
+    // address of the main `trampoline` function is special in that
+    // it points to the beginning of `first_tramp` instead of the
+    // instruction following the `jmp` below. (This is because we
+    // also use that field to store the initial resumption address
+    // of the coroutine.) We include this `nop` to correct for that
+    // 1-byte adjustment, and point the initial address one byte
+    // after it in `prepare_stack`.
+    "nop",
 
     // Preserve the current contents of `rbp`.
     "push rbp",
@@ -111,7 +130,8 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
     // Switch to the new stack.
     "mov rsp, rsi",
     // Bounce into the architecture-independent trampoline.
-    "jmp {second_tramp}",
+    "jmp {second_tramp}", // todo: replace by call and skip the manual stack adjustment in `initial_sp`?
+    "ud2",
     ".cfi_endproc",
     sp_off = const offset_of!(Control, stack_ptr),
     personality_fn = sym crate::unwind::__coro_trampoline_personality,

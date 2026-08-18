@@ -110,7 +110,7 @@ struct Control {
   ///
   /// [trampoline function]: trampoline
   /// [null pointer]: ptr::null
-  inst_ptr: *const (),
+  // inst_ptr: *const (),
   /// If the coroutine is active, the address of the control record
   /// of the coroutine that last resumed it (with `ptr::null_mut()`
   /// representing the main program). Otherwise undefined.
@@ -164,7 +164,7 @@ struct Bottom<R, F: FnOnce() -> R + Unpin> {
   /// A control record used to store status information during
   /// transfers of control that involve this coroutine.
   ctrl: Control,
-  ret_val: *mut R,
+  //ret_val: *mut R,
   func: ManuallyDrop<F>,
 }
 
@@ -238,14 +238,14 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
           stack_ptr: arch::initial_sp(loc),
           #[cfg(target_arch = "x86_64")]
           _pad: ptr::null(),
-          // inst_ptr: arch::trampoline::<R, F> as *const _,
-          inst_ptr: trampoline::<R, F> as *const _,
+          // inst_ptr: arch::first_tramp::<R, F> as *const _,
+          // inst_ptr: trampoline::<R, F> as *const _,
           ret_val: ptr::null_mut(),
           caller: ptr::null_mut(),
           poisoned: false,
           _pin: PhantomPinned,
         },
-        ret_val: ptr::null_mut(),
+        // ret_val: ptr::null_mut(),
         // todo: finish comment.
         // Make a bitwise copy of the `FnOnce` instance on the new stack, in
         // order to pin it to a fixed memory location.
@@ -291,7 +291,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   #[must_use]
   #[inline]
   pub fn has_started(&self) -> bool {
-    self.control().inst_ptr() != arch::first_tramp::<R, F> as *const _
+    self.control().inst_ptr() != arch::first_inst_addr::<R, F>()
   }
 
   // todo: find better name? `is_suspended`? not good enough, since
@@ -509,11 +509,11 @@ unsafe fn drop_<R, F: FnOnce() -> R + Unpin>(coro: &mut Coro<R, F>) -> DropRetur
     // We need to unwind the coroutine's stack manually if it was left in progress.
     if coro.is_paused() {
       let ctrl = coro.control_mut();
-      extern crate std;
+      /*extern crate std;
       std::println!(
         "coroutine has not panicked, unwinding... control @ {:?}={ctrl:?}",
         ptr::from_mut(ctrl)
-      );
+      );*/
       let _active = ActivateOnDrop(ACTIVE.replace(ctrl));
       unsafe { arch::force_unwind2(ctrl) };
       // ACTIVE.set(ctrl.caller);

@@ -84,7 +84,7 @@ const _UA_CLEANUP_PHASE: _Unwind_Action = 2;
 pub unsafe extern "C" fn __coro_trampoline_personality(
   version: c_int,
   actions: _Unwind_Action,
-  ex_class: _Unwind_Exception_Class,
+  _ex_class: _Unwind_Exception_Class,
   _ex: *mut _Unwind_Exception,
   _ctx: *mut _Unwind_Context,
 ) -> _Unwind_Reason_Code {
@@ -105,7 +105,7 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
       cold_path();
       return _Unwind_Reason_Code::_URC_FATAL_PHASE2_ERROR;
     }
-    let cur = unsafe { &mut *cur };
+    // let cur = unsafe { &mut *cur };
     // cur.poisoned = true;
     // std::println!("poisoned active {:?}", &raw const cur);
   }

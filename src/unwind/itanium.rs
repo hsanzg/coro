@@ -37,7 +37,7 @@ type _Unwind_Action = c_int;
 type _Unwind_Exception_Cleanup_Fn =
   Option<extern "C" fn(_Unwind_Reason_Code, *mut _Unwind_Exception)>;
 
-const UNWINDER_PRIVATE_DATA_SIZE: usize = 2;
+const UNWINDER_PRIVATE_DATA_SIZE: usize = 2; // minimum across all supported targets.
 
 // todo: rename to `CORO_DROP`?
 const CORO_UNWIND: _Unwind_Exception_Class = u64::from_ne_bytes(*b"CORORUST");

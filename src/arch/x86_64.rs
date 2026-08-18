@@ -66,6 +66,7 @@ where
 
 // Define an LSDA for the personality function of the trampoline function.
 // See https://www.airs.com/blog/archives/464 for an explanation of the format.
+// Also see https://maskray.me/blog/2020-12-12-c++-exception-handling-abi.
 global_asm!(
   r#".section .gcc_except_table, "a", @progbits"#,
   ".p2align 2, 0x0", // todo: why?
@@ -78,15 +79,15 @@ global_asm!(
   // Leave the type table empty.
   ".byte 0xff", // TType = DW_EH_PE_omit
   // Define the encoding and length of the call-site table.
-  ".uleb128 0x03", // DW_EH_PE_udata4
+  ".byte 0x01", // DW_EH_PE_uleb128
   ".uleb128 .Lcs_table_end - .Lcs_table_start",
   // Declare the call-site table entry.
   ".Lcs_table_start:",
   ".uleb128 0",          // start instruction.
-  ".uleb128 0xffffffff", // length of the instructions.
+  ".uleb128 0xffffffff", // length of the instruction sequence.
   ".uleb128 0",          // there's no landing pad.
   // The action to take is to clean up and continue unwinding.
-  ".uleb128 0", // 1 + action table index. // todo: zero is a special case meaning "cleanup".
+  ".byte 0", // 1 + action table index. // todo: zero is a special case meaning "cleanup".
   ".Lcs_table_end:",
 );
 

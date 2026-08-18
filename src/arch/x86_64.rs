@@ -99,6 +99,10 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
     ".cfi_personality 0x1b, {personality_fn}", // 0x1b = DW_EH_PE_pcrel | DW_EH_PE_sdata4
     ".cfi_lsda 0x10, __coro_tramp_lsda",
     ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0
+    // todo: This seems to cause the unwinder to use the unwind info
+    //  corresponding the instruction _following_ the return address;
+    //  check that all relevant `asm!` blocks do not end with a `ret`
+    //  or a `jmp` not followed by e.g. a dummy `nop` or `ud2`.
     ".cfi_signal_frame", // hack to allow backtrace generation with gdb.
 
     // Place this frame on the parent stack.
@@ -144,8 +148,8 @@ pub unsafe fn suspend_coro(active: &mut Control) {
     asm!(
       // Preserve the current contents of the reserved registers
       // on the coroutine stack.
-      "push rbp",
       "push rbx",
+      "push rbp",
       // Also record the resumption program address.
       "lea rcx, [rip + 2f]",
       "push rcx",
@@ -168,8 +172,8 @@ pub unsafe fn suspend_coro(active: &mut Control) {
       // since they were updated by `resume_coro`.)
       "lea rsp, [rsi + 8]", // skip resumption address.
       // Restore the previous contents of the reserved registers.
-      "pop rbx",
       "pop rbp",
+      "pop rbx",
       in("rdi") active,
       in("rsi") active.stack_ptr.as_ptr(),
       clobber_abi("sysv64"),
@@ -206,6 +210,7 @@ pub unsafe fn force_unwind2(target: &mut Control) {
   let res = crate::unwind::catch_unwind(move || unsafe {
     let target: &mut _ = *target_ref;
     asm!(
+      // Create a frame on the parent stack.
       "push rbx",
       "lea rcx, [rip + 2f]",
       "push rcx",
@@ -216,8 +221,8 @@ pub unsafe fn force_unwind2(target: &mut Control) {
       "mov rsp, rsi",
       // Restore the previous contents of the reserved registers.
       "pop rcx",
-      "pop rbx",
       "pop rbp",
+      "pop rbx",
       // Begin the unwinding.
       // todo: Say that this is to set the return address of `start_unwind` to the original resumption point of the coroutine.
       "push rcx",

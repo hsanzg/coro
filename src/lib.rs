@@ -359,8 +359,9 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
     unsafe { arch::resume_coro(ctrl) };
     drop(act_parent);
     // The coroutine's computation has transferred control back.
-    // todo: invert branches.
-    if !ctrl.ret_val.is_null() {
+    if ctrl.ret_val.is_null() {
+      CoroutineState::Yielded(())
+    } else {
       // The computation finished. Copy the return value to the current stack,
       // because the stack of the coroutine might be about to get dropped.
       // let ret_val_addr = NonNull::new(ctrl.ret_val).unwrap().cast();
@@ -371,8 +372,6 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
       //         after the coroutine terminates.
       let ret_val = unsafe { ctrl.ret_val.cast::<R>().read() };
       CoroutineState::Complete(ret_val)
-    } else {
-      CoroutineState::Yielded(())
     }
   }
 
@@ -457,27 +456,24 @@ where
 //  in memory unsafety caused by re-entering the active coroutine.
 #[inline(always)]
 pub fn suspend() {
-  match unsafe { ACTIVE.get().as_mut() } {
-    Some(control) => {
-      /*if control.poisoned {
-        cold_path();
-        suspend_during_unwind();
-      }*/
-      /*extern crate std;
-      std::println!(
-        "suspend: transferring control back, reading from {:?} (sp={:?}, ip={:?})",
-        ptr::from_mut(control),
-        control.stack_ptr,
-        control.inst_ptr
-      );*/
-      // Pop the current coroutine from the stack.
-      // ACTIVE.set(control.caller);
-      unsafe { arch::suspend_coro(control) };
-    }
-    None => {
+  if let Some(control) = unsafe { ACTIVE.get().as_mut() } {
+    /*if control.poisoned {
       cold_path();
-      suspend_from_outside();
-    }
+      suspend_during_unwind();
+    }*/
+    /*extern crate std;
+    std::println!(
+      "suspend: transferring control back, reading from {:?} (sp={:?}, ip={:?})",
+      ptr::from_mut(control),
+      control.stack_ptr,
+      control.inst_ptr
+    );*/
+    // Pop the current coroutine from the stack.
+    // ACTIVE.set(control.caller);
+    unsafe { arch::suspend_coro(control) };
+  } else {
+    cold_path();
+    suspend_from_outside();
   };
 }
 
@@ -486,7 +482,7 @@ fn suspend_during_unwind() -> ! {
   panic!("cannot suspend unwinding coroutine");
 }*/
 
-#[inline(never)]
+#[cold]
 fn suspend_from_outside() -> ! {
   panic!("cannot suspend from outside a coroutine")
 }

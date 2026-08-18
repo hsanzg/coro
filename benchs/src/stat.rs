@@ -33,5 +33,5 @@ fn call(c: &mut Criterion) {
   });
 }
 
-criterion_group!(benchs, switch /*call*/,);
+criterion_group!(benchs, switch, call);
 criterion_main!(benchs);

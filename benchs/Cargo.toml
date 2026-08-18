@@ -12,11 +12,14 @@ edition = "2024"
 coro = { path = ".." }
 corosensei = "0.3"
 criterion = "0.8"
-
-[profile.bench]
-debug = true
+gungraun = "0.19"
 
 [[bench]]
-name = "benchs"
-path = "src/main.rs"
+name = "stat"
+path = "src/stat.rs"
+harness = false
+
+[[bench]]
+name = "one_shot"
+path = "src/one_shot.rs"
 harness = false

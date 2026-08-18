@@ -18,5 +18,8 @@ common_pool = ["stack_alloc"]
 [dependencies]
 libc = "0.2"
 
+[profile.bench]
+debug = true
+
 [workspace]
 members = ["macros", "benchs"]

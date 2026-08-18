@@ -106,7 +106,7 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
       return _Unwind_Reason_Code::_URC_FATAL_PHASE2_ERROR;
     }
     let cur = unsafe { &mut *cur };
-    cur.poisoned = true;
+    // cur.poisoned = true;
     // std::println!("poisoned active {:?}", &raw const cur);
   }
   _Unwind_Reason_Code::_URC_CONTINUE_UNWIND

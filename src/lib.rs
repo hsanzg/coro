@@ -116,7 +116,7 @@ struct Control {
   /// representing the main program). Otherwise undefined.
   caller: *mut Control,
   ret_val: *const (),
-  poisoned: bool,
+  // poisoned: bool,
   _pin: PhantomPinned,
 }
 
@@ -242,7 +242,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
           // inst_ptr: trampoline::<R, F> as *const _,
           ret_val: ptr::null_mut(),
           caller: ptr::null_mut(),
-          poisoned: false,
+          // poisoned: false,
           _pin: PhantomPinned,
         },
         // ret_val: ptr::null_mut(),
@@ -291,7 +291,7 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   #[must_use]
   #[inline]
   pub fn has_started(&self) -> bool {
-    self.control().inst_ptr() != arch::first_inst_addr::<R, F>()
+    self.has_panicked() || self.control().inst_ptr() != arch::first_inst_addr::<R, F>()
   }
 
   // todo: find better name? `is_suspended`? not good enough, since
@@ -324,9 +324,9 @@ impl<R, F: FnOnce() -> R + Unpin> Coro<R, F> {
   }
 
   // todo: remove.
-  pub fn is_poisoned(&self) -> bool {
+  /*pub fn is_poisoned(&self) -> bool {
     self.control().poisoned
-  }
+  }*/
 
   /// Resumes execution of this coroutine's program where it last left off.
   ///
@@ -455,13 +455,14 @@ where
 //  cases of calling `suspend` from a `drop` method, or after stopping the
 //  unwinding process using `catch_unwind`. Failure to do so could result
 //  in memory unsafety caused by re-entering the active coroutine.
+#[inline(always)]
 pub fn suspend() {
   match unsafe { ACTIVE.get().as_mut() } {
     Some(control) => {
-      if control.poisoned {
+      /*if control.poisoned {
         cold_path();
         suspend_during_unwind();
-      }
+      }*/
       /*extern crate std;
       std::println!(
         "suspend: transferring control back, reading from {:?} (sp={:?}, ip={:?})",
@@ -475,15 +476,15 @@ pub fn suspend() {
     }
     None => {
       cold_path();
-      suspend_from_outside()
+      suspend_from_outside();
     }
-  }
+  };
 }
 
-#[inline(never)]
+/*#[inline(never)]
 fn suspend_during_unwind() -> ! {
   panic!("cannot suspend unwinding coroutine");
-}
+}*/
 
 #[inline(never)]
 fn suspend_from_outside() -> ! {

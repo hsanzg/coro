@@ -3,7 +3,6 @@ use crate::{Bottom, Control};
 use core::arch::{asm, global_asm, naked_asm};
 use core::mem::offset_of;
 use core::panic::AssertUnwindSafe;
-use core::ptr;
 use core::ptr::NonNull;
 
 // Invariant: return address always stored at `control.sp`.
@@ -243,7 +242,11 @@ pub unsafe fn force_unwind2(target: &mut Control) {
   // todo: it may be the case that the coroutine caught the unwind. Do not
   //  complain in that case, but check what happens if dropping coroutine
   //  suspends.
-  debug_assert!(res.is_err(), "coroutine did not unwind");
+  // todo: if the coroutine suspends when it is being dropped,
+  //       this code seems to get called. Replace `debug_assert`
+  //       by an assertion, and make panic message clearer with
+  //       something like "Did the coroutine suspend while being unwound?"
+  assert!(res.is_err(), "coroutine did not unwind");
 }
 
 /*pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {

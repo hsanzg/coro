@@ -370,7 +370,9 @@ impl Drop for SuspendOnDrop {
 }
 
 #[test]
-#[ignore = "aborts the test process; uncomment and test manually"]
+#[should_panic]
+// #[ignore = "aborts the test process; uncomment and test manually"]
+// todo: `_panics` instead of `_aborts`
 fn suspend_from_paused_coro_being_dropped_aborts() {
   new_coro(|| {
     let _drop = SuspendOnDrop;

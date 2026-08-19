@@ -56,6 +56,8 @@ unsafe extern "C-unwind" {
 }
 
 pub extern "C-unwind" fn start_unwind() -> ! {
+  /*extern crate std;
+  std::panic::resume_unwind(std::boxed::Box::new(()));*/
   extern "C" fn cleanup(_code: _Unwind_Reason_Code, _ex: *mut _Unwind_Exception) {}
 
   #[thread_local]
@@ -71,10 +73,11 @@ pub extern "C-unwind" fn start_unwind() -> ! {
   };
 
   let ex_ptr = EXCEPTION.get().cast();
-  // panic!("manual unwind");
   let res = unsafe { _Unwind_RaiseException(ex_ptr) };
-  // todo: abort better than panic.
-  panic!("_Unwind_RaiseException failed: {res:?}");
+  extern "C" fn handle_failure(code: _Unwind_Reason_Code) -> ! {
+    panic!("_Unwind_RaiseException failed: {code:?}"); // aborts due to `extern "C"`.
+  }
+  handle_failure(res);
 }
 
 // See Section 1.6.2.

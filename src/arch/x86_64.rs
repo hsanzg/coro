@@ -99,7 +99,7 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
   naked_asm!(
     ".cfi_startproc simple",
     ".cfi_personality 0x1b, {personality_fn}", // 0x1b = DW_EH_PE_pcrel | DW_EH_PE_sdata4
-    ".cfi_lsda 0x10, __coro_tramp_lsda",
+    ".cfi_lsda 0x1b, __coro_tramp_lsda",
     // todo: This seems to cause the unwinder to use the unwind info
     //  corresponding the instruction _following_ the return address;
     //  check that all relevant `asm!` blocks do not end with a `ret`
@@ -107,17 +107,17 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
     // ".cfi_signal_frame", // hack to allow backtrace generation with gdb.
 
     // Place this frame on the parent stack.
-    // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=5, DW_OP_breg7/rsp 0 DW_OP_deref DW_OP_plus_uconst 16)
-    // In theory we could use `DW_OP_reg7` instead of `DW_OP_breg7 +0`.
+    // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=5, DW_OP_breg6/rbp 0 DW_OP_deref DW_OP_plus_uconst 24)
+    // In theory we could use `DW_OP_reg6` instead of `DW_OP_breg6 +0`.
     // Alas, gdb doesn't accept the former operation when it appears
     // within `DW_CFA_def_cfa_expression`.
-    ".cfi_escape 0x0f, 5, 0x77, 0, 0x06, 0x23, 16",
-    // LLVM doesn't support `DW_CFA_val_offset`. // todo: is this still up to date? Record LLVM version.
+    ".cfi_escape 0x0f, 5, 0x76, 0, 0x06, 0x23, 24",
+    /*// LLVM doesn't support `DW_CFA_val_offset`. // todo: is this still up to date? Record LLVM version.
     // DW_CFA_val_expression rsp, DW_FORM_block(len=2, DW_OP_plus_uconst 8)
-    ".cfi_escape 0x16, 0x07, 2, 0x23, 8", // on entry to the `asm!` block of `resume_coro`.
-    ".cfi_offset rbx, 0",
-    ".cfi_offset rip, -8",
-    ".cfi_offset rbp, -16",
+    // ".cfi_escape 0x16, 0x06, 2, 0x23, 8", // on entry to the `asm!` block of `resume_coro`.*/
+    ".cfi_offset rbx, -8",
+    ".cfi_offset rip, -16",
+    ".cfi_offset rbp, -24",
 
     // LLDB subtracts 1 from the return address of a frame before
     // resolving the function symbol that it points to. The return
@@ -135,6 +135,7 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
     // Record the parent stack pointer value.
     "mov [rdi + {sp_off}], rsp",
     // Switch to the new stack.
+    "lea rbp, [rdi + {sp_off}]",
     "mov rsp, rsi",
     // Bounce into the architecture-independent trampoline.
     ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0

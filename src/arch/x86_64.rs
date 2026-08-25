@@ -3,6 +3,7 @@ use crate::{Bottom, Control};
 use core::arch::{asm, global_asm, naked_asm};
 use core::mem::offset_of;
 use core::panic::AssertUnwindSafe;
+use core::ptr;
 use core::ptr::NonNull;
 
 // Invariant: return address always stored at `control.sp`.
@@ -58,8 +59,10 @@ pub fn prepare_stack<R, F>(bottom: NonNull<Bottom<R, F>>)
 where
   F: FnOnce() -> R + Unpin,
 {
-  let ret_addr = unsafe { bottom.byte_add(8).cast() };
-  unsafe { ret_addr.write(resume_coro as *const ()) };
+  let pad = unsafe { bottom.byte_add(8).cast() };
+  unsafe { pad.write(ptr::null::<()>()) };
+  // let ret_addr = unsafe { bottom.byte_add(8).cast() };
+  // unsafe { ret_addr.write(resume_coro as *const ()) };
   let tramp_ret_addr = unsafe { bottom.byte_sub(8).cast() };
   unsafe { tramp_ret_addr.write(first_inst_addr::<R, F>()) };
 }
@@ -67,7 +70,7 @@ where
 // Define an LSDA for the personality function of the trampoline function.
 // See https://www.airs.com/blog/archives/464 for an explanation of the format.
 // Also see https://maskray.me/blog/2020-12-12-c++-exception-handling-abi.
-global_asm!(
+/*global_asm!(
   r#".section .gcc_except_table, "a", @progbits"#,
   ".p2align 2, 0x0", // todo: why?
   ".globl __coro_tramp_lsda",
@@ -89,17 +92,17 @@ global_asm!(
   // The action to take is to clean up and continue unwinding.
   ".byte 0", // 1 + action table index. // todo: zero is a special case meaning "cleanup".
   ".Lcs_table_end:",
-);
+);*/
 
 #[unsafe(naked)]
 pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
   _active: &mut Control,
-  _parent_sp: StackPtr,
+  _coro_sp: StackPtr,
 ) -> ! {
   naked_asm!(
-    ".cfi_startproc simple",
-    ".cfi_personality 0x1b, {personality_fn}", // 0x1b = DW_EH_PE_pcrel | DW_EH_PE_sdata4
-    ".cfi_lsda 0x1b, __coro_tramp_lsda",
+    ".cfi_startproc", // simple
+    // ".cfi_personality 0x1b, {personality_fn}", // 0x1b = DW_EH_PE_pcrel | DW_EH_PE_sdata4
+    // ".cfi_lsda 0x1b, __coro_tramp_lsda",
     // todo: This seems to cause the unwinder to use the unwind info
     //  corresponding the instruction _following_ the return address;
     //  check that all relevant `asm!` blocks do not end with a `ret`
@@ -143,12 +146,12 @@ pub unsafe extern "sysv64-unwind" fn first_tramp<R, F: FnOnce() -> R + Unpin>(
     "ud2",
     ".cfi_endproc",
     sp_off = const offset_of!(Control, stack_ptr),
-    personality_fn = sym crate::unwind::__coro_trampoline_personality,
+    // personality_fn = sym crate::unwind::__coro_trampoline_personality,
     second_tramp = sym crate::trampoline::<R, F>,
   )
 }
 
-#[inline(always)]
+#[inline(never)]
 pub unsafe fn suspend_coro(active: &mut Control) {
   unsafe {
     asm!(
@@ -203,10 +206,11 @@ pub unsafe fn return_control(active: &mut Control) -> ! {
       "pop rbp",
       // Return control to `resume_coro`.
       "ret",
+      /*"ud2",*/
       in("rdi") active,
       in("rsi") active.stack_ptr.as_ptr(),
       sp_off = const offset_of!(Control, stack_ptr),
-      options(noreturn)
+      options(/*may_unwind,*/ noreturn)
     )
   }
 }

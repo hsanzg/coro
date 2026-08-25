@@ -43,6 +43,9 @@ const UNWINDER_PRIVATE_DATA_SIZE: usize = 2; // minimum across all supported tar
 const CORO_UNWIND: _Unwind_Exception_Class = u64::from_ne_bytes(*b"CORORUST");
 
 #[repr(C)]
+#[cfg_attr(target_pointer_width = "16", repr(align(4)))]
+#[cfg_attr(target_pointer_width = "32", repr(align(8)))]
+#[cfg_attr(target_pointer_width = "64", repr(align(16)))]
 pub struct _Unwind_Exception {
   exception_class: _Unwind_Exception_Class,
   exception_cleanup: _Unwind_Exception_Cleanup_Fn,
@@ -58,6 +61,7 @@ unsafe extern "C-unwind" {
 pub extern "C-unwind" fn start_unwind() -> ! {
   /*extern crate std;
   std::panic::resume_unwind(std::boxed::Box::new(()));*/
+  // todo: add `#[rustc_nounwind]`.
   extern "C" fn cleanup(_code: _Unwind_Reason_Code, _ex: *mut _Unwind_Exception) {}
 
   #[thread_local]
@@ -68,7 +72,7 @@ pub extern "C-unwind" fn start_unwind() -> ! {
     EXCEPTION.get().write(MaybeUninit::new(_Unwind_Exception {
       exception_class: CORO_UNWIND,
       exception_cleanup: Some(cleanup),
-      private: [ptr::null(); UNWINDER_PRIVATE_DATA_SIZE],
+      private: [ptr::null(); _],
     }))
   };
 

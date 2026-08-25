@@ -1,5 +1,5 @@
 use proc_macro::TokenStream;
-use syn::__private::ToTokens;
+use quote::ToTokens;
 use syn::{Abi, ItemFn, LitStr, parse_macro_input};
 
 /// Attribute macro applied to a function in order to specify its calling

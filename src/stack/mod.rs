@@ -54,6 +54,8 @@ pub type StackPtr = NonNull<u8>;
 pub struct Stack {
   base: NonNull<u8>,
   size: NonZeroUsize, // bytes.
+  #[cfg(feature = "valgrind")]
+  valgrind_id: ValgrindStackId,
 }
 
 impl Stack {
@@ -132,12 +134,15 @@ impl Stack {
     // SAFETY: We have `size >= 2 * page_size > 0`.
     let size = unsafe { NonZeroUsize::new_unchecked(size) };
     let base = os::alloc_stack(size);
-    // todo: handle deregistration.
-    crate::arch::valgrind_stack_register(
-      base.as_ptr(),
-      unsafe { base.byte_add(size.get()) }.as_ptr(),
-    );
-    Self { base, size }
+    Self {
+      base,
+      size,
+      #[cfg(feature = "valgrind")]
+      valgrind_id: crate::arch::valgrind_register_stack(
+        base.as_ptr(),
+        unsafe { base.byte_add(size.get()) }.as_ptr(),
+      ),
+    }
   }
 
   /// Returns the smallest memory location within the stack area,
@@ -230,6 +235,8 @@ pub(crate) fn next_slot<T>(sp: StackPtr) -> NonNull<T> {
 #[cfg(feature = "stack_alloc")]
 impl Drop for Stack {
   fn drop(&mut self) {
+    #[cfg(feature = "valgrind")]
+    crate::arch::valgrind_deregister_stack(self.valgrind_id);
     // SAFETY: This stack was allocated by `os::alloc_stack`.
     unsafe { os::free_stack(self.base, self.size) };
   }
@@ -296,6 +303,15 @@ where
   // SAFETY: The caller upholds the aliasing rules.
   f(unsafe { &mut *POOL.get() })
 }
+
+/// A stack identifier to be referenced in Valgrind client requests.
+#[cfg(feature = "valgrind")]
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub(crate) struct ValgrindStackId(pub libc::c_uint);
+
+// The implementation of `valgrind_stack_{,de}register` is
+// architecture-specific, hence it appears in `crate::arch`.
 
 #[cfg(test)]
 mod stack_tests {

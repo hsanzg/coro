@@ -485,7 +485,10 @@ pub unsafe fn force_unwind(control: &mut Control) {
   debug_assert!(res.is_err(), "coroutine did not unwind");
 }*/
 
-// https://sourceware.org/git/?p=valgrind.git;a=blob;f=include/valgrind.h.in;h=ed7d8c68e24b896e912fb19e17cc906730a82a4c;hb=refs/heads/master#l409
+// Rust translation of the client request macros in `valgrind.h`. See
+// https://sourceware.org/git/?p=valgrind.git;a=blob;f=include/valgrind.h.in;h=ed7d8c68e24b896e912fb19e17cc906730a82a4c;hb=refs/heads/master#l409.
+
+#[cfg(feature = "valgrind")]
 fn valgrind_do_client_request(default: usize, args: &[usize; 6]) -> usize {
   let result: usize;
   unsafe {
@@ -502,10 +505,16 @@ fn valgrind_do_client_request(default: usize, args: &[usize; 6]) -> usize {
   result
 }
 
-pub fn valgrind_stack_register(start: *mut u8, end: *mut u8) -> usize {
-  valgrind_do_client_request(0, &[0x1501, start as _, end as _, 0, 0, 0])
+#[cfg(feature = "valgrind")]
+use crate::stack::ValgrindStackId;
+
+#[cfg(feature = "valgrind")]
+pub fn valgrind_register_stack(start: *mut u8, end: *mut u8) -> ValgrindStackId {
+  let res = valgrind_do_client_request(0, &[0x1501, start as _, end as _, 0, 0, 0]);
+  ValgrindStackId(res as _)
 }
 
-pub fn valgrind_stack_deregister(id: usize) {
-  valgrind_do_client_request(0, &[0x1502, id, 0, 0, 0, 0]);
+#[cfg(feature = "valgrind")]
+pub fn valgrind_deregister_stack(id: ValgrindStackId) {
+  valgrind_do_client_request(0, &[0x1502, id.0 as _, 0, 0, 0, 0]);
 }

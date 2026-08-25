@@ -151,7 +151,8 @@ dependencies = [
 name = "coro_macros"
 version = "1.0.0"
 dependencies = [
- "syn 2.0.117",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -688,6 +689,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
 dependencies = [
  "proc-macro2",
+ "quote",
  "unicode-ident",
 ]
 

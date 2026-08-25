@@ -489,7 +489,7 @@ pub unsafe fn force_unwind(control: &mut Control) {
 // https://sourceware.org/git/?p=valgrind.git;a=blob;f=include/valgrind.h.in;h=ed7d8c68e24b896e912fb19e17cc906730a82a4c;hb=refs/heads/master#l409.
 
 #[cfg(feature = "valgrind")]
-fn valgrind_do_client_request(default: usize, args: &[usize; 6]) -> usize {
+fn valgrind_client_req(default: usize, args: &[usize; 6]) -> usize {
   let result: usize;
   unsafe {
     asm!(
@@ -510,11 +510,11 @@ use crate::stack::ValgrindStackId;
 
 #[cfg(feature = "valgrind")]
 pub fn valgrind_register_stack(start: *mut u8, end: *mut u8) -> ValgrindStackId {
-  let res = valgrind_do_client_request(0, &[0x1501, start as _, end as _, 0, 0, 0]);
+  let res = valgrind_client_req(0, &[0x1501, start as _, end as _, 0, 0, 0]);
   ValgrindStackId(res as _)
 }
 
 #[cfg(feature = "valgrind")]
 pub fn valgrind_deregister_stack(id: ValgrindStackId) {
-  valgrind_do_client_request(0, &[0x1502, id.0 as _, 0, 0, 0, 0]);
+  valgrind_client_req(0, &[0x1502, id.0 as _, 0, 0, 0, 0]);
 }

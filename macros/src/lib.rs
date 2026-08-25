@@ -3,8 +3,8 @@ use quote::ToTokens;
 use syn::{Abi, ItemFn, LitStr, parse_macro_input};
 
 /// Attribute macro applied to a function in order to specify its calling
-/// convention. The macro argument is a [ABI] string literal, and it takes
-/// priority over the [`extern`] qualifier (if any).
+/// convention. The macro argument is an [ABI] string literal, and it takes
+/// precedence over the [`extern`] qualifier (if any).
 ///
 /// # Example
 ///

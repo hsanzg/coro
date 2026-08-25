@@ -490,7 +490,7 @@ fn suspend_from_outside() -> ! {
 type DropReturn = cfg_select! {
   feature = "common_pool" => (),
   feature = "stack_alloc" => Stack,
-  _ => ()
+  _ => (),
 };
 
 ///
@@ -527,7 +527,7 @@ unsafe fn drop_<R, F: FnOnce() -> R + Unpin>(coro: &mut Coro<R, F>) -> DropRetur
     feature = "common_pool" => {
       // SAFETY: We have exclusive access to the thread-local pool.
       unsafe { stack::borrow_common_pool(|pool| pool.give(stack)) };
-    },
+    }
     feature = "stack_alloc" => stack,
     _ => {}
   }

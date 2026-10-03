@@ -3,6 +3,7 @@
 #[cfg_attr(unix, path = "unix.rs")]
 mod os;
 
+use core::alloc::Layout;
 use core::num::NonZero;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
@@ -199,6 +200,7 @@ impl Stack {
     offset < self.size.get()
   }
 
+  // todo: clean up and document.
   // the reason for taking a closure is to allow for objects to depend
   // on their own address; note that for address sensitivity to be safe,
   // care must be taken.
@@ -218,6 +220,26 @@ impl Stack {
   }
 }
 
+pub(crate) unsafe fn push(sp: &mut StackPtr, layout: Layout) -> NonNull<()> {
+  let align_mask = layout.alignment().mask();
+  let loc = sp.map_addr(|a| {
+    let addr = match GROWTH_DIR {
+      GrowthDir::Upwards => (a.get() + !align_mask) & align_mask,
+      GrowthDir::Downwards => (a.get() & align_mask) - layout.size(),
+    };
+    // SAFETY:
+    // todo: add proof of correctness.
+    unsafe { NonZero::new_unchecked(addr) }
+  });
+  // Advance the stack pointer.
+  *sp = match GROWTH_DIR {
+    GrowthDir::Upwards => unsafe { loc.byte_add(layout.size()) },
+    GrowthDir::Downwards => loc,
+  };
+  loc.cast()
+}
+
+// todo: clean up and document.
 pub(crate) fn next_slot<T>(sp: StackPtr) -> NonNull<T> {
   let align_mask = align_of::<T>() - 1;
   sp.map_addr(|a| {

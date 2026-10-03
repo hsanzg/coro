@@ -114,7 +114,7 @@ fn resume_after_move() {
   coro.resume();
 
   #[inline(never)]
-  fn resume<F: FnOnce() -> i32 + Unpin>(mut coro: Coro<i32, F>) {
+  fn resume(mut coro: Coro<i32>) {
     assert_eq!(coro.resume(), CoroutineState::Complete(0xcafe));
     assert_complete(&coro, false);
   }

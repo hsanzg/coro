@@ -17,6 +17,7 @@ common_pool = ["stack_alloc"]
 valgrind = []
 
 [dependencies]
+coro_macros = { version = "1", path = "macros" }
 libc = "0.2"
 
 [profile.bench]

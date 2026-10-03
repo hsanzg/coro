@@ -24,9 +24,9 @@ use syn::{Abi, ItemFn, LitStr, parse_macro_input};
 /// [ABI]: https://doc.rust-lang.org/reference/glossary.html#r-glossary.abi
 /// [`extern`]: https://doc.rust-lang.org/reference/items/functions.html#extern-function-qualifier
 #[proc_macro_attribute]
-pub fn abi(args: TokenStream, item: TokenStream) -> TokenStream {
-  let abi_lit = parse_macro_input!(item as LitStr);
-  let mut fun = parse_macro_input!(args as ItemFn);
+pub fn abi(args: TokenStream, input: TokenStream) -> TokenStream {
+  let mut fun = parse_macro_input!(input as ItemFn);
+  let abi_lit = parse_macro_input!(args as LitStr);
   fun.sig.abi = Some(Abi {
     extern_token: Default::default(),
     name: Some(abi_lit),

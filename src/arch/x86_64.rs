@@ -9,11 +9,13 @@ const CALLER_REF_OFF: isize = -16; // caller chain pointer.
 const TRAMP_PTR_OFF: isize = -24; // trampoline jump address.
 
 pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) {
+  let ip = unsafe { bot.byte_offset(INIT_SP_OFF).cast() };
+  unsafe { ip.write(init_coro as *const ()) };
   // Write the address of the trampoline function immediately
   // above the bottommost frame of the coroutine. The address
   // will be read and jumped to by `init_coro`.
-  let ptr = unsafe { bot.byte_offset(TRAMP_PTR_OFF) }.cast();
-  unsafe { ptr.write(tramp_fn) };
+  let tp = unsafe { bot.byte_offset(TRAMP_PTR_OFF) }.cast();
+  unsafe { tp.write(tramp_fn) };
 }
 
 #[inline(always)]
@@ -46,7 +48,7 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
       // and `init_coro` read `rsi` in order to update the "caller
       // reference" at the bottom of the coroutine's stack.
       "call [rdi]",
-      // The coroutine has returned control to us. At this point `rdx`
+      // The coroutine has returned control to us. At this point `rsi`
       // contains the new stack pointer of the coroutine; and if it
       // finished via `return_control`, `rax` contains the address of
       // its return value (otherwise `rax` is null). All that remains
@@ -55,8 +57,8 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
       "pop rbx", // todo: is this more efficient than `add rsp, 8`?
       "pop rbx",
       in("rdi") (*sp).as_ptr(),
-      in("rsi") caller_ref.as_ptr(),
-      inlateout("rdx") CALLER.get() => sus_sp,
+      inlateout("rsi") caller_ref.as_ptr() => sus_sp,
+      in("rdx") CALLER.get(),
       lateout("rax") ret_addr,
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
@@ -109,7 +111,7 @@ pub unsafe fn suspend_coro(caller: StackPtr) {
       "push rax",
       "xor rax, rax", // the coroutine is not done yet.
       // Switch to the caller stack.
-      "mov rdx, rsp",
+      "mov rsi, rsp", // needed by `resume_coro`.
       "mov rsp, rdi",
       // Restore the previous value of `rbp`.
       "pop rbp",
@@ -142,6 +144,7 @@ pub unsafe fn return_control(caller: StackPtr, ret_val: NonNull<()>) -> ! {
   unsafe {
     asm!(
       // Switch to the caller stack.
+      "mov rsi, rsp", // needed by `resume_coro`.
       "mov rsp, rdi",
       // Restore the previous contents of `rbp`.
       "pop rbp",
@@ -215,8 +218,8 @@ unsafe extern "sysv64-unwind" fn poison_trampoline(_sp: StackPtr, _caller_ref: S
 
 pub unsafe fn poison(sp: StackPtr, target_fn: extern "sysv64-unwind" fn() -> !) {
   // Overwrite the instruction pointer of the coroutine.
-  unsafe { sp.cast().write(poison_trampoline) };
-  unsafe { sp.byte_sub(8).cast().write(target_fn) };
+  unsafe { sp.cast().write(poison_trampoline as *const ()) };
+  unsafe { sp.byte_sub(8).cast().write(target_fn as *const ()) };
 }
 
 pub unsafe fn poison_target(cont_sp: StackPtr) -> Option<NonNull<()>> {
@@ -694,7 +697,7 @@ pub unsafe extern "sysv64-unwind" fn transfer_control2(_target: &mut Control) {
 /// Returns the value that the stack pointer should have after
 /// [transferring control] to the coroutine associated with the
 /// metadata object pointed to by `bottom` (which need not be
-/// deferrenceable).
+/// dereferenceable).
 ///
 /// [transferring control]: transfer_control
 pub fn initial_sp2<R, F>(bottom: NonNull<Bottom<R, F>>) -> StackPtr

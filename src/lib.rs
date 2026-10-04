@@ -404,6 +404,12 @@ extern "C-unwind" fn trampoline<R, F>(caller: *const (), fn_ptr: NonNull<()>) ->
 where
   F: FnOnce() -> R + Unpin,
 {
+  extern crate std;
+  std::println!(
+    "[tramp] overwriting caller {:?} by {caller:?}",
+    CALLER.get()
+  );
+  std::println!("[tramp] reading fn from {fn_ptr:?}");
   CALLER.set(caller);
 
   let f = unsafe { fn_ptr.cast().as_mut() };
@@ -412,6 +418,7 @@ where
   let ret_val = ManuallyDrop::new(f());
   let ret_val = NonNull::from_ref(&ret_val).cast();
   let caller = unsafe { NonNull::new_unchecked(CALLER.get().cast_mut()) };
+  std::println!("[tramp] returning control to caller {caller:?} with ra={ret_val:?}");
   unsafe { arch::return_control(caller, ret_val) }
 
   /*debug_assert_eq!(ACTIVE.get(), ptr::from_mut(ctrl));

@@ -1,15 +1,232 @@
-use crate::stack::{Stack, StackPtr, push};
-use crate::{Control, Coro, fn_ptr};
-use core::alloc::Layout;
-use core::arch::{asm, global_asm, naked_asm};
-use core::mem::offset_of;
-use core::ops::Code;
-use core::ops::FnPtr;
-use core::panic::AssertUnwindSafe;
-use core::ptr;
+use crate::CALLER;
+use crate::stack::StackPtr;
+use core::arch::{asm, naked_asm};
 use core::ptr::NonNull;
 
-// Invariant: return address always stored at `control.sp`.
+// Byte offsets of various fields from the bottom of a coroutine stack.
+const INIT_SP_OFF: isize = -8; // initial stack pointer.
+const CALLER_REF_OFF: isize = -16; // caller chain pointer.
+const TRAMP_PTR_OFF: isize = -24; // trampoline jump address.
+
+pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) {
+  // Write the address of the trampoline function immediately
+  // above the bottommost frame of the coroutine. The address
+  // will be read and jumped to by `init_coro`.
+  let ptr = unsafe { bot.byte_offset(TRAMP_PTR_OFF) }.cast();
+  unsafe { ptr.write(tramp_fn) };
+}
+
+#[inline(always)]
+pub unsafe fn initial_sp(bot: StackPtr) -> StackPtr {
+  // The `init_coro` subroutine obeys a custom calling convention
+  // where its *own* address appears at `rsp` immediately after the
+  // call.
+  // todo: improve wording.
+  unsafe { bot.byte_offset(INIT_SP_OFF) }
+}
+
+#[inline(always)]
+unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
+  unsafe { bot.byte_offset(CALLER_REF_OFF) }
+}
+
+pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
+  let sus_sp;
+  let ret_addr;
+  let caller_ref = unsafe { caller_ref_loc(bot) };
+  unsafe {
+    asm!(
+      // Preserve the contents of the reserved register `rbx`;
+      // `init_coro` and `suspend_coro` take care of the rest.
+      "push rbx",
+      // Link the caller to its own caller.
+      "push rdx",
+      // Read the resumption program address from the top of the
+      // coroutine stack, and jump to it. Note that `suspend_coro`
+      // and `init_coro` read `rsi` in order to update the "caller
+      // reference" at the bottom of the coroutine's stack.
+      "call [rdi]",
+      // The coroutine has returned control to us. At this point `rdx`
+      // contains the new stack pointer of the coroutine; and if it
+      // finished via `return_control`, `rax` contains the address of
+      // its return value (otherwise `rax` is null). All that remains
+      // is to restore the contents of `rbx`, since `rbp` was already
+      // restored by `suspend_coro` or `return_control`.
+      "pop rbx", // todo: is this more efficient than `add rsp, 8`?
+      "pop rbx",
+      in("rdi") (*sp).as_ptr(),
+      in("rsi") caller_ref.as_ptr(),
+      inlateout("rdx") CALLER.get() => sus_sp,
+      lateout("rax") ret_addr,
+      clobber_abi("sysv64"),
+      lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
+      options(may_unwind),
+    )
+  };
+  *sp = unsafe { NonNull::new_unchecked(sus_sp) };
+  ret_addr
+}
+
+#[unsafe(naked)]
+pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: StackPtr) -> ! {
+  // Invariant: `_init_sp - INIT_SP_OFF == _caller_ref - CALLER_REF_OFF`.
+  naked_asm!(
+    ".cfi_startproc simple",
+    // todo: add CFI information.
+    // Preserve the contents of `rbp`. After this step, the top of
+    // the caller stack has a valid frame to which we will soon link.
+    "push rbp",
+    // Record the stack pointer of the caller program at the bottom
+    // of the coroutine stack.
+    "mov [rsi], rsp",
+    // Prepare the first argument for the trampoline.
+    "mov rdi, rsp",
+    // Switch to the coroutine stack.
+    "mov rsp, rsi", // skip caller reference/frame pointer.
+    "mov rbp, rsp",
+    // Prepare the second argument for the trampoline.
+    "add rsi, {fn_off}",
+    // Bounce into the architecture-independent trampoline.
+    "jmp [rsp + {tramp_off}]",
+    "ud2",
+    ".cfi_endproc",
+    // These two offsets are relative to `caller_ref`.
+    fn_off = const -CALLER_REF_OFF,
+    tramp_off = const TRAMP_PTR_OFF - CALLER_REF_OFF,
+  )
+}
+
+pub unsafe fn suspend_coro(caller: StackPtr) {
+  let caller_ref: *const StackPtr;
+  unsafe {
+    asm!(
+      // Preserve the contents of the reserved registers on the
+      // coroutine stack.
+      "push rbx",
+      "push rbp",
+      // Record the resumption program address.
+      "lea rax, [rip + 2f]",
+      "push rax",
+      "xor rax, rax", // the coroutine is not done yet.
+      // Switch to the caller stack.
+      "mov rdx, rsp",
+      "mov rsp, rdi",
+      // Restore the previous value of `rbp`.
+      "pop rbp",
+      // Return control to `resume_coro`, which takes care of
+      // restoring the remaining registers.
+      "ret",
+      // The coroutine has been resumed.
+      "2:",
+      // Preserve the caller's `rbp` value.
+      "push rbp",
+      // Record the stack pointer of the caller program.
+      "mov [rsi], rsp",
+      // Switch to the coroutine stack.
+      "lea rsp, [rdx + 8]", // skip resumption program address.
+      // Restore the contents of the reserved registers.
+      "pop rbp",
+      "pop rbx",
+      in("rdi") caller.as_ptr(),
+      lateout("rsi") caller_ref,
+      clobber_abi("sysv64"),
+      lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
+      options(may_unwind),
+    )
+  };
+  let new_caller = unsafe { caller_ref.read() };
+  CALLER.set(new_caller.as_ptr());
+}
+
+pub unsafe fn return_control(caller: StackPtr, ret_val: NonNull<()>) -> ! {
+  unsafe {
+    asm!(
+      // Switch to the caller stack.
+      "mov rsp, rdi",
+      // Restore the previous contents of `rbp`.
+      "pop rbp",
+      // Return control to `resume_coro`.
+      "ret",
+      in("rdi") caller.as_ptr(),
+      in("rax") ret_val.as_ptr(),
+      options(noreturn)
+    )
+  }
+}
+
+pub unsafe fn force_unwind(sp: StackPtr, bot: StackPtr) {
+  let res = crate::unwind::catch_unwind(move || {
+    let caller_ref = unsafe { caller_ref_loc(bot) };
+    unsafe {
+      asm!(
+        // Emulate the "resumption" part of `resume_coro`.
+        "push rbx",
+        "push rdx",
+        "lea rax, [rip + 2f]",
+        "push rax",
+        // And the "resumption" part of `suspend_coro`.
+        "push rbp",
+        "mov [rsi], rsp",
+        // Switch to the coroutine stack.
+        "mov rsp, rdi",
+        "pop rax", // the previous return address.
+        "pop rbp",
+        "pop rbx",
+        // Begin the unwinding.
+        "push rax", // preserve the return address.
+        "jmp {start_unwind}",
+        // If the coroutine program catches the exception itself,
+        // `suspend_coro` will return control to the following
+        // section of code. Emulate the "suspension" part of
+        // `resume_coro`, i.e. those instructions after `call`.
+        "2:",
+        "pop rbx", // todo: is this more efficient than `add rsp, 8`?
+        "pop rbx",
+        in("rdi") sp.as_ptr(),
+        in("rsi") caller_ref.as_ptr(),
+        clobber_abi("sysv64"),
+        lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
+        options(may_unwind),
+        start_unwind = sym crate::unwind::start_unwind,
+      )
+    };
+  });
+  assert!(res.is_err(), "coroutine did not unwind");
+}
+
+#[unsafe(naked)]
+unsafe extern "sysv64-unwind" fn poison_trampoline(_sp: StackPtr, _caller_ref: StackPtr) {
+  naked_asm!(
+    // Emulate the "resumption" part of `suspend_coro`.
+    ".cfi_startproc simple",
+    "push rbp",
+    "mov [rsi], rsp",
+    // Switch to the coroutine stack.
+    "lea rsp, [rdi + 8]", // skip resumption address.
+    // Restore the contents of the reserved registers.
+    "pop rbp",
+    "pop rbx",
+    // Jump to the target function, instead of returning normally.
+    // todo: see how to handle `CALLER.set()`.
+    "jmp [rdi - 8]",
+    ".cfi_endproc",
+  )
+}
+
+pub unsafe fn poison(sp: StackPtr, target_fn: extern "sysv64-unwind" fn() -> !) {
+  // Overwrite the instruction pointer of the coroutine.
+  unsafe { sp.cast().write(poison_trampoline) };
+  unsafe { sp.byte_sub(8).cast().write(target_fn) };
+}
+
+pub unsafe fn poison_target(cont_sp: StackPtr) -> Option<NonNull<()>> {
+  let ip: *const () = unsafe { cont_sp.cast().read() };
+  (ip == poison_trampoline as *const _).then(|| unsafe { cont_sp.byte_sub(8).cast().read() })
+}
+
+// Old implementation:
+
+/*// Invariant: return address always stored at `control.sp`.
 
 #[inline(always)]
 pub unsafe fn resume_coro(target: &mut Control) {
@@ -355,10 +572,10 @@ pub unsafe fn poison(ctrl: &mut Control, dst: extern "C-unwind" fn() -> !) {
     on_poison_resume as *const ()
   );
 
-  let dst_ptr = unsafe { ctrl.stack_ptr.cast().sub(1) };
+  let dst_ptr = unsafe { ctrl.stack_ptr.cast().byte_sub(1) };
   unsafe { dst_ptr.write(fn_ptr!(dst)) };
   // unsafe { ctrl.stack_ptr.cast().write(fn_ptr!(on_resume)) };
-  // let dst_ptr = unsafe { ctrl.stack_ptr.cast().sub(1) };
+  // let dst_ptr = unsafe { ctrl.stack_ptr.cast().byte_sub(1) };
   // unsafe { dst_ptr.write(dst) };
 }
 
@@ -374,11 +591,11 @@ pub fn poison_dst(ctrl: &Control) -> Option<NonNull<Code>> {
     unsafe { fn_ptr!(on_poison_resume) }.as_ptr(),
   )
   .then(|| {
-    let dest_addr = unsafe { ctrl.stack_ptr.cast().sub(1) };
+    let dest_addr = unsafe { ctrl.stack_ptr.cast().byte_sub(1) };
     std::println!("  yes! dest address is {:?}", unsafe { dest_addr.read() });
     unsafe { dest_addr.read() }
   })
-}
+}*/
 
 /*pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
   unsafe {
@@ -624,7 +841,7 @@ fn valgrind_client_req(default: usize, args: &[usize; 6]) -> usize {
 use crate::stack::ValgrindStackId;
 
 #[cfg(feature = "valgrind")]
-pub fn valgrind_register_stack(start: *mut u8, end: *mut u8) -> ValgrindStackId {
+pub fn valgrind_register_stack(start: *mut (), end: *mut ()) -> ValgrindStackId {
   let res = valgrind_client_req(0, &[0x1501, start as _, end as _, 0, 0, 0]);
   ValgrindStackId(res as _)
 }

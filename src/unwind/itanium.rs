@@ -1,6 +1,6 @@
 #![allow(non_camel_case_types)]
 
-use crate::{ACTIVE, arch, finished};
+use crate::{CALLER, arch};
 use core::cell::UnsafeCell;
 use core::hint::cold_path;
 use core::mem::MaybeUninit;
@@ -156,19 +156,20 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
   }
   extern crate std;
   std::println!("tramp_personality: actions={actions:x}, ex_class={ex_class:x}");
-  std::println!("  active at this point is {:?}", ACTIVE.get());
+  std::println!("  caller at this point is {:?}", CALLER.get());
   // Poison the active coroutine as soon as possible, before the second phase starts.
   if actions & _UA_SEARCH_PHASE != 0 && ex_class != CORO_UNWIND {
     // todo: poison the active coroutine.
     // todo: Move to some `cleanup_on_panic` global function in `lib.rs`.
-    let cur = ACTIVE.get();
-    if cur.is_null() {
+    let caller = CALLER.get();
+    if caller.is_null() {
       cold_path();
       return _Unwind_Reason_Code::_URC_FATAL_PHASE2_ERROR;
     }
+    todo!()
 
     // todo: experimental; untested.
-    let cur = unsafe { &mut *cur };
+    /*let cur = unsafe { &mut *caller };
     unsafe { arch::poison(cur, crate::panicked) };
 
     // cur.poisoned = true;
@@ -176,7 +177,7 @@ pub unsafe extern "C" fn __coro_trampoline_personality(
       "poisoned active {:?} (={:?}?)",
       ACTIVE.get(),
       ptr::from_mut(cur)
-    );
+    );*/
   }
   _Unwind_Reason_Code::_URC_CONTINUE_UNWIND
 }

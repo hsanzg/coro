@@ -28,7 +28,7 @@ pub fn page_size() -> NonZeroUsize {
   unsafe { NonZeroUsize::new_unchecked(val) }
 }
 
-pub fn alloc_stack(size: NonZeroUsize) -> NonNull<u8> {
+pub fn alloc_stack(size: NonZeroUsize) -> NonNull<()> {
   let page_size = page_size().get();
   assert!(
     size.get().is_multiple_of(page_size),
@@ -47,8 +47,10 @@ pub fn alloc_stack(size: NonZeroUsize) -> NonNull<u8> {
       libc::MAP_PRIVATE
         | libc::MAP_ANONYMOUS
         | cfg_select! {
-          any(target_os = "linux", target_os = "freebsd", target_os = "openbsd") => libc::MAP_STACK,
-          _ => 0
+          any(target_os = "linux", target_os = "freebsd", target_os = "openbsd") => {
+            libc::MAP_STACK
+          }
+          _ => 0,
         },
       -1,
       0,
@@ -90,7 +92,7 @@ pub fn alloc_stack(size: NonZeroUsize) -> NonNull<u8> {
 ///
 /// The pointer `base` must be the return value of a previous
 /// call to [`alloc_stack`] with argument `size`.
-pub unsafe fn free_stack(base: NonNull<u8>, size: NonZeroUsize) {
+pub unsafe fn free_stack(base: NonNull<()>, size: NonZeroUsize) {
   // Delete the mappings for the stack's address range.
   assert_eq!(
     unsafe { libc::munmap(base.cast().as_ptr(), size.get()) },

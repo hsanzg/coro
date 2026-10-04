@@ -7,7 +7,6 @@ use core::alloc::Layout;
 use core::num::NonZero;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use libc::getaddrinfo;
 
 /// Describes how the stack pointer changes after a `push` instruction.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -32,7 +31,7 @@ pub const GROWTH_DIR: GrowthDir = const { GrowthDir::Downwards };
 /// [program stacks]: Stack
 /// [towards zero]: GrowthDir::Downwards
 /// [upwards]: GrowthDir::Upwards
-pub type StackPtr = NonNull<u8>;
+pub type StackPtr = NonNull<()>;
 
 /// A set of contiguous memory pages where a [coroutine] is free to
 /// store any data.
@@ -54,20 +53,10 @@ pub type StackPtr = NonNull<u8>;
 /// [stack growth direction]: GROWTH_DIR
 /// [_guard page_]: https://devblogs.microsoft.com/oldnewthing/20220203-00/?p=106215
 pub struct Stack {
-  bot: NonNull<u8>,
+  base: NonNull<()>,
   size: NonZeroUsize, // bytes.
   #[cfg(feature = "valgrind")]
   valgrind_id: ValgrindStackId,
-}
-
-// SAFETY: `base` must point to a `size`-byte allocation.
-#[inline]
-unsafe fn bottom(base: NonNull<u8>, size: NonZeroUsize) -> NonNull<u8> {
-  match GROWTH_DIR {
-    GrowthDir::Upwards => base,
-    // SAFETY: The last byte of the stack is at address `base+size-1`.
-    GrowthDir::Downwards => unsafe { base.add(size.get()) },
-  }
 }
 
 impl Stack {
@@ -106,11 +95,8 @@ impl Stack {
   /// [`MaybeUninit`]: core::mem::MaybeUninit
   /// [`ptr::write`]: core::ptr::write
   #[cfg(not(feature = "stack_alloc"))]
-  pub unsafe fn from_raw(base: NonNull<u8>, size: NonZeroUsize) -> Self {
-    Self {
-      bot: unsafe { bottom(base, size) },
-      size,
-    }
+  pub unsafe fn from_raw(base: NonNull<()>, size: NonZeroUsize) -> Self {
+    Self { base, size }
   }
 
   /// Reserves space for a new program stack of size at least
@@ -150,14 +136,35 @@ impl Stack {
     let size = unsafe { NonZeroUsize::new_unchecked(size) };
     let base = os::alloc_stack(size);
     Self {
-      bot: unsafe { bottom(base, size) },
+      base,
       size,
       #[cfg(feature = "valgrind")]
       valgrind_id: crate::arch::valgrind_register_stack(
         base.as_ptr(),
-        unsafe { base.add(size.get()) }.as_ptr(),
+        unsafe { base.byte_add(size.get()) }.as_ptr(),
       ),
     }
+  }
+
+  /// Returns the smallest memory location within the stack area,
+  /// including its guard page. This address is aligned with the
+  /// beginning of a page.
+  ///
+  /// It is important to note that the returned pointer does not
+  /// necessarily point to the [bottom] of the stack; this occurs
+  /// only if program stacks grow [upwards] on the current platform.
+  ///
+  /// [bottom]: Self::bottom
+  /// [upwards]: GrowthDir::Upwards
+  pub fn base(&self) -> NonNull<()> {
+    self.base
+  }
+
+  /// Returns the number of bytes occupied by the stack, including
+  /// its guard page. This value is a multiple of the system's
+  /// page size.
+  pub fn size(&self) -> NonZeroUsize {
+    self.size
   }
 
   /// If the stack grows [towards zero], returns the location one
@@ -172,36 +179,15 @@ impl Stack {
   /// [upwards]: GrowthDir::Upwards
   /// [downwards]: GrowthDir::Downwards
   /// [base address]: Self::base
-  pub fn bottom(&self) -> NonNull<u8> {
-    self.bot
-  }
-
-  /// Returns the number of bytes occupied by the stack, including
-  /// its guard page. This value is a multiple of the system's
-  /// page size.
-  pub fn size(&self) -> NonZeroUsize {
-    self.size
-  }
-
-  /// Returns the smallest memory location within the stack area,
-  /// including its guard page. This address is aligned with the
-  /// beginning of a page.
-  ///
-  /// It is important to note that the returned pointer does not
-  /// necessarily point to the [bottom] of the stack; this occurs
-  /// only if program stacks grow [upwards] on the current platform.
-  ///
-  /// [bottom]: Self::bottom
-  /// [upwards]: GrowthDir::Upwards
-  pub fn base(&self) -> NonNull<u8> {
+  pub fn bottom(&self) -> NonNull<()> {
     match GROWTH_DIR {
-      GrowthDir::Upwards => self.bot,
-      // SAFETY: The bottom of the stack is at address `base + size`.
-      GrowthDir::Downwards => unsafe { self.bot.sub(self.size.get()) },
+      GrowthDir::Upwards => self.base,
+      // SAFETY: The last byte of the stack is at address `base+size-1`.
+      GrowthDir::Downwards => unsafe { self.base.byte_add(self.size.get()) },
     }
   }
 
-  /// Returns whether `addr` refers to a location within this stack
+  /*/// Returns whether `addr` refers to a location within this stack
   /// or its guard page. The [bottom location] of the stack is part
   /// of the stack if and only if program stacks grow [upwards] on
   /// the [current platform].
@@ -210,15 +196,15 @@ impl Stack {
   /// [upwards]: GrowthDir::Upwards
   /// [current platform]: GROWTH_DIR
   #[deprecated] // todo: check if this is needed after refactor.
-  pub fn contains(&self, addr: NonNull<u8>) -> bool {
+  pub fn contains(&self, addr: NonNull<()>) -> bool {
     let offset = match GROWTH_DIR {
       GrowthDir::Upwards => addr.addr().get().wrapping_sub(self.bot.addr().get()),
       GrowthDir::Downwards => self.bot.addr().get().wrapping_sub(addr.addr().get()),
     };
     offset < self.size.get()
-  }
+  }*/
 
-  // todo: clean up and document.
+  /*// todo: clean up and document.
   // the reason for taking a closure is to allow for objects to depend
   // on their own address; note that for address sensitivity to be safe,
   // care must be taken.
@@ -236,7 +222,7 @@ impl Stack {
     }
     .cast();
     loc
-  }
+  }*/
 }
 
 pub(crate) unsafe fn push(sp: &mut StackPtr, layout: Layout) -> NonNull<()> {
@@ -258,7 +244,11 @@ pub(crate) unsafe fn push(sp: &mut StackPtr, layout: Layout) -> NonNull<()> {
   loc.cast()
 }
 
-// todo: clean up and document.
+pub(crate) unsafe fn push2<T>(sp: &mut StackPtr) -> NonNull<T> {
+  unsafe { push(sp, Layout::new::<T>()) }.cast()
+}
+
+/*// todo: clean up and document.
 pub(crate) fn next_slot<T>(sp: StackPtr) -> NonNull<T> {
   let align_mask = align_of::<T>() - 1;
   sp.map_addr(|a| {
@@ -271,7 +261,7 @@ pub(crate) fn next_slot<T>(sp: StackPtr) -> NonNull<T> {
     unsafe { NonZero::new_unchecked(addr) }
   })
   .cast()
-}
+}*/
 
 #[cfg(feature = "stack_alloc")]
 impl Drop for Stack {
@@ -389,18 +379,18 @@ mod stack_tests {
     assert!(stack.bottom().is_aligned_to(page_size));
   }
 
-  #[test]
+  /*#[test]
   #[cfg(feature = "stack_alloc")]
   fn contains() {
     let stack = Stack::allocate(1 << 12);
     assert!(stack.contains(stack.base()));
-    let last_byte = unsafe { stack.base().add(stack.size().get() - 1) };
+    let last_byte = unsafe { stack.base().byte_add(stack.size().get() - 1) };
     assert!(stack.contains(last_byte));
     assert_eq!(
       stack.contains(stack.bottom()),
       GROWTH_DIR == GrowthDir::Upwards
     );
-  }
+  }*/
 }
 
 #[cfg(all(test, feature = "stack_alloc"))]

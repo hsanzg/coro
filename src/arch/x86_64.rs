@@ -1,4 +1,3 @@
-use crate::CALLER;
 use crate::stack::StackPtr;
 use core::arch::{asm, naked_asm};
 use core::ptr::NonNull;
@@ -16,6 +15,7 @@ pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) {
   // will be read and jumped to by `init_coro`.
   let tp = unsafe { bot.byte_offset(TRAMP_PTR_OFF) }.cast();
   unsafe { tp.write(tramp_fn) };
+  // Leave the caller reference field uninitialized.
 }
 
 #[inline(always)]
@@ -32,10 +32,11 @@ unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
   unsafe { bot.byte_offset(CALLER_REF_OFF) }
 }
 
-pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
+#[inline(never)] // todo: https://github.com/rust-lang/rust/issues/161490
+pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr, prev_caller: *const ()) -> *mut () {
+  // todo: do we really need to store `prev_caller` in the caller stack?
   let sus_sp;
   let ret_addr;
-  let caller_ref = unsafe { caller_ref_loc(bot) };
   unsafe {
     asm!(
       // Preserve the contents of the reserved register `rbx`;
@@ -57,8 +58,8 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
       "pop rbx", // todo: is this more efficient than `add rsp, 8`?
       "pop rbx",
       in("rdi") (*sp).as_ptr(),
-      inlateout("rsi") caller_ref.as_ptr() => sus_sp,
-      in("rdx") CALLER.get(),
+      inlateout("rsi") caller_ref_loc(bot).as_ptr() => sus_sp,
+      in("rdx") prev_caller,
       lateout("rax") ret_addr,
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
@@ -74,7 +75,12 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
   // Invariant: `_init_sp - INIT_SP_OFF == _caller_ref - CALLER_REF_OFF`.
   naked_asm!(
     ".cfi_startproc simple",
-    // todo: add CFI information.
+    // Place this frame on the caller's stack.
+    // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=5, DW_OP_breg6/rbp 0 DW_OP_deref DW_OP_plus_uconst 24)
+    ".cfi_escape 0x0f, 5, 0x76, 0, 0x06, 0x23, 32",
+    ".cfi_offset rbx, -8",
+    ".cfi_offset rip, -24",
+    ".cfi_offset rbp, -32",
     // Preserve the contents of `rbp`. After this step, the top of
     // the caller stack has a valid frame to which we will soon link.
     "push rbp",
@@ -89,7 +95,7 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
     // Prepare the second argument for the trampoline.
     "add rsi, {fn_off}",
     // Bounce into the architecture-independent trampoline.
-    "jmp [rsp + {tramp_off}]",
+    "call [rsp + {tramp_off}]",
     "ud2",
     ".cfi_endproc",
     // These two offsets are relative to `caller_ref`.
@@ -98,7 +104,8 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
   )
 }
 
-pub unsafe fn suspend_coro(caller: StackPtr) {
+#[must_use]
+pub unsafe fn suspend_coro(caller: StackPtr) -> *const () {
   let caller_ref: *const StackPtr;
   unsafe {
     asm!(
@@ -118,14 +125,14 @@ pub unsafe fn suspend_coro(caller: StackPtr) {
       // Return control to `resume_coro`, which takes care of
       // restoring the remaining registers.
       "ret",
-      // The coroutine has been resumed.
+      // The coroutine has been resumed by `resume_coro`.
       "2:",
       // Preserve the caller's `rbp` value.
       "push rbp",
       // Record the stack pointer of the caller program.
       "mov [rsi], rsp",
       // Switch to the coroutine stack.
-      "lea rsp, [rdx + 8]", // skip resumption program address.
+      "lea rsp, [rdi + 8]", // skip resumption program address.
       // Restore the contents of the reserved registers.
       "pop rbp",
       "pop rbx",
@@ -137,7 +144,7 @@ pub unsafe fn suspend_coro(caller: StackPtr) {
     )
   };
   let new_caller = unsafe { caller_ref.read() };
-  CALLER.set(new_caller.as_ptr());
+  new_caller.as_ptr()
 }
 
 pub unsafe fn return_control(caller: StackPtr, ret_val: NonNull<()>) -> ! {

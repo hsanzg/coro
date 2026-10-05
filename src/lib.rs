@@ -319,10 +319,27 @@ impl<R> Coro<R> {
   /// [normally]: Self::has_finished
   /// [panicking]: Self::has_panicked
   pub fn resume(&mut self) -> CoroutineState<(), R> {
-    let ret_addr = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr) };
+    extern crate std;
+    std::println!(
+      "[resume] cont_sp={:?}, fn_ptr={:?}; replacing caller {:?}",
+      self.cont_sp,
+      self.fn_ptr,
+      CALLER.get(),
+    );
+    let prev_caller = CALLER.get();
+    let ret_addr = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr, prev_caller) };
+    CALLER.set(prev_caller); // todo: maybe place in an `ActivateOnDrop`.
     if ret_addr.is_null() {
+      std::println!(
+        "[resume] yielded @ sp={:?}; caller restored to {prev_caller:?}",
+        self.cont_sp
+      );
       CoroutineState::Yielded(())
     } else {
+      std::println!(
+        "[resume] terminated with ret_val @ {ret_addr:?}; caller is now {:?}",
+        CALLER.get()
+      );
       // The computation finished. Copy the return value to the current
       // stack, because the stack of the coroutine might be about to get
       // dropped.
@@ -465,7 +482,10 @@ pub fn suspend() {
     cold_path();
     suspend_from_outside();
   };
-  unsafe { arch::suspend_coro(caller) };
+  extern crate std;
+  std::println!("[suspend] returning control to caller {caller:?}");
+  CALLER.set(unsafe { arch::suspend_coro(caller) });
+  std::println!("[suspend] new caller after resume: {:?}", CALLER.get());
 }
 
 /*#[inline(never)]

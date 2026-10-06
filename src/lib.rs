@@ -244,10 +244,17 @@ impl<R> Coro<R> {
   pub fn with_stack<F: FnOnce() -> R + Unpin>(f: F, stack: Stack) -> Self {
     #[repr(C)]
     #[cfg_attr(target_arch = "x86_64", repr(align(16)))]
-    struct Fn<F>(ManuallyDrop<F>);
+    union Fn<F> {
+      normal: ManuallyDrop<F>,
+      poison: PoisonTarget,
+    }
 
     let fn_ptr = unsafe { stack::push2(&mut stack.bottom()) };
-    unsafe { fn_ptr.write(Fn(ManuallyDrop::new(f))) };
+    unsafe {
+      fn_ptr.write(Fn {
+        normal: ManuallyDrop::new(f),
+      })
+    };
     let bot = fn_ptr.cast();
     unsafe { arch::prepare_stack(bot, trampoline::<R, F> as *const _) };
 
@@ -279,7 +286,7 @@ impl<R> Coro<R> {
     !self.has_finished() && !self.has_panicked()
   }
 
-  fn poison_target(&self) -> Option<NonNull<()>> {
+  fn poison_target(&self) -> Option<PoisonTarget> {
     unsafe { arch::poison_target(self.cont_sp) }
   }
 
@@ -288,9 +295,7 @@ impl<R> Coro<R> {
   #[must_use]
   #[inline]
   pub fn has_finished(&self) -> bool {
-    self
-      .poison_target()
-      .is_some_and(|t| t.as_ptr() == finished as *mut _)
+    self.poison_target() == Some(finished)
   }
 
   /// Checks if the coroutine has panicked via the [`panic!`] macro
@@ -301,9 +306,7 @@ impl<R> Coro<R> {
   /// [`resume`]: Self::resume
   #[must_use]
   pub fn has_panicked(&self) -> bool {
-    self
-      .poison_target()
-      .is_some_and(|t| t.as_ptr() == panicked as *mut _)
+    self.poison_target() == Some(panicked)
   }
 
   /// Resumes execution of this coroutine's program where it last left off.
@@ -344,7 +347,7 @@ impl<R> Coro<R> {
       // stack, because the stack of the coroutine might be about to get
       // dropped.
       let ret_val = unsafe { ret_addr.cast::<R>().read() };
-      unsafe { arch::poison(self.cont_sp, finished) };
+      unsafe { arch::poison(&mut self.cont_sp, self.fn_ptr, finished) };
       CoroutineState::Complete(ret_val)
     }
 
@@ -488,6 +491,10 @@ pub fn suspend() {
   std::println!("[suspend] new caller after resume: {:?}", CALLER.get());
 }
 
+pub fn in_coro() -> bool {
+  !CALLER.get().is_null()
+}
+
 /*#[inline(never)]
 fn suspend_during_unwind() -> ! {
   panic!("cannot suspend unwinding coroutine");
@@ -495,15 +502,13 @@ fn suspend_during_unwind() -> ! {
 
 #[cold]
 #[inline(never)]
-#[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
-extern "C-unwind" fn finished() -> ! {
+fn finished() -> ! {
   panic!("coroutine resumed after completion")
 }
 
 #[cold]
 #[inline(never)]
-#[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
-extern "C-unwind" fn panicked() -> ! {
+fn panicked() -> ! {
   panic!("coroutine resumed after panicking")
 }
 
@@ -511,6 +516,15 @@ extern "C-unwind" fn panicked() -> ! {
 #[inline(never)]
 fn suspend_from_outside() -> ! {
   panic!("cannot suspend from outside a coroutine")
+}
+
+type PoisonTarget = fn() -> !;
+
+#[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
+#[allow(improper_ctypes_definitions, reason = "written and read from Rust")]
+extern "C-unwind" fn poison_trampoline(caller: *const (), target_loc: NonNull<PoisonTarget>) -> ! {
+  CALLER.set(caller);
+  (unsafe { target_loc.read() })();
 }
 
 type DropReturn = cfg_select! {

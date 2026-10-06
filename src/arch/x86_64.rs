@@ -1,3 +1,4 @@
+use crate::PoisonTarget;
 use crate::stack::StackPtr;
 use core::arch::{asm, naked_asm};
 use core::ptr::NonNull;
@@ -18,7 +19,6 @@ pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) {
   // Leave the caller reference field uninitialized.
 }
 
-#[inline(always)]
 pub unsafe fn initial_sp(bot: StackPtr) -> StackPtr {
   // The `init_coro` subroutine obeys a custom calling convention
   // where its *own* address appears at `rsp` immediately after the
@@ -27,7 +27,6 @@ pub unsafe fn initial_sp(bot: StackPtr) -> StackPtr {
   unsafe { bot.byte_offset(INIT_SP_OFF) }
 }
 
-#[inline(always)]
 unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
   unsafe { bot.byte_offset(CALLER_REF_OFF) }
 }
@@ -179,11 +178,11 @@ pub unsafe fn force_unwind(sp: StackPtr, bot: StackPtr) {
         "mov [rsi], rsp",
         // Switch to the coroutine stack.
         "mov rsp, rdi",
-        "pop rax", // the previous return address.
+        "pop rax", // the previous resumption address.
         "pop rbp",
         "pop rbx",
         // Begin the unwinding.
-        "push rax", // preserve the return address.
+        "push rax", // preserve the resumption address.
         "jmp {start_unwind}",
         // If the coroutine program catches the exception itself,
         // `suspend_coro` will return control to the following
@@ -204,34 +203,26 @@ pub unsafe fn force_unwind(sp: StackPtr, bot: StackPtr) {
   assert!(res.is_err(), "coroutine did not unwind");
 }
 
-#[unsafe(naked)]
-unsafe extern "sysv64-unwind" fn poison_trampoline(_sp: StackPtr, _caller_ref: StackPtr) {
-  naked_asm!(
-    // Emulate the "resumption" part of `suspend_coro`.
-    ".cfi_startproc simple",
-    "push rbp",
-    "mov [rsi], rsp",
-    // Switch to the coroutine stack.
-    "lea rsp, [rdi + 8]", // skip resumption address.
-    // Restore the contents of the reserved registers.
-    "pop rbp",
-    "pop rbx",
-    // Jump to the target function, instead of returning normally.
-    // todo: see how to handle `CALLER.set()`.
-    "jmp [rdi - 8]",
-    ".cfi_endproc",
-  )
+pub unsafe fn poison(sp: &mut StackPtr, bot: StackPtr, target_fn: PoisonTarget) {
+  unsafe { prepare_stack(bot, crate::poison_trampoline as *const _) };
+  // Overwrite the regular target function of the coroutine.
+  unsafe { bot.cast().write(target_fn) };
+  *sp = unsafe { initial_sp(bot) };
+  extern crate std;
+  std::println!(
+    "[poison] new target_fn={:?} at bot={:?}, init sp={:?}",
+    unsafe { bot.cast::<PoisonTarget>().read() },
+    bot,
+    sp,
+  );
 }
 
-pub unsafe fn poison(sp: StackPtr, target_fn: extern "sysv64-unwind" fn() -> !) {
-  // Overwrite the instruction pointer of the coroutine.
-  unsafe { sp.cast().write(poison_trampoline as *const ()) };
-  unsafe { sp.byte_sub(8).cast().write(target_fn as *const ()) };
-}
-
-pub unsafe fn poison_target(cont_sp: StackPtr) -> Option<NonNull<()>> {
+pub unsafe fn poison_target(cont_sp: StackPtr) -> Option<PoisonTarget> {
   let ip: *const () = unsafe { cont_sp.cast().read() };
-  (ip == poison_trampoline as *const _).then(|| unsafe { cont_sp.byte_sub(8).cast().read() })
+  (ip == crate::poison_trampoline as *const _).then(|| {
+    let bot = unsafe { cont_sp.byte_offset(-INIT_SP_OFF) };
+    unsafe { bot.cast().read() }
+  })
 }
 
 // Old implementation:

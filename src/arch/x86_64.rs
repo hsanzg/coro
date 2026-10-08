@@ -32,8 +32,7 @@ unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
 }
 
 #[inline(never)] // todo: https://github.com/rust-lang/rust/issues/161490
-pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr, prev_caller: *const ()) -> *mut () {
-  // todo: do we really need to store `prev_caller` in the caller stack?
+pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
   let sus_sp;
   let ret_addr;
   unsafe {
@@ -41,8 +40,6 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr, prev_caller: *const 
       // Preserve the contents of the reserved register `rbx`;
       // `init_coro` and `suspend_coro` take care of the rest.
       "push rbx",
-      // Link the caller to its own caller.
-      "push rdx",
       // Read the resumption program address from the top of the
       // coroutine stack, and jump to it. Note that `suspend_coro`
       // and `init_coro` read `rsi` in order to update the "caller
@@ -54,11 +51,9 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr, prev_caller: *const 
       // its return value (otherwise `rax` is null). All that remains
       // is to restore the contents of `rbx`, since `rbp` was already
       // restored by `suspend_coro` or `return_control`.
-      "pop rbx", // todo: is this more efficient than `add rsp, 8`?
       "pop rbx",
       in("rdi") (*sp).as_ptr(),
       inlateout("rsi") caller_ref_loc(bot).as_ptr() => sus_sp,
-      in("rdx") prev_caller,
       lateout("rax") ret_addr,
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
@@ -189,7 +184,6 @@ pub unsafe fn force_unwind(sp: StackPtr, bot: StackPtr) {
         // section of code. Emulate the "suspension" part of
         // `resume_coro`, i.e. those instructions after `call`.
         "2:",
-        "pop rbx", // todo: is this more efficient than `add rsp, 8`?
         "pop rbx",
         in("rdi") sp.as_ptr(),
         in("rsi") caller_ref.as_ptr(),

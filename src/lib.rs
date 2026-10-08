@@ -330,7 +330,7 @@ impl<R> Coro<R> {
       CALLER.get(),
     );
     let prev_caller = CALLER.get();
-    let ret_addr = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr, prev_caller) };
+    let ret_addr = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr) };
     CALLER.set(prev_caller); // todo: maybe place in an `ActivateOnDrop`.
     if ret_addr.is_null() {
       std::println!(

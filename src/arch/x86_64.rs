@@ -1,6 +1,7 @@
 use crate::PoisonTarget;
 use crate::stack::StackPtr;
 use core::arch::{asm, naked_asm};
+use core::hint::unlikely;
 use core::ptr::NonNull;
 
 // Byte offsets of various fields from the bottom of a coroutine stack.
@@ -8,7 +9,15 @@ const INIT_SP_OFF: isize = -8; // initial stack pointer.
 const CALLER_REF_OFF: isize = -16; // caller chain pointer.
 const TRAMP_PTR_OFF: isize = -24; // trampoline jump address.
 
-pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) {
+unsafe fn initial_sp(bot: StackPtr) -> StackPtr {
+  // The `init_coro` subroutine obeys a custom calling convention
+  // where its *own* address appears at `rsp` immediately after the
+  // call.
+  // todo: improve wording.
+  unsafe { bot.byte_offset(INIT_SP_OFF) }
+}
+
+pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) -> StackPtr {
   let ip = unsafe { bot.byte_offset(INIT_SP_OFF).cast() };
   unsafe { ip.write(init_coro as *const ()) };
   // Write the address of the trampoline function immediately
@@ -17,14 +26,7 @@ pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) {
   let tp = unsafe { bot.byte_offset(TRAMP_PTR_OFF) }.cast();
   unsafe { tp.write(tramp_fn) };
   // Leave the caller reference field uninitialized.
-}
-
-pub unsafe fn initial_sp(bot: StackPtr) -> StackPtr {
-  // The `init_coro` subroutine obeys a custom calling convention
-  // where its *own* address appears at `rsp` immediately after the
-  // call.
-  // todo: improve wording.
-  unsafe { bot.byte_offset(INIT_SP_OFF) }
+  unsafe { initial_sp(bot) }
 }
 
 unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
@@ -71,10 +73,10 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
     ".cfi_startproc simple",
     // Place this frame on the caller's stack.
     // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=5, DW_OP_breg6/rbp 0 DW_OP_deref DW_OP_plus_uconst 24)
-    ".cfi_escape 0x0f, 5, 0x76, 0, 0x06, 0x23, 32",
+    ".cfi_escape 0x0f, 5, 0x76, 0, 0x06, 0x23, 24",
     ".cfi_offset rbx, -8",
-    ".cfi_offset rip, -24",
-    ".cfi_offset rbp, -32",
+    ".cfi_offset rip, -16",
+    ".cfi_offset rbp, -24",
     // Preserve the contents of `rbp`. After this step, the top of
     // the caller stack has a valid frame to which we will soon link.
     "push rbp",
@@ -85,7 +87,7 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
     "mov rdi, rsp",
     // Switch to the coroutine stack.
     "mov rsp, rsi", // skip caller reference/frame pointer.
-    "mov rbp, rsp",
+    "mov rbp, rsi",
     // Prepare the second argument for the trampoline.
     "add rsi, {fn_off}",
     // Bounce into the architecture-independent trampoline.
@@ -161,11 +163,14 @@ pub unsafe fn return_control(caller: StackPtr, ret_val: NonNull<()>) -> ! {
 pub unsafe fn force_unwind(sp: StackPtr, bot: StackPtr) {
   let res = crate::unwind::catch_unwind(move || {
     let caller_ref = unsafe { caller_ref_loc(bot) };
+    extern crate std;
+    std::println!(
+      "[force uw] starting unwind at sp={sp:?}, bot={bot:?} with caller_ref={caller_ref:?}"
+    );
     unsafe {
       asm!(
         // Emulate the "resumption" part of `resume_coro`.
         "push rbx",
-        "push rdx",
         "lea rax, [rip + 2f]",
         "push rax",
         // And the "resumption" part of `suspend_coro`.
@@ -198,10 +203,9 @@ pub unsafe fn force_unwind(sp: StackPtr, bot: StackPtr) {
 }
 
 pub unsafe fn poison(sp: &mut StackPtr, bot: StackPtr, target_fn: PoisonTarget) {
-  unsafe { prepare_stack(bot, crate::poison_trampoline as *const _) };
+  *sp = unsafe { prepare_stack(bot, crate::poison_trampoline as *const _) };
   // Overwrite the regular target function of the coroutine.
   unsafe { bot.cast().write(target_fn) };
-  *sp = unsafe { initial_sp(bot) };
   extern crate std;
   std::println!(
     "[poison] new target_fn={:?} at bot={:?}, init sp={:?}",
@@ -212,11 +216,32 @@ pub unsafe fn poison(sp: &mut StackPtr, bot: StackPtr, target_fn: PoisonTarget) 
 }
 
 pub unsafe fn poison_target(cont_sp: StackPtr) -> Option<PoisonTarget> {
-  let ip: *const () = unsafe { cont_sp.cast().read() };
-  (ip == crate::poison_trampoline as *const _).then(|| {
+  ({
+    let ip = unsafe { cont_sp.cast().read() };
+    init_coro as *const () == ip
+  } && {
+    let tp = unsafe { cont_sp.byte_offset(TRAMP_PTR_OFF - INIT_SP_OFF) };
+    crate::poison_trampoline as *const () == unsafe { tp.cast().read() }
+  })
+  .then(|| {
     let bot = unsafe { cont_sp.byte_offset(-INIT_SP_OFF) };
     unsafe { bot.cast().read() }
   })
+}
+
+pub unsafe fn has_started(cont_sp: StackPtr) -> bool {
+  let ip: *const () = unsafe { cont_sp.cast().read() };
+  if ip != init_coro as *const _ {
+    return true;
+  }
+  let tp = unsafe { cont_sp.byte_offset(TRAMP_PTR_OFF - INIT_SP_OFF) };
+  unlikely(crate::poison_trampoline as *const () == unsafe { tp.cast().read() })
+  /*// Either the stack pointer has moved, or the coroutine is poisoned.
+  if cont_sp != unsafe { initial_sp(bot) } {
+    return true;
+  }
+  let ip: *const () = unsafe { cont_sp.cast().read() };
+  unlikely(ip == crate::poison_trampoline as *const _)*/
 }
 
 // Old implementation:

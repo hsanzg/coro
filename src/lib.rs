@@ -47,6 +47,7 @@
 #![feature(rustc_attrs)]
 #![feature(thread_local)]
 #![feature(ptr_alignment_type)]
+#![feature(likely_unlikely)]
 #![expect(
   internal_features,
   reason = "we unwind coroutine stacks by throwing a non-Rust exception type, and need `catch_unwind` to catch it"
@@ -64,7 +65,7 @@ use crate::stack::{Stack, StackPtr};
 use core::cell::Cell;
 use core::hint::cold_path;
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
+use core::mem::{DropGuard, ManuallyDrop};
 use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
 use core::ptr;
@@ -255,15 +256,13 @@ impl<R> Coro<R> {
         normal: ManuallyDrop::new(f),
       })
     };
-    let bot = fn_ptr.cast();
-    unsafe { arch::prepare_stack(bot, trampoline::<R, F> as *const _) };
-
     unsafe fn drop_fn<F>(ptr: NonNull<()>) {
       unsafe { ptr.cast::<F>().drop_in_place() };
     }
 
+    let bot = fn_ptr.cast();
     Self {
-      cont_sp: unsafe { arch::initial_sp(bot) },
+      cont_sp: unsafe { arch::prepare_stack(bot, trampoline::<R, F> as *const _) },
       fn_ptr: fn_ptr.cast(),
       drop_fn: drop_fn::<F>,
       stack: ManuallyDrop::new(stack),
@@ -275,7 +274,7 @@ impl<R> Coro<R> {
   #[must_use]
   #[inline]
   pub fn has_started(&self) -> bool {
-    self.cont_sp != unsafe { arch::initial_sp(self.fn_ptr) }
+    unsafe { arch::has_started(self.cont_sp) }
   }
 
   // todo: find better name? `is_suspended`? not good enough, since
@@ -329,13 +328,14 @@ impl<R> Coro<R> {
       self.fn_ptr,
       CALLER.get(),
     );
-    let prev_caller = CALLER.get();
+    let call_guard = DropGuard::new(CALLER.get(), |p| CALLER.set(p));
     let ret_addr = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr) };
-    CALLER.set(prev_caller); // todo: maybe place in an `ActivateOnDrop`.
+    drop(call_guard);
     if ret_addr.is_null() {
       std::println!(
-        "[resume] yielded @ sp={:?}; caller restored to {prev_caller:?}",
-        self.cont_sp
+        "[resume] yielded @ sp={:?}; caller restored to {:?}",
+        self.cont_sp,
+        CALLER.get()
       );
       CoroutineState::Yielded(())
     } else {
@@ -524,6 +524,8 @@ type PoisonTarget = fn() -> !;
 #[allow(improper_ctypes_definitions, reason = "written and read from Rust")]
 extern "C-unwind" fn poison_trampoline(caller: *const (), target_loc: NonNull<PoisonTarget>) -> ! {
   CALLER.set(caller);
+  extern crate std;
+  std::println!("[poison_tramp] setting caller to {caller:?} and jumping to {target_loc:?}");
   (unsafe { target_loc.read() })();
 }
 
@@ -544,7 +546,9 @@ type DropReturn = cfg_select! {
 unsafe fn drop_<R>(coro: &mut Coro<R>) -> DropReturn {
   if coro.has_started() {
     if coro.is_paused() {
+      let prev_caller = CALLER.get();
       unsafe { arch::force_unwind(coro.cont_sp, coro.fn_ptr) };
+      CALLER.set(prev_caller);
     }
   } else {
     cold_path();

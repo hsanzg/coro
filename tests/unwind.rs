@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use core::cell::Cell;
 use core::panic::AssertUnwindSafe;
-use coro::{Coro, suspend};
+use coro::{Coro, in_coro, suspend};
 use std::panic::{catch_unwind, resume_unwind};
 use std::thread::panicking;
 
@@ -50,6 +50,7 @@ fn unwind_on_drop_before_finished() {
   assert!(!dropped.get());
   drop(coro);
   assert!(dropped.get());
+  assert!(!in_coro());
 }
 
 #[test]
@@ -66,9 +67,11 @@ fn unwind_when_finished_within_pausing_coro() {
     assert!(!inner_dropped.get());
     inner.resume();
     assert!(inner_dropped.get());
+    assert!(in_coro());
   });
   outer.resume();
   outer.resume();
+  assert!(!in_coro());
 }
 
 #[test]
@@ -83,6 +86,7 @@ fn unwind_unfinished_inner_when_outer_finishes() {
   });
   outer.resume();
   assert!(inner_dropped.get());
+  assert!(!in_coro());
 }
 
 #[test]
@@ -101,6 +105,7 @@ fn do_not_unwind_unfinished_inner_when_it_outlives_outer() {
   assert!(!inner_dropped.get());
   drop(inner);
   assert!(inner_dropped.get());
+  assert!(!in_coro());
 }
 
 #[test]
@@ -121,6 +126,7 @@ fn unwind_unfinished_inner_on_outer_drop_before_finished() {
   assert!(!inner_dropped.get());
   drop(outer);
   assert!(inner_dropped.get());
+  assert!(!in_coro());
 }
 
 #[test]
@@ -137,6 +143,7 @@ fn user_unwind() {
   });
   assert!(res.is_err());
   assert!(dropped.get());
+  assert!(!in_coro());
 }
 
 /// On drop, checks that the current thread is unwinding
@@ -166,6 +173,7 @@ fn unwind_on_panic() {
     Some(&"help")
   );
   assert!(dropped.get());
+  assert!(!in_coro());
 }
 
 #[test]
@@ -192,6 +200,7 @@ fn unwind_on_panic_after_many_suspends_from_recursive_fn() {
     Some(&"boom")
   );
   assert_complete(&coro, true);
+  assert!(!in_coro());
 }
 
 #[test]
@@ -219,6 +228,7 @@ fn nested_unwinds_on_inner_panic() {
   );
   assert!(inner_dropped.get());
   assert!(outer_dropped.get());
+  assert!(!in_coro());
 }
 
 #[test]
@@ -254,6 +264,7 @@ fn doubly_nested_unwinds_on_inner_panic() {
   assert!(inner_dropped.get());
   assert!(middle_dropped.get());
   assert!(outer_dropped.get());
+  assert!(!in_coro());
 }
 
 #[test]
@@ -282,6 +293,7 @@ fn nested_unwinds_on_outer_panic() {
   );
   assert!(inner_dropped.get());
   assert!(outer_dropped.get());
+  assert!(!in_coro());
 }
 
 #[test]
@@ -319,6 +331,7 @@ fn doubly_nested_unwinds_on_outer_panic() {
   assert!(inner_dropped.get());
   assert!(middle_dropped.get());
   assert!(outer_dropped.get());
+  assert!(!in_coro());
 }
 
 #[test]
@@ -326,9 +339,11 @@ fn catch_panic_unwind_within_coro() {
   let mut coro = new_coro(|| {
     let res = catch_unwind(|| panic!("help"));
     assert!(res.is_err());
+    assert!(in_coro());
   });
   coro.resume();
   assert_complete(&coro, false);
+  assert!(!in_coro());
 }
 
 #[test]
@@ -350,14 +365,18 @@ fn catch_unwind_of_inner_coro_within_coro() {
     );
     assert_complete(&thrower, true);
     assert!(thrower_dropped.get());
+    assert!(in_coro());
     suspend();
+    assert!(in_coro());
   });
   catcher.resume();
   assert_paused(&catcher);
   assert!(!catcher_dropped.get());
+  assert!(!in_coro());
   catcher.resume();
   assert_complete(&catcher, false);
   assert!(catcher_dropped.get());
+  assert!(!in_coro());
 }
 
 /// Calls [`suspend`] when dropped.

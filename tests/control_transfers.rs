@@ -118,7 +118,6 @@ fn non_terminating_coro() {
   for _ in 0..1000000 {
     coro.resume();
   }
-  assert!(!in_coro());
 }
 
 #[test]

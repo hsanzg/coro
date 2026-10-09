@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use core::cell::Cell;
 use core::panic::AssertUnwindSafe;
-use coro::{Coro, in_coro, suspend};
+use coro::{in_coro, suspend};
 use std::panic::{catch_unwind, resume_unwind};
 use std::thread::panicking;
 

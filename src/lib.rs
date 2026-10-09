@@ -43,17 +43,24 @@
 
 #![feature(asm_unwind)]
 #![feature(core_intrinsics)]
+#![feature(std_internals)] // for `PanicPayload`.
 #![feature(coroutine_trait)]
 #![feature(rustc_attrs)]
 #![feature(thread_local)]
 #![feature(ptr_alignment_type)]
 #![feature(likely_unlikely)]
+#![feature(abort_immediate)]
+#![cfg_attr(target_arch = "x86_64", feature(panic_unwind))]
 #![expect(
   internal_features,
-  reason = "we unwind coroutine stacks by throwing a non-Rust exception type, and need `catch_unwind` to catch it"
+  reason = "we unwind coroutine stacks by throwing a non-Rust exception type, and need `core::intrinsics::catch_unwind` to catch it"
 )]
 #![cfg_attr(all(test, feature = "stack_alloc"), feature(pointer_is_aligned_to))]
 #![no_std]
+
+#[cfg(target_arch = "x86_64")]
+extern crate unwind as uw;
+
 #[cfg(feature = "stack_alloc")]
 extern crate alloc;
 
@@ -62,17 +69,17 @@ pub mod stack;
 mod unwind;
 
 use crate::stack::{Stack, StackPtr};
+use crate::unwind::Exception;
 use core::cell::Cell;
-use core::hint::cold_path;
+use core::hint::{cold_path, unreachable_unchecked};
 use core::marker::PhantomData;
-use core::mem::{DropGuard, ManuallyDrop};
+use core::mem::ManuallyDrop;
 use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
 use core::ptr;
 use core::ptr::NonNull;
 #[allow(unused_imports)] // false positive depending on platform.
 use coro_macros::abi;
-
 /*/// The control record of a [coroutine], used to save or restore the
 /// context needed by the coroutine during a [transfer of control].
 ///
@@ -138,6 +145,13 @@ static ACTIVE: Cell<*mut Control> = Cell::new(ptr::null_mut());*/
 
 #[thread_local]
 static CALLER: Cell<*const ()> = Cell::new(ptr::null_mut());
+
+/*struct CallerGuard(*const ());
+impl Drop for CallerGuard {
+  fn drop(&mut self) {
+    CALLER.set(self.0);
+  }
+}*/
 
 /*// Triggered on panics and manual unwinds of the coroutine stack.
 struct ActivateOnDrop(*mut Control);
@@ -321,36 +335,28 @@ impl<R> Coro<R> {
   /// [normally]: Self::has_finished
   /// [panicking]: Self::has_panicked
   pub fn resume(&mut self) -> CoroutineState<(), R> {
-    extern crate std;
-    std::println!(
-      "[resume] cont_sp={:?}, fn_ptr={:?}; replacing caller {:?}",
-      self.cont_sp,
-      self.fn_ptr,
-      CALLER.get(),
-    );
-    let call_guard = DropGuard::new(CALLER.get(), |p| CALLER.set(p));
-    let ret_addr = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr) };
-    drop(call_guard);
-    if ret_addr.is_null() {
-      std::println!(
-        "[resume] yielded @ sp={:?}; caller restored to {:?}",
-        self.cont_sp,
-        CALLER.get()
-      );
-      CoroutineState::Yielded(())
-    } else {
-      std::println!(
-        "[resume] terminated with ret_val @ {ret_addr:?}; caller is now {:?}",
-        CALLER.get()
-      );
-      // The computation finished. Copy the return value to the current
-      // stack, because the stack of the coroutine might be about to get
-      // dropped.
-      let ret_val = unsafe { ret_addr.cast::<R>().read() };
-      unsafe { arch::poison(&mut self.cont_sp, self.fn_ptr, finished) };
-      CoroutineState::Complete(ret_val)
-    }
+    let prev_caller = CALLER.get();
+    let res = unwind::catch(|| unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr) });
+    CALLER.set(prev_caller);
 
+    match res.map(NonNull::new) {
+      Ok(None) => CoroutineState::Yielded(()),
+      Ok(Some(ret_addr)) => {
+        // The computation finished. Copy the return value to the current
+        // stack, because the stack of the coroutine might be about to get
+        // dropped.
+        let ret_val = unsafe { ret_addr.cast::<R>().read() };
+        unsafe { arch::poison(&mut self.cont_sp, self.fn_ptr, finished) };
+        CoroutineState::Complete(ret_val)
+      }
+      Err(Exception::Panic(payload)) => {
+        cold_path();
+        unsafe { arch::poison(&mut self.cont_sp, self.fn_ptr, panicked) };
+        unwind::resume(payload);
+      }
+      // Forced unwinds are always caught by `arch::force_unwind`.
+      Err(Exception::ForcedUnwind) => unsafe { unreachable_unchecked() },
+    }
     /*// Push ourselves to the stack of active coroutines.
     let ctrl = self.control_mut();
     //ctrl.caller = ACTIVE.replace(ctrl);
@@ -424,12 +430,6 @@ extern "C-unwind" fn trampoline<R, F>(caller: *const (), fn_ptr: NonNull<()>) ->
 where
   F: FnOnce() -> R + Unpin,
 {
-  extern crate std;
-  std::println!(
-    "[tramp] overwriting caller {:?} by {caller:?}",
-    CALLER.get()
-  );
-  std::println!("[tramp] reading fn from {fn_ptr:?}");
   CALLER.set(caller);
 
   let f = unsafe { fn_ptr.cast().as_mut() };
@@ -437,8 +437,8 @@ where
 
   let ret_val = ManuallyDrop::new(f());
   let ret_val = NonNull::from_ref(&ret_val).cast();
+  // The coroutine caller may have changed since its first resumption.
   let caller = unsafe { NonNull::new_unchecked(CALLER.get().cast_mut()) };
-  std::println!("[tramp] returning control to caller {caller:?} with ra={ret_val:?}");
   unsafe { arch::return_control(caller, ret_val) }
 
   /*debug_assert_eq!(ACTIVE.get(), ptr::from_mut(ctrl));
@@ -485,20 +485,13 @@ pub fn suspend() {
     cold_path();
     suspend_from_outside();
   };
-  extern crate std;
-  std::println!("[suspend] returning control to caller {caller:?}");
   CALLER.set(unsafe { arch::suspend_coro(caller) });
-  std::println!("[suspend] new caller after resume: {:?}", CALLER.get());
 }
 
+// todo: document.
 pub fn in_coro() -> bool {
   !CALLER.get().is_null()
 }
-
-/*#[inline(never)]
-fn suspend_during_unwind() -> ! {
-  panic!("cannot suspend unwinding coroutine");
-}*/
 
 #[cold]
 #[inline(never)]
@@ -524,8 +517,6 @@ type PoisonTarget = fn() -> !;
 #[allow(improper_ctypes_definitions, reason = "written and read from Rust")]
 extern "C-unwind" fn poison_trampoline(caller: *const (), target_loc: NonNull<PoisonTarget>) -> ! {
   CALLER.set(caller);
-  extern crate std;
-  std::println!("[poison_tramp] setting caller to {caller:?} and jumping to {target_loc:?}");
   (unsafe { target_loc.read() })();
 }
 

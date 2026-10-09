@@ -1,7 +1,7 @@
-use crate::PoisonTarget;
 use crate::stack::StackPtr;
+use crate::{PoisonTarget, unwind};
 use core::arch::{asm, naked_asm};
-use core::hint::unlikely;
+use core::hint::{cold_path, unlikely};
 use core::ptr::NonNull;
 
 // Byte offsets of various fields from the bottom of a coroutine stack.
@@ -33,7 +33,7 @@ unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
   unsafe { bot.byte_offset(CALLER_REF_OFF) }
 }
 
-#[inline(never)] // todo: https://github.com/rust-lang/rust/issues/161490
+// #[inline(never)] // todo: https://github.com/rust-lang/rust/issues/161490
 pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
   let sus_sp;
   let ret_addr;
@@ -66,11 +66,39 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
   ret_addr
 }
 
+/*// Define the LSDA of the `init_coro` subroutine.
+// See https://www.airs.com/blog/archives/464 for an explanation of the format.
+// Also see https://maskray.me/blog/2020-12-12-c++-exception-handling-abi.
+global_asm!(
+  r#".section .gcc_except_table, "a", @progbits"#,
+  ".p2align 2, 0",
+  ".global __coro_tramp_lsda",
+  ".type __coro_tramp_lsda, @object",
+  "__coro_tramp_lsda:",
+  // The personality function does not contain a landing pad,
+  // so there's no need to set a base offset for it.
+  ".byte 0xff", // LPStart = DW_EH_PE_omit
+  // Leave the type table empty.
+  ".byte 0xff", // TType = DW_EH_PE_omit
+  // Define the encoding and length of the call-site table.
+  ".byte 0x01", // DW_EH_PE_uleb128
+  ".uleb128 .Lcs_table_end - .Lcs_table_start",
+  // Declare the call-site table entry.
+  ".Lcs_table_start:",
+  ".uleb128 0",          // start instruction.
+  ".uleb128 0xffffffff", // length of the instruction sequence.
+  ".uleb128 0",          // there's no landing pad.
+  ".byte 0",             // no action.
+  ".Lcs_table_end:",
+);*/
+
 #[unsafe(naked)]
 pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: StackPtr) -> ! {
   // Invariant: `_init_sp - INIT_SP_OFF == _caller_ref - CALLER_REF_OFF`.
   naked_asm!(
     ".cfi_startproc simple",
+    /*".cfi_personality 0x1b, {personality_fn}", // 0x1b = DW_EH_PE_pcrel | DW_EH_PE_sdata4
+    ".cfi_lsda 0x1b, __coro_tramp_lsda",*/
     // Place this frame on the caller's stack.
     // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=5, DW_OP_breg6/rbp 0 DW_OP_deref DW_OP_plus_uconst 24)
     ".cfi_escape 0x0f, 5, 0x76, 0, 0x06, 0x23, 24",
@@ -94,6 +122,7 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
     "call [rsp + {tramp_off}]",
     "ud2",
     ".cfi_endproc",
+    // personality_fn = sym crate::unwind::__coro_trampoline_personality,
     // These two offsets are relative to `caller_ref`.
     fn_off = const -CALLER_REF_OFF,
     tramp_off = const TRAMP_PTR_OFF - CALLER_REF_OFF,
@@ -161,12 +190,8 @@ pub unsafe fn return_control(caller: StackPtr, ret_val: NonNull<()>) -> ! {
 }
 
 pub unsafe fn force_unwind(sp: StackPtr, bot: StackPtr) {
-  let res = crate::unwind::catch_unwind(move || {
+  let res = unwind::catch(move || {
     let caller_ref = unsafe { caller_ref_loc(bot) };
-    extern crate std;
-    std::println!(
-      "[force uw] starting unwind at sp={sp:?}, bot={bot:?} with caller_ref={caller_ref:?}"
-    );
     unsafe {
       asm!(
         // Emulate the "resumption" part of `resume_coro`.
@@ -199,20 +224,20 @@ pub unsafe fn force_unwind(sp: StackPtr, bot: StackPtr) {
       )
     };
   });
-  assert!(res.is_err(), "coroutine did not unwind");
+  match res {
+    Err(Exception::ForcedUnwind) => {}
+    Err(Exception::Panic(payload)) => {
+      cold_path();
+      unwind::resume(payload);
+    }
+    Ok(_) => panic!("coroutine did not unwind"),
+  }
 }
 
 pub unsafe fn poison(sp: &mut StackPtr, bot: StackPtr, target_fn: PoisonTarget) {
   *sp = unsafe { prepare_stack(bot, crate::poison_trampoline as *const _) };
   // Overwrite the regular target function of the coroutine.
   unsafe { bot.cast().write(target_fn) };
-  extern crate std;
-  std::println!(
-    "[poison] new target_fn={:?} at bot={:?}, init sp={:?}",
-    unsafe { bot.cast::<PoisonTarget>().read() },
-    bot,
-    sp,
-  );
 }
 
 pub unsafe fn poison_target(cont_sp: StackPtr) -> Option<PoisonTarget> {
@@ -859,6 +884,7 @@ fn valgrind_client_req(default: usize, args: &[usize; 6]) -> usize {
 
 #[cfg(feature = "valgrind")]
 use crate::stack::ValgrindStackId;
+use crate::unwind::{Exception, abort};
 
 #[cfg(feature = "valgrind")]
 pub fn valgrind_register_stack(start: *mut (), end: *mut ()) -> ValgrindStackId {

@@ -1,9 +1,13 @@
+#![feature(coroutine_trait)]
+
 mod common;
 
 use common::*;
 use core::cell::Cell;
 use core::panic::AssertUnwindSafe;
 use coro::{in_coro, suspend};
+use std::mem::DropGuard;
+use std::ops::CoroutineState;
 use std::panic::{catch_unwind, resume_unwind};
 use std::thread::panicking;
 
@@ -410,6 +414,43 @@ fn suspend_from_coro_being_unwound_due_to_panic_aborts() {
   .resume();
 }
 
-// todo: add `suspend_from_dropping_coro_panics`.
-// todo: add `resume_from_dropping_coro`.
-// todo: add `resume_another_coro_when_being_dropped` (due to panic and due to drop).
+#[test]
+fn resume_another_coro_from_paused_coro_when_being_dropped() {
+  let dropped = Cell::new(false);
+  new_coro(|| {
+    let _drop = DropGuard::new((), |_| {
+      assert!(in_coro()); // destructors run in the coroutine.
+      let mut inner = new_coro(|| assert!(in_coro()));
+      assert_eq!(inner.resume(), CoroutineState::Complete(()));
+      assert_complete(&inner, false);
+      assert!(in_coro());
+      dropped.set(true);
+    });
+    suspend();
+  })
+  .resume();
+  assert!(dropped.get());
+}
+
+#[test]
+fn resume_another_coro_from_panicking_coro() {
+  let dropped = Cell::new(false);
+  let dropped_ref = AssertUnwindSafe(&dropped);
+  let res = catch_unwind(|| {
+    new_coro(|| {
+      let _drop = DropGuard::new((), |_| {
+        assert!(in_coro());
+        let mut inner = new_coro(|| assert!(in_coro()));
+        assert_eq!(inner.resume(), CoroutineState::Complete(()));
+        assert_complete(&inner, false);
+        assert!(in_coro());
+        dropped_ref.set(true);
+      });
+      panic!();
+    })
+    .resume()
+  });
+  assert!(res.is_err());
+  assert!(!in_coro());
+  assert!(dropped.get());
+}

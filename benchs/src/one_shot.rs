@@ -6,13 +6,13 @@ use gungraun::prelude::*;
 use std::hint::black_box;
 use std::ops::CoroutineState;
 
-fn coro_switch_setup() -> Coro<(), impl FnOnce() -> () + Unpin> {
+fn coro_switch_setup() -> Coro<()> {
   Coro::new(|| suspend())
 }
 
 #[library_benchmark]
 #[bench::with_setup(setup = coro_switch_setup)]
-fn coro_switch<F: FnOnce() -> () + Unpin>(mut coro: Coro<(), F>) -> Coro<(), F> {
+fn coro_switch(mut coro: Coro<()>) -> Coro<()> {
   black_box(coro.resume());
   coro
 }

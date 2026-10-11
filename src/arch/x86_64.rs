@@ -193,6 +193,9 @@ pub unsafe fn return_control(caller: StackPtr, final_sp: StackPtr, comp: Complet
 /// of all live objects in it. After this operation, the coroutine can
 /// be resumed or unwound again only after being [poisoned].
 ///
+/// Note that a poisoned coroutine is never paused, and so its stack
+/// cannot be unwound.
+///
 /// [paused]: crate::Coro::is_paused
 /// [poisoned]: poison
 pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr) -> Completion {
@@ -207,6 +210,8 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr) -> Completion {
       // And the "resumption" part of `suspend_coro`.
       "push rbp",
       "mov [rsi], rsp",
+      // Prepare the argument for `start_unwind`.
+      "mov rdi, rsp",
       // Switch to the coroutine stack.
       "mov rsp, rax",
       "pop rax", // the previous resumption address.
@@ -236,9 +241,9 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr) -> Completion {
 /// Restores the stack of the coroutine whose stack starts at `bot`
 /// to its initial state, but with [`poison_trampoline`] instead of
 /// the original trampoline and `target_fn` instead of the original
-/// target function.
+/// target function. Returns the new stack pointer of the coroutine.
 ///
-/// A poisoned coroutine can only return control back by panicking
+/// A poisoned coroutine can return control back only by panicking
 /// or [forcibly unwinding] its stack.
 ///
 /// [`poison_trampoline`]: crate::poison_trampoline

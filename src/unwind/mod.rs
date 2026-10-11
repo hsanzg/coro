@@ -1,7 +1,15 @@
+//! Unwinding support for coroutines.
+//!
+//! Most subroutines in this module are based on the great [blog post]
+//! on faster exception handling by Alisa Sireneva; her [`lithium`]
+//! crate was also a source of inspiration.
+//!
+//! [blog post]: https://purplesyringa.moe/blog/bringing-faster-exceptions-to-rust/
+//! [`lithium`]: https://docs.rs/lithium/latest/lithium/
 #[cfg_attr(not(windows), path = "itanium.rs")]
 mod imp;
 
-pub use self::imp::*;
+pub use self::imp::*; // todo: remove.
 use crate::stack::StackPtr;
 use alloc::boxed::Box;
 use core::alloc::AllocError;
@@ -404,7 +412,7 @@ impl Completion {
 
   #[cold]
   #[inline(never)]
-  unsafe fn rethrow(self) {
+  pub unsafe fn rethrow(self) {
     let ptr = ManuallyDrop::new(self)
       .0
       .map_addr(|a| a & !Self::UNWIND)
@@ -416,17 +424,11 @@ impl Completion {
     }
   }
 
-  pub fn try_rethrow(self) {
-    if !self.is_ok() {
-      unsafe { self.rethrow() };
-    }
-  }
-
   #[inline]
   pub fn ret_addr(self) -> Option<StackPtr> {
     let ptr = self.0;
     if self.is_ok() {
-      let _ = ManuallyDrop::new(self);
+      core::mem::forget(self);
       StackPtr::new(ptr)
     } else {
       cold_path();

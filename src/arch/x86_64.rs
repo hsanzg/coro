@@ -10,15 +10,26 @@ const INIT_SP_OFF: isize = -8; // initial stack pointer.
 const CALLER_REF_OFF: isize = -16; // caller chain pointer.
 const TRAMP_PTR_OFF: isize = -24; // trampoline jump address.
 
+/// Returns the initial stack pointer of the coroutine whose stack
+/// starts at `bot`; that is, the value the stack pointer will have
+/// when control is first [transferred] to the coroutine.
+///
+/// [transferred]: resume_coro
 unsafe fn initial_sp(bot: StackPtr) -> StackPtr {
+  unsafe { bot.byte_offset(INIT_SP_OFF) }
+}
+
+/// Restores the coroutine stack starting at `bot` to its initial
+/// state, so that the next call to [`resume_coro`] on it enters
+/// [`init_coro`] and jumps to `tramp_fn`.
+///
+/// For convenience, the [initial stack pointer](initial_sp) of
+/// the coroutine is returned.
+pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) -> StackPtr {
   // The `init_coro` subroutine obeys a custom calling convention
   // where its *own* address appears at `rsp` immediately after the
   // call.
   // todo: improve wording.
-  unsafe { bot.byte_offset(INIT_SP_OFF) }
-}
-
-pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) -> StackPtr {
   let ip = unsafe { bot.byte_offset(INIT_SP_OFF).cast() };
   unsafe { ip.write(init_coro as *const ()) };
   // Write the address of the trampoline function immediately
@@ -34,6 +45,11 @@ unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
   unsafe { bot.byte_offset(CALLER_REF_OFF) }
 }
 
+/// Transfers control to the coroutine whose stack starts at `bot`,
+/// resuming it where it was last suspended (or starting it, if it
+/// has not yet begun execution). This subroutine returns once the
+/// coroutine transfers control back via [`suspend_coro`] or
+/// [`return_control`].
 #[inline(always)]
 pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> Completion {
   let comp;
@@ -48,13 +64,13 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> Completion {
       // and `init_coro` read `rsi` in order to update the "caller
       // reference" at the bottom of the coroutine's stack.
       "call [rax]",
-      // todo: update comment about `rax`.
       // The coroutine has returned control to us. At this point `rsi`
-      // contains the new stack pointer of the coroutine; and if it
-      // finished via `return_control`, `rax` contains the address of
-      // its return value (otherwise `rax` is null). All that remains
-      // is to restore the contents of `rbx`, since `rbp` was already
-      // restored by `suspend_coro` or `return_control`.
+      // contains the new stack pointer of the coroutine, and `rax` is
+      // the tagged pointer that tells whether the coroutine finished
+      // completely or not, and if its stack was unwound forcibly or
+      // due to a panic. All that remains is to restore the contents
+      // of `rbx`, since `rbp` was already restored by `suspend_coro`
+      // or `return_control`.
       "pop rbx",
       inlateout("rax") (*sp).as_ptr() => comp,
       inlateout("rsi") caller_ref_loc(bot).as_ptr() => sus_sp,
@@ -67,39 +83,15 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> Completion {
   unsafe { Completion::from_raw(comp) }
 }
 
-/*// Define the LSDA of the `init_coro` subroutine.
-// See https://www.airs.com/blog/archives/464 for an explanation of the format.
-// Also see https://maskray.me/blog/2020-12-12-c++-exception-handling-abi.
-global_asm!(
-  r#".section .gcc_except_table, "a", @progbits"#,
-  ".p2align 2, 0",
-  ".global __coro_tramp_lsda",
-  ".type __coro_tramp_lsda, @object",
-  "__coro_tramp_lsda:",
-  // The personality function does not contain a landing pad,
-  // so there's no need to set a base offset for it.
-  ".byte 0xff", // LPStart = DW_EH_PE_omit
-  // Leave the type table empty.
-  ".byte 0xff", // TType = DW_EH_PE_omit
-  // Define the encoding and length of the call-site table.
-  ".byte 0x01", // DW_EH_PE_uleb128
-  ".uleb128 .Lcs_table_end - .Lcs_table_start",
-  // Declare the call-site table entry.
-  ".Lcs_table_start:",
-  ".uleb128 0",          // start instruction.
-  ".uleb128 0xffffffff", // length of the instruction sequence.
-  ".uleb128 0",          // there's no landing pad.
-  ".byte 0",             // no action.
-  ".Lcs_table_end:",
-);*/
-
+/// The initial sequence of instructions executed by a coroutine
+/// after it is activated for the first time or after being poisoned.
+///
+/// See [`crate::trampoline`] for some ABI-related considerations.
 #[unsafe(naked)]
 pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: StackPtr) -> ! {
   // Invariant: `_init_sp - INIT_SP_OFF == _caller_ref - CALLER_REF_OFF`.
   naked_asm!(
     ".cfi_startproc simple",
-    /*".cfi_personality 0x1b, {personality_fn}", // 0x1b = DW_EH_PE_pcrel | DW_EH_PE_sdata4
-    ".cfi_lsda 0x1b, __coro_tramp_lsda",*/
     // Place this frame on the caller's stack.
     // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=5, DW_OP_breg6/rbp 0 DW_OP_deref DW_OP_plus_uconst 24)
     ".cfi_escape 0x0f, 5, 0x76, 0, 0x06, 0x23, 24",
@@ -115,21 +107,25 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
     // Prepare the first argument for the trampoline.
     "mov rdi, rsp",
     // Switch to the coroutine stack.
-    "mov rsp, rsi", // skip caller reference/frame pointer.
+    "mov rsp, rsi", // skip initial resumption address.
     "mov rbp, rsi",
     // Prepare the second argument for the trampoline.
     "add rsi, {fn_off}",
     // Bounce into the architecture-independent trampoline.
+    // The stack pointer is properly aligned for a `sysv64` call,
+    // since `rsp - CALLER_REF_OFFSET` (the bottom of the stack)
+    // is 16-byte aligned by construction (see `Coro::with_stack`).
     "call [rsp + {tramp_off}]",
     "ud2",
     ".cfi_endproc",
-    // personality_fn = sym crate::unwind::__coro_trampoline_personality,
     // These two offsets are relative to `caller_ref`.
     fn_off = const -CALLER_REF_OFF,
     tramp_off = const TRAMP_PTR_OFF - CALLER_REF_OFF,
   )
 }
 
+/// Jumps to the instruction immediately after the [`resume_coro`]
+/// call that last activated the current coroutine.
 #[must_use]
 #[inline(always)]
 pub unsafe fn suspend_coro(caller: StackPtr) -> *const () {
@@ -173,6 +169,9 @@ pub unsafe fn suspend_coro(caller: StackPtr) -> *const () {
   new_caller
 }
 
+/// A variant of [`suspend_coro`] for the case when the current
+/// coroutine will never be activated again (unless it is first
+/// [poisoned](poison)).
 pub unsafe fn return_control(caller: StackPtr, final_sp: StackPtr, comp: Completion) -> ! {
   unsafe {
     asm!(
@@ -190,6 +189,12 @@ pub unsafe fn return_control(caller: StackPtr, final_sp: StackPtr, comp: Complet
   }
 }
 
+/// Unwinds the stack of a [paused] coroutine, running the destructors
+/// of all live objects in it. After this operation, the coroutine can
+/// be resumed or unwound again only after being [poisoned].
+///
+/// [paused]: crate::Coro::is_paused
+/// [poisoned]: poison
 pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr) -> Completion {
   let comp;
   let final_sp;
@@ -210,12 +215,10 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr) -> Completion {
       // Begin the unwinding.
       "push rax", // preserve the resumption address.
       "jmp {start_unwind}",
-      // todo: this is outdated; the coroutine trampoline always
-      //       catches the exception now.
-      // If the coroutine program catches the exception itself,
-      // `suspend_coro` will return control to the following
-      // section of code. Emulate the "suspension" part of
-      // `resume_coro`, i.e. those instructions after `call`.
+      // The trampoline function catches the exception itself,
+      // and returns control normally to the following section
+      // of code. Emulate the "suspension" part of `resume_coro`,
+      // i.e. those instructions after the resumption `call`.
       "2:",
       "pop rbx",
       inlateout("rax") (*sp).as_ptr() => comp,
@@ -230,634 +233,55 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr) -> Completion {
   unsafe { Completion::from_raw(comp) }
 }
 
+/// Restores the stack of the coroutine whose stack starts at `bot`
+/// to its initial state, but with [`poison_trampoline`] instead of
+/// the original trampoline and `target_fn` instead of the original
+/// target function.
+///
+/// A poisoned coroutine can only return control back by panicking
+/// or [forcibly unwinding] its stack.
+///
+/// [`poison_trampoline`]: crate::poison_trampoline
+/// [forcibly unwinding]: force_unwind
 #[must_use]
 pub unsafe fn poison(bot: StackPtr, target_fn: PoisonTarget) -> StackPtr {
-  // Overwrite the original target function of the coroutine.
   unsafe { bot.cast().write(target_fn) };
   unsafe { prepare_stack(bot, crate::poison_trampoline as *const _) }
 }
 
+/// Returns the target function of a poisoned coroutine,
+/// or [`None`] if the coroutine is not currently poisoned.
 pub unsafe fn poison_target(cont_sp: StackPtr) -> Option<PoisonTarget> {
   ({
     let ip = unsafe { cont_sp.cast().read() };
     init_coro as *const () == ip
   } && {
+    // Is `init_coro` going to jump the alternative trampoline?
     let tp = unsafe { cont_sp.byte_offset(TRAMP_PTR_OFF - INIT_SP_OFF) };
     crate::poison_trampoline as *const () == unsafe { tp.cast().read() }
   })
   .then(|| {
+    // Read the landing point of that trampoline.
     let bot = unsafe { cont_sp.byte_offset(-INIT_SP_OFF) };
     unsafe { bot.cast().read() }
   })
 }
 
+/// Returns whether the (suspended) coroutine whose stack
+/// pointer is currently `cont_sp` has begun execution.
+///
+/// This is the architecture-specific part of [`Coro::has_started`].
+///
+/// [`Coro::has_started`]: crate::Coro::has_started
 pub unsafe fn has_started(cont_sp: StackPtr) -> bool {
+  // Either the instruction pointer has moved, or the coroutine is poisoned.
   let ip: *const () = unsafe { cont_sp.cast().read() };
   if ip != init_coro as *const _ {
     return true;
   }
   let tp = unsafe { cont_sp.byte_offset(TRAMP_PTR_OFF - INIT_SP_OFF) };
   unlikely(crate::poison_trampoline as *const () == unsafe { tp.cast().read() })
-  /*// Either the stack pointer has moved, or the coroutine is poisoned.
-  if cont_sp != unsafe { initial_sp(bot) } {
-    return true;
-  }
-  let ip: *const () = unsafe { cont_sp.cast().read() };
-  unlikely(ip == crate::poison_trampoline as *const _)*/
 }
-
-// Old implementation:
-
-/*// Invariant: return address always stored at `control.sp`.
-
-#[inline(always)]
-pub unsafe fn resume_coro(target: &mut Control) {
-  unsafe {
-    asm!(
-      // Preserve the current contents of the reserved register `rbx`.
-      // Register `rbp` is also reserved, but we push its contents to
-      // the stack only after the `call` instruction below transfers
-      // control to `trampoline` or `suspend_coro`. In this way the
-      // top of the coroutine stack will contain a suitably arranged
-      // frame, as specified in Section 3.2.2 of the System V AMD64 ABI.
-      // todo: Well, that's not entirely true, since we do not align
-      //  the stack to 16 bytes prior to the `call`. But that's no
-      //  issue, since `trampoline` and `suspend_coro` can handle
-      //  a misaligned frame, and debuggers that use the chain of
-      //  frame pointers do not really care about the misalignment
-      //  either.
-      // todo: to be correct, maybe we should do a `sub rsp, 8`.
-      "push rbx",
-      ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size 0
-      "call [rsi]",
-      // The coroutine has returned control to us; all that remains
-      // is to restore the previous contents of `rbx`.
-      "pop rbx",
-      in("rdi") target,
-      in("rsi") target.stack_ptr.as_ptr(),
-      clobber_abi("sysv64"),
-      lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
-      options(may_unwind),
-    )
-  }
-}
-
-/*pub const fn initial_sp<R, F>(bottom: NonNull<Bottom<R, F>>) -> StackPtr
-where
-  F: FnOnce() -> R + Unpin,
-{
-  unsafe { bottom.byte_sub(8).cast() }
-}*/
-
-pub const fn first_inst_addr() -> NonNull<Code>
-/*where
-  F: FnOnce() -> R + Unpin,*/
-{
-  // todo: replace by `FnPtr::as_ptr` if we can avoid the 1-byte offset.
-  // See `first_tramp` for the reason behind the 1-byte offset.
-  unsafe { fn_ptr!(first_tramp).byte_add(1) }
-  // (first_tramp/*::<R, F>*/ as *const ()).byte_add(1)
-}
-
-// const FIRST_INST_ADDR: NonNull<Code> = unsafe { fn_ptr!(first_tramp).byte_add(1) };
-
-/*pub fn prepare_stack_old<R, F>(bottom: NonNull<Bottom<R, F>>)
-where
-  F: FnOnce() -> R + Unpin,
-{
-  let pad = unsafe { bottom.byte_add(8).cast() };
-  unsafe { pad.write(ptr::null::<()>()) };
-  // let ret_addr = unsafe { bottom.byte_add(8).cast() };
-  // unsafe { ret_addr.write(resume_coro as *const ()) };
-  let tramp_ret_addr = unsafe { bottom.byte_sub(8).cast() };
-  unsafe { tramp_ret_addr.write(first_inst_addr::<R, F>()) };
-}*/
-
-pub unsafe fn prepare_stack(
-  stack: &mut Stack,
-  fn_layout: Layout,
-  trampoline_addr: NonNull<Code>,
-) -> (NonNull<()>, NonNull<Control>, StackPtr) {
-  let mut top = stack.bottom();
-  let fn_ptr = unsafe { push(&mut top, fn_layout) };
-  let ctrl_ptr = unsafe { push(&mut top, Layout::new::<Control>()) }.cast();
-  // todo: write address of arch trampoline as the return address of
-  //       the first frame.
-  // todo: write address of second trampoline on top of that address;
-  //       it is to be read by `first_tramp` and be placed on the
-  //       appropriate register for `trampoline::<R, F>` to accept it
-  //       correctly.
-
-  // Arrange things so that the frame corresponding to `first_tramp`
-  // has the field `stack_ptr` of the coroutine's control record as
-  // the "previous `rbp` value" slot. (See the System V AMD64 ABI.)
-  // In this way the bottommost frame of the coroutine always points
-  // to the topmost frame of the program that last resumed it. The
-  // return address of this first frame will be invalid, but that
-  // does not seem to prevent `libunwind` nor `libgcc` to proceed
-  // normally through it during unwinding.
-  let mut push_fn_ptr = |ptr: NonNull<Code>| {
-    let loc = unsafe { push(&mut top, Layout::for_value(&ptr)) }.cast();
-    unsafe { loc.write(ptr) };
-    loc
-  };
-  let sp = push_fn_ptr(first_inst_addr()).cast();
-  push_fn_ptr(trampoline_addr);
-  push_fn_ptr(unsafe { NonNull::new_unchecked(fn_ptr.as_ptr() as *mut _) });
-  (fn_ptr, ctrl_ptr, sp)
-}
-
-// Define an LSDA for the personality function of the trampoline function.
-// See https://www.airs.com/blog/archives/464 for an explanation of the format.
-// Also see https://maskray.me/blog/2020-12-12-c++-exception-handling-abi.
-global_asm!(
-  r#".section .gcc_except_table, "a", @progbits"#,
-  ".p2align 2, 0x0", // todo: why?
-  ".globl __coro_tramp_lsda",
-  ".type __coro_tramp_lsda, @object",
-  "__coro_tramp_lsda:",
-  // The personality function does not set up a landing pad,
-  // so there's no need to set a base offset for it.
-  ".byte 0xff", // LPStart = DW_EH_PE_omit
-  // Leave the type table empty.
-  ".byte 0xff", // TType = DW_EH_PE_omit
-  // Define the encoding and length of the call-site table.
-  ".byte 0x01", // DW_EH_PE_uleb128
-  ".uleb128 .Lcs_table_end - .Lcs_table_start",
-  // Declare the call-site table entry.
-  ".Lcs_table_start:",
-  ".uleb128 0",          // start instruction.
-  ".uleb128 0xffffffff", // length of the instruction sequence.
-  ".uleb128 0",          // there's no landing pad.
-  // The action to take is to clean up and continue unwinding.
-  ".byte 0", // 1 + action table index. // todo: zero is a special case meaning "cleanup".
-  ".Lcs_table_end:",
-);
-
-#[unsafe(naked)]
-pub unsafe extern "sysv64-unwind" fn first_tramp(_active: &mut Control, _coro_sp: StackPtr) -> ! {
-  naked_asm!(
-    ".cfi_startproc simple", // not simple
-    ".cfi_personality 0x1b, {personality_fn}", // 0x1b = DW_EH_PE_pcrel | DW_EH_PE_sdata4
-    ".cfi_lsda 0x1b, __coro_tramp_lsda",
-    // todo: This seems to cause the unwinder to use the unwind info
-    //  corresponding the instruction _following_ the return address;
-    //  check that all relevant `asm!` blocks do not end with a `ret`
-    //  or a `jmp` not followed by e.g. a dummy `nop` or `ud2`.
-    // ".cfi_signal_frame", // hack to allow backtrace generation with gdb.
-
-    // Place this frame on the parent stack.
-    // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=5, DW_OP_breg6/rbp 0 DW_OP_deref DW_OP_plus_uconst 24)
-    // In theory we could use `DW_OP_reg6` instead of `DW_OP_breg6 +0`.
-    // Alas, gdb doesn't accept the former operation when it appears
-    // within `DW_CFA_def_cfa_expression`.
-    ".cfi_escape 0x0f, 5, 0x76, 0, 0x06, 0x23, 24",
-    /*// LLVM doesn't support `DW_CFA_val_offset`. // todo: is this still up to date? Record LLVM version.
-    // DW_CFA_val_expression rsp, DW_FORM_block(len=2, DW_OP_plus_uconst 8)
-    // ".cfi_escape 0x16, 0x06, 2, 0x23, 8", // on entry to the `asm!` block of `resume_coro`.*/
-    ".cfi_offset rbx, -8",
-    ".cfi_offset rip, -16",
-    ".cfi_offset rbp, -24",
-
-    // LLDB subtracts 1 from the return address of a frame before
-    // resolving the function symbol that it points to. The return
-    // address of the main `trampoline` function is special in that
-    // it points to the beginning of `first_tramp` instead of the
-    // instruction following the `jmp` below. (This is because we
-    // also use that field to store the initial resumption address
-    // of the coroutine.) We include this `nop` to correct for that
-    // 1-byte adjustment, and point the initial address one byte
-    // after it in `prepare_stack`.
-    "nop",
-
-    // Preserve the current contents of `rbp`.
-    "push rbp",
-    // Record the parent stack pointer value.
-    "mov [rdi + {sp_off}], rsp",
-    // Switch to the new stack.
-    "lea rbp, [rdi + {sp_off}]",
-    "mov rsp, rsi",
-    // Load the address of the coroutine function from its stack,
-    // and pass it as the second argument to the arch-independent
-    // trampoline.
-    "mov rsi, [rdi - 16]",
-    // Bounce into the architecture-independent trampoline.
-    ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0
-    // "jmp {second_tramp}",
-    "jmp [rsp - 8]",
-    "ud2",
-    ".cfi_endproc",
-    sp_off = const offset_of!(Control, stack_ptr),
-    //caller_off = const offset_of!(Control, caller),
-    personality_fn = sym crate::unwind::__coro_trampoline_personality,
-    // second_tramp = sym crate::trampoline::<R, F>,
-  )
-}
-
-#[inline(never)]
-pub unsafe fn suspend_coro(active: &mut Control) {
-  unsafe {
-    asm!(
-      // Preserve the current contents of the reserved registers
-      // on the coroutine stack.
-      "push rbx",
-      "push rbp",
-      // Also record the resumption program address.
-      "lea rax, [rip + 2f]",
-      "push rax",
-      // Switch to the parent stack.
-      "mov [rdi + {sp_off}], rsp",
-      "mov rsp, rsi",
-      // Restore the previous contents of `rbp`.
-      "pop rbp",
-      // Return control to `resume_coro`.
-      ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size 0
-      "ret",
-      "2:",
-      // Preserve the current contents of the `rbp` register. After
-      // this step, the top of the parent stack has a valid frame.
-      "push rbp",
-      // Record the stack pointer value of the parent program.
-      "mov [rdi + {sp_off}], rsp",
-      // Switch to the coroutine stack. (The contents of `rsi` are
-      // not the same as they were on entry to this assembly macro,
-      // since they were updated by `resume_coro`.)
-      "lea rsp, [rsi + 8]", // skip resumption address.
-      // Restore the previous contents of the reserved registers.
-      "pop rbp",
-      "pop rbx",
-      in("rdi") active,
-      in("rsi") active.stack_ptr.as_ptr(),
-      clobber_abi("sysv64"),
-      lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
-      sp_off = const offset_of!(Control, stack_ptr),
-      options(may_unwind),
-    )
-  };
-}
-
-#[inline(always)]
-pub unsafe fn return_control(active: &mut Control) -> ! {
-  unsafe {
-    asm!(
-      // Mark the coroutine as finished (but non-panicking).
-      // todo: improve strategy; it should suffice to have a nonnull `ret_val` pointer.
-      "mov [rdi + {sp_off}], rsp",
-      // Switch to the parent stack.
-      "mov rsp, rsi",
-      // Restore the previous contents of `rbp`.
-      "pop rbp",
-      // Return control to `resume_coro`.
-      "ret",
-      /*"ud2",*/
-      in("rdi") active,
-      in("rsi") active.stack_ptr.as_ptr(),
-      sp_off = const offset_of!(Control, stack_ptr),
-      options(/*may_unwind,*/ noreturn)
-    )
-  }
-}
-
-#[inline]
-pub unsafe fn force_unwind2(target: &mut Control) {
-  let mut target_ref = AssertUnwindSafe(target);
-  let res = crate::unwind::catch_unwind(move || unsafe {
-    let target: &mut _ = *target_ref;
-    asm!(
-      // Create a frame on the parent stack.
-      "push rbx",
-      "lea rax, [rip + 2f]",
-      "push rax",
-      "push rbp",
-      // Record the current stack pointer value.
-      "mov [rdi + {sp_off}], rsp",
-      // Switch to the coroutine stack.
-      "mov rsp, rsi",
-      // Restore the previous contents of the reserved registers.
-      "pop rax",
-      "pop rbp",
-      "pop rbx",
-      // Begin the unwinding.
-      // todo: Say that this is to set the return address of `start_unwind` to the original resumption point of the coroutine.
-      ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size 0
-      "push rax",
-      "jmp {start_unwind}",
-      "2:",
-      // It may be the case that the coroutine program catches the exception
-      // itself, by using `catch_unwind`. This function must work properly
-      // in that case as well. This section of call is jumped-to from
-      // `suspend_coro`, so it suffices to restore the contents of `rbx`,
-      // just as in `resume_coro`.
-      "pop rbx",
-      in("rdi") target,
-      in("rsi") target.stack_ptr.as_ptr(),
-      clobber_abi("sysv64"),
-      lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
-      sp_off = const offset_of!(Control, stack_ptr),
-      start_unwind = sym crate::unwind::start_unwind,
-      options(may_unwind)
-    );
-  });
-  // todo: it may be the case that the coroutine caught the unwind. Do not
-  //  complain in that case, but check what happens if dropping coroutine
-  //  suspends.
-  // todo: if the coroutine suspends when it is being dropped,
-  //       this code seems to get called. Replace `debug_assert`
-  //       by an assertion, and make panic message clearer with
-  //       something like "Did the coroutine suspend while being unwound?"
-  assert!(res.is_err(), "coroutine did not unwind");
-}
-
-#[unsafe(naked)]
-unsafe extern "sysv64-unwind" fn on_poison_resume() {
-  naked_asm!(
-    // todo: Note that there's no need to have correct CFI directives,
-    //       because the final `jmp` "eliminates" `on_resume` from
-    //       the call stack. (It makes it seem as if the original
-    //       caller of `suspend` within the coroutine had called
-    //       `dst`.) But they would be nice to have anyway.
-    ".cfi_startproc simple",
-    // Preserve the current contents of the `rbp` register. After
-    // this step, the top of the parent stack has a valid frame.
-    "push rbp",
-    // Record the stack pointer value of the parent program.
-    "mov [rdi + {sp_off}], rsp",
-    // Switch to the coroutine stack.
-    // todo: document that at this point `rsi` contains the control record location.
-    "lea rsp, [rsi - 8]",
-    // Load the new and the original resumption addresses.
-    "pop rsi", // new.
-    "pop rax", // original.
-    // Restore the previous contents of the reserved registers.
-    "pop rbp",
-    "pop rbx",
-    // Jump to the new destination (instead of returning, like `suspend`),
-    // making sure to preserve the chain of call frames through `rax`.
-    ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size 0
-    "push rsi",
-    "jmp rax",
-    ".cfi_endproc",
-    sp_off = const offset_of!(Control, stack_ptr),
-  );
-}
-
-// todo: rename to `prime`? Come up with better name.
-// todo: note that coroutine must be suspended.
-pub unsafe fn poison(ctrl: &mut Control, dst: extern "C-unwind" fn() -> !) {
-  // todo: document safety; the stack pointer of a suspended coroutine
-  //       is always 8-byte aligned.
-  unsafe { ctrl.stack_ptr.cast().write(fn_ptr!(on_poison_resume)) };
-  extern crate std;
-  std::println!(
-    "poison: overwrote ip at {:?} by {:?}",
-    ctrl.stack_ptr,
-    on_poison_resume as *const ()
-  );
-
-  let dst_ptr = unsafe { ctrl.stack_ptr.cast().byte_sub(1) };
-  unsafe { dst_ptr.write(fn_ptr!(dst)) };
-  // unsafe { ctrl.stack_ptr.cast().write(fn_ptr!(on_resume)) };
-  // let dst_ptr = unsafe { ctrl.stack_ptr.cast().byte_sub(1) };
-  // unsafe { dst_ptr.write(dst) };
-}
-
-pub fn poison_dst(ctrl: &Control) -> Option<NonNull<Code>> {
-  extern crate std;
-  std::println!(
-    "checking whether poisoned @ {:?} (well it has {:?})",
-    ctrl.stack_ptr,
-    unsafe { ctrl.stack_ptr.cast::<*const Code>().read() }
-  );
-  ptr::eq(
-    unsafe { ctrl.stack_ptr.cast().read() },
-    unsafe { fn_ptr!(on_poison_resume) }.as_ptr(),
-  )
-  .then(|| {
-    let dest_addr = unsafe { ctrl.stack_ptr.cast().byte_sub(1) };
-    std::println!("  yes! dest address is {:?}", unsafe { dest_addr.read() });
-    unsafe { dest_addr.read() }
-  })
-}*/
-
-/*pub unsafe extern "sysv64-unwind" fn transfer_control(target: &mut Control) {
-  unsafe {
-    asm!(
-      "mov [rsp - 8], rbx",
-      // ".cfi_adjust_cfa_offset 8",
-      // ".cfi_rel_offset rbx, -8",
-      "mov [rsp - 16], rbp",
-      // ".cfi_rel_offset rbp, -16",
-      // ".cfi_adjust_cfa_offset 8",
-      // ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0
-
-      "mov rax, [rdi + {sp_off}]",
-      "mov [rdi + {sp_off}], rsp",
-      "mov rsp, rax",
-
-      "mov rax, [rdi + {ip_off}]",
-      "lea rsi, [rip + 2f]",
-      "mov [rdi + {ip_off}], rsi",
-      "jmp rax",
-
-      "mov rbp, [rsp - 16]",
-      "mov rbx, [rsp - 8]",
-      "call {unwind}",
-
-      "2:",
-      "mov rbp, [rsp - 16]",
-      // ".cfi_restore rbp",
-      // ".cfi_adjust_cfa_offset -8",
-      "mov rbx, [rsp - 8]",
-      // ".cfi_adjust_cfa_offset -8",
-      // ".cfi_restore rbx",
-      in("rdi") target, lateout("rsi") _,
-      clobber_abi("sysv64"),
-      lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
-      sp_off = const offset_of!(Control, stack_ptr),
-      ip_off = const offset_of!(Control, inst_ptr),
-      unwind = sym crate::unwind::start_unwind,
-      options(may_unwind)
-    )
-  };
-  // extern crate std;
-  // std::println!("returning from transfer_control");
-}
-
-#[unsafe(naked)]
-pub unsafe extern "sysv64-unwind" fn transfer_control2(_target: &mut Control) {
-  #[inline(always)]
-  unsafe extern "sysv64-unwind" fn inner(target: &mut Control) {
-    unsafe {
-      asm!(
-        "mov rax, [rdi + {sp_off}]",
-        "mov [rdi + {sp_off}], rsp",
-        "mov rsp, rax",
-
-        "mov rax, [rdi + {ip_off}]",
-        "lea rsi, [rip + 2f]",
-        "mov [rdi + {ip_off}], rsi",
-
-        "jmp rax",
-
-        "call {unwind}",
-        "2:",
-        in("rdi") target,
-        clobber_abi("sysv64"),
-        lateout("r12") _, lateout("r13") _,
-        lateout("r14") _, lateout("r15") _,
-        sp_off = const offset_of!(Control, stack_ptr),
-        ip_off = const offset_of!(Control, inst_ptr),
-        unwind = sym crate::unwind::start_unwind,
-        options(may_unwind)
-      )
-    }
-  }
-  naked_asm!(
-    ".cfi_startproc",
-    "mov [rsp - 16], rbp",
-    ".cfi_rel_offset rbp, -16",
-    "mov [rsp - 8], rbx",
-    ".cfi_rel_offset rbx, -8",
-    "sub rsp, 24", // mod 16 = 8
-    ".cfi_adjust_cfa_offset 24",
-    "call {inner}",
-    "mov rbp, [rsp + 8]",
-    ".cfi_restore rbp",
-    "mov rbx, [rsp + 16]",
-    ".cfi_restore rbx",
-    "add rsp, 24",
-    ".cfi_adjust_cfa_offset -24",
-    "ret",
-    ".cfi_endproc",
-    inner = sym inner,
-  )
-}
-
-/// Returns the value that the stack pointer should have after
-/// [transferring control] to the coroutine associated with the
-/// metadata object pointed to by `bottom` (which need not be
-/// dereferenceable).
-///
-/// [transferring control]: transfer_control
-pub fn initial_sp2<R, F>(bottom: NonNull<Bottom<R, F>>) -> StackPtr
-where
-  F: FnOnce() -> R + Unpin,
-{
-  // todo: finish comment. Explain why stack pointer is pointed
-  //  to where it is, and prove that location is aligned to a
-  //  16-byte boundary.
-  // SAFETY: This is similar to `&raw const bottom.ctrl.inst_ptr`,
-  //  but it does not require
-  // unsafe { bottom.byte_add(offset_of!(Control, inst_ptr)) }.cast()
-  let ret_addr = unsafe { bottom.byte_sub(8) }.cast::<*const u8>();
-  unsafe { ret_addr.write((first_frame as *const u8).byte_add(1)) }
-  ret_addr.cast()
-}
-
-// todo: this is now wrong; rename to `first_coro_frame`.
-/// The initial sequence of instructions executed by a coroutine
-/// after it is activated for the first time.
-///
-/// See [`crate::trampoline`] for some ABI-related considerations.
-#[unsafe(naked)]
-pub extern "sysv64-unwind" fn first_frame() -> ! {
-  // todo: finish comment. Reference `initial_sp` and make clear
-  //  that the 16control record is actually part of the first frame
-  //  in the coroutine's program stack. That way we get linkage
-  //  between the different stacks of coroutines, allowing unwinding
-  //  by regular means.
-  // The only direct entry point to this function is through the `jmp`
-  // instruction in `transfer_control`. So at this point `rdi` points
-  // to the control record of a coroutine.
-
-  // Conveniently, since that control record appears as the first field
-  // of the `Bottom` structure of the coroutine at the bottom of its stack,
-  // and `Bottom` is annotated with `#[repr(C)]`, `rdi` is also the
-  // address of the `Bottom` structure. This sets up things perfectly
-  // to call the architecture-independent trampoline function. But
-  // there's still some work left.
-  naked_asm!(
-    ".cfi_startproc",
-    ".cfi_personality 0x1b, {personality_fn}", // DW_EH_PE_pcrel | DW_EH_PE_sdata4
-    ".cfi_signal_frame", // hack to allow backtrace generation with gdb.
-    ".cfi_escape 0x2e, 0", // DW_CFA_GNU_args_size, 0
-    ".cfi_def_cfa rsp, 16",
-    ".cfi_rel_offset rsp, 0",
-    // DW_CFA_expression DW_OP_reg6 (rbp) DW_FORM_block(len, DW_OP_lit16 DW_OP_minus DW_OP_deref DW_OP_plus_uconst 8 DW_OP_deref)
-    // ".cfi_escape 0x10, 0x66, 6, 0x40, 0x1c, 0x06, 0x23, 0x08, 0x06",
-    // DW_CFA_expression DW_OP_reg3 (rbx) DW_FORM_block(len, DW_OP_lit16 DW_OP_minus DW_OP_deref DW_OP_deref)
-    // ".cfi_escape 0x10, 0x63, 4, 0x40, 0x1c, 0x06, 0x06",
-    // Bounce off to the second, architecture-independent trampoline.
-    // "call {second_tramp}",
-    "nop",
-    "ud2",
-    ".cfi_endproc",
-    // second_tramp = sym crate::trampoline::<R, F>,
-    personality_fn = sym crate::unwind::__coro_trampoline_personality
-  )
-}
-
-/// Jumps to the instruction immediately after the [`resume`] call that
-/// last activated the current [coroutine]. This function is a version
-/// of [`transfer_control`] for the case when the coroutine will never
-/// get activated again (hence the `!` return type): it does not bother
-/// to save the caller-saved register contents, it writes the address
-/// `_ret_val_addr` of the coroutine's return value to the `stack_ptr`
-/// field of the control record, and it clears the instruction pointer
-/// in the control record. (See [`Control`] for more information.)
-///
-/// # Safety
-///
-/// This function must be called from within a coroutine that shall
-/// never be resumed again. Pointer `_ret_val_addr` must be valid
-/// for reads.
-///
-/// [`resume`]: crate::Coro::resume
-/// [coroutine]: crate::Coro
-#[unsafe(naked)]
-pub unsafe extern "sysv64-unwind" fn return_control2<R>(
-  _control: &mut Control,    // in `rdi`.
-  _ret_val_addr: NonNull<R>, // in `rsi`.
-) -> ! {
-  naked_asm!(
-    // Switch back to the previous stack.
-    "mov rsp, [rdi + {sp_off}]",
-    // Record the coroutine's return value location.
-    "mov [rdi + {sp_off}], rsi",
-    // Mark the coroutine as finished and return to the previous
-    // computation.
-    "mov rsi, [rdi + {ip_off}]",
-    "mov qword ptr [rdi + {ip_off}], 0",
-    "jmp rsi",
-    sp_off = const offset_of!(Control, stack_ptr),
-    ip_off = const offset_of!(Control, inst_ptr),
-  )
-}
-
-///
-/// # Safety
-///
-/// The coroutine must be currently [paused]; its computation must
-/// have started but not be completely finished.
-///
-/// [paused]: crate::Coro::is_paused
-// todo: note that caller is responsible for marking the coroutine as finished, if necessary.
-pub unsafe fn force_unwind(control: &mut Control) {
-  // Transfer control back to the `call {unwind}` instruction in
-  // `transfer_control`, by moving the resumption address of the
-  // coroutine (local label `2` in that function) five bytes back
-  // (the length of the `call {unwind}` instruction).
-  control.inst_ptr = unsafe {
-    control.inst_ptr.byte_sub(5 /*15*/)
-  };
-  let resume_addr = control.stack_ptr.cast::<*const ()>();
-  unsafe { resume_addr.write(resume_addr.read().byte_sub(5)) };
-
-  // crate::ACTIVE.set(&raw mut *control);
-  let mut control_ref = AssertUnwindSafe(control);
-  let res = crate::unwind::catch_unwind(move || unsafe { resume_coro(*control_ref) });
-  debug_assert!(res.is_err(), "coroutine did not unwind");
-}*/
 
 // Rust translation of the client request macros in `valgrind.h`. See
 // https://sourceware.org/git/?p=valgrind.git;a=blob;f=include/valgrind.h.in;h=ed7d8c68e24b896e912fb19e17cc906730a82a4c;hb=refs/heads/master#l409.

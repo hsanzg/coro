@@ -42,23 +42,21 @@
 //! [`libfringe`]: https://github.com/edef1c/libfringe
 
 #![feature(asm_unwind)]
-#![feature(core_intrinsics)]
+#![feature(core_intrinsics)] // todo: document purpose.
 #![feature(std_internals)] // for `PanicPayload`.
 #![feature(coroutine_trait)]
-#![feature(rustc_attrs)]
+#![feature(rustc_attrs)] // todo: document purpose.
 #![feature(thread_local)]
-#![feature(ptr_alignment_type)]
+#![feature(ptr_alignment_type)] // todo: can we remove?
 #![feature(likely_unlikely)]
 #![feature(abort_immediate)]
-#![feature(ptr_metadata)]
-#![feature(box_into_inner)]
-#![feature(allocator_ext)]
-#![feature(pointer_is_aligned_to)]
+#![feature(ptr_metadata)] // todo: can we remove?
 #![cfg_attr(target_arch = "x86_64", feature(panic_unwind))]
 #![expect(
   internal_features,
   reason = "we unwind coroutine stacks by throwing a non-Rust exception type, and need `core::intrinsics::catch_unwind` to catch it"
 )]
+#![cfg_attr(all(test, feature = "stack_alloc"), feature(pointer_is_aligned_to))]
 #![no_std]
 
 #[cfg(target_arch = "x86_64")]
@@ -72,7 +70,7 @@ pub mod stack;
 mod unwind;
 
 use crate::stack::{Stack, StackPtr};
-use crate::unwind::{CatchResult, Completion, Exception, Moved};
+use crate::unwind::{CatchResult, Completion};
 use core::cell::Cell;
 use core::hint::{cold_path, unreachable_unchecked};
 use core::marker::PhantomData;
@@ -495,14 +493,17 @@ where
     NonNull::from_mut(ret_val).cast::<()>()
   });
 
-  let poison_target = if res.is_ok() { finished } else { panicked };
-  let new_sp = unsafe { arch::poison(fn_ptr, poison_target) };
-  let comp = Completion::from(res);
+  unsafe fn return_control(res: CatchResult<NonNull<()>>, fn_ptr: NonNull<()>) -> ! {
+    let poison_target = if res.is_ok() { finished } else { panicked };
+    let new_sp = unsafe { arch::poison(fn_ptr, poison_target) };
+    let comp = Completion::from(res);
 
-  // The coroutine caller may have changed since its first resumption.
-  let caller = unsafe { NonNull::new_unchecked(CALLER.get().cast_mut()) };
-  unsafe { arch::return_control(caller, new_sp, comp) }
+    // The coroutine caller may have changed since its first resumption.
+    let caller = unsafe { NonNull::new_unchecked(CALLER.get().cast_mut()) };
+    unsafe { arch::return_control(caller, new_sp, comp) }
+  }
 
+  unsafe { return_control(res, fn_ptr) };
   /*debug_assert_eq!(ACTIVE.get(), ptr::from_mut(ctrl));
   // SAFETY: `arch::transfer_control` passes the address of the control
   //  record at the bottom of the stack of a coroutine, in the register

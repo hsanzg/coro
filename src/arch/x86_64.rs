@@ -1,9 +1,8 @@
+use crate::PoisonTarget;
 use crate::stack::StackPtr;
-use crate::unwind::{Completion, Exception, Moved};
-use crate::{PoisonTarget, unwind};
+use crate::unwind::Completion;
 use core::arch::{asm, naked_asm};
-use core::hint::{cold_path, unlikely};
-use core::mem;
+use core::hint::unlikely;
 use core::ptr::NonNull;
 
 // Byte offsets of various fields from the bottom of a coroutine stack.
@@ -35,7 +34,7 @@ unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
   unsafe { bot.byte_offset(CALLER_REF_OFF) }
 }
 
-// #[inline(never)] // todo: https://github.com/rust-lang/rust/issues/161490
+#[inline(always)]
 pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> Completion {
   let comp;
   let sus_sp;
@@ -132,8 +131,9 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
 }
 
 #[must_use]
+#[inline(always)]
 pub unsafe fn suspend_coro(caller: StackPtr) -> *const () {
-  let caller_ref: *const StackPtr;
+  let new_caller: *const ();
   unsafe {
     asm!(
       // Preserve the contents of the reserved registers on the
@@ -143,7 +143,7 @@ pub unsafe fn suspend_coro(caller: StackPtr) -> *const () {
       // Record the resumption program address.
       "lea rax, [rip + 2f]",
       "push rax",
-      "xor rax, rax", // the coroutine is not done yet.
+      "xor eax, eax", // the coroutine is not done yet.
       // Switch to the caller stack.
       "mov rsi, rsp", // needed by `resume_coro`.
       "mov rsp, rdi",
@@ -158,20 +158,19 @@ pub unsafe fn suspend_coro(caller: StackPtr) -> *const () {
       "push rbp",
       // Record the stack pointer of the caller program.
       "mov [rsi], rsp",
+      "mov rdi, rsp",
       // Switch to the coroutine stack.
       "lea rsp, [rax + 8]", // skip resumption program address.
       // Restore the contents of the reserved registers.
       "pop rbp",
       "pop rbx",
-      in("rdi") caller.as_ptr(),
-      lateout("rsi") caller_ref,
+      inlateout("rdi") caller.as_ptr() => new_caller,
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
       options(may_unwind),
     )
   };
-  let new_caller = unsafe { caller_ref.read() };
-  new_caller.as_ptr()
+  new_caller
 }
 
 pub unsafe fn return_control(caller: StackPtr, final_sp: StackPtr, comp: Completion) -> ! {

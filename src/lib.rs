@@ -265,7 +265,7 @@ impl<R> Coro<R> {
       poison: PoisonTarget,
     }
 
-    let fn_ptr = unsafe { stack::push2(&mut stack.bottom()) };
+    let fn_ptr = unsafe { stack::push(&mut stack.bottom()) };
     unsafe {
       fn_ptr.write(Fn {
         normal: ManuallyDrop::new(f),

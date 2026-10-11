@@ -186,82 +186,7 @@ impl Stack {
       GrowthDir::Downwards => unsafe { self.base.byte_add(self.size.get()) },
     }
   }
-
-  /*/// Returns whether `addr` refers to a location within this stack
-  /// or its guard page. The [bottom location] of the stack is part
-  /// of the stack if and only if program stacks grow [upwards] on
-  /// the [current platform].
-  ///
-  /// [bottom location]: Self::bottom
-  /// [upwards]: GrowthDir::Upwards
-  /// [current platform]: GROWTH_DIR
-  #[deprecated] // todo: check if this is needed after refactor.
-  pub fn contains(&self, addr: NonNull<()>) -> bool {
-    let offset = match GROWTH_DIR {
-      GrowthDir::Upwards => addr.addr().get().wrapping_sub(self.bot.addr().get()),
-      GrowthDir::Downwards => self.bot.addr().get().wrapping_sub(addr.addr().get()),
-    };
-    offset < self.size.get()
-  }*/
-
-  /*// todo: clean up and document.
-  // the reason for taking a closure is to allow for objects to depend
-  // on their own address; note that for address sensitivity to be safe,
-  // care must be taken.
-  #[deprecated = "does not depend on `Stack`; can be a global fn"]
-  pub(crate) unsafe fn push<T, F: FnOnce(NonNull<T>) -> T>(
-    &mut self,
-    sp: &mut StackPtr,
-    f: F,
-  ) -> NonNull<T> {
-    let loc = next_slot(*sp);
-    unsafe { loc.write(f(loc)) };
-    *sp = match GROWTH_DIR {
-      GrowthDir::Upwards => unsafe { loc.add(1) },
-      GrowthDir::Downwards => loc,
-    }
-    .cast();
-    loc
-  }*/
 }
-
-pub(crate) unsafe fn push(sp: &mut StackPtr, layout: Layout) -> NonNull<()> {
-  let align_mask = layout.alignment().mask();
-  let loc = sp.map_addr(|a| {
-    let addr = match GROWTH_DIR {
-      GrowthDir::Upwards => (a.get() + !align_mask) & align_mask,
-      GrowthDir::Downwards => (a.get() & align_mask) - layout.size(),
-    };
-    // SAFETY:
-    // todo: add proof of correctness.
-    unsafe { NonZero::new_unchecked(addr) }
-  });
-  // Advance the stack pointer.
-  *sp = match GROWTH_DIR {
-    GrowthDir::Upwards => unsafe { loc.byte_add(layout.size()) },
-    GrowthDir::Downwards => loc,
-  };
-  loc.cast()
-}
-
-pub(crate) unsafe fn push2<T>(sp: &mut StackPtr) -> NonNull<T> {
-  unsafe { push(sp, Layout::new::<T>()) }.cast()
-}
-
-/*// todo: clean up and document.
-pub(crate) fn next_slot<T>(sp: StackPtr) -> NonNull<T> {
-  let align_mask = align_of::<T>() - 1;
-  sp.map_addr(|a| {
-    let addr = match GROWTH_DIR {
-      GrowthDir::Upwards => (a.get() + align_mask) & !align_mask,
-      GrowthDir::Downwards => (a.get() & !align_mask) - size_of::<T>(),
-    };
-    // SAFETY:
-    // todo: add proof of correctness.
-    unsafe { NonZero::new_unchecked(addr) }
-  })
-  .cast()
-}*/
 
 #[cfg(feature = "stack_alloc")]
 impl Drop for Stack {
@@ -271,6 +196,42 @@ impl Drop for Stack {
     // SAFETY: This stack was allocated by `os::alloc_stack`.
     unsafe { os::free_stack(self.base(), self.size) };
   }
+}
+
+/// Reserves space for an aligned `T` immediately [above] `sp`.
+///
+/// More precisely, moves the stack pointer and returns an aligned
+/// pointer to the reserved stack slot.
+///
+/// # Safety
+///
+/// Let `c..d` be the memory range of the allocation that `sp` is
+/// derived from. The conditions `c <= next_multiple(sp, a) <= b - s`
+/// and `c <= prev_multiple(sp, a) - s <= d - s` must hold if stacks
+/// grow [upwards] and [downwards], respectively. Here `s` and `a`
+/// are shorthand for `size_of::<T>()` and `align_of::<T>()`, resp.
+///
+/// [above]: GrowthDir
+pub(crate) unsafe fn push<T>(sp: &mut StackPtr) -> NonNull<T> {
+  let align_mask = align_of::<T>() - 1;
+  let loc = sp.map_addr(|a| {
+    let a = match GROWTH_DIR {
+      GrowthDir::Upwards => (a.get() + align_mask) & !align_mask,
+      GrowthDir::Downwards => (a.get() & !align_mask) - size_of::<T>(),
+    };
+    // SAFETY: The caller promises that rounding `sp` up, or rounding
+    //  it down and subtracting `size_of::<T>()`, keeps it within its
+    //  allocation. In particular, it cannot become zero nor overflow
+    //  a `usize`.
+    unsafe { NonZero::new_unchecked(a) }
+  });
+  // Advance the stack pointer.
+  *sp = match GROWTH_DIR {
+    // SAFETY: See above.
+    GrowthDir::Upwards => unsafe { loc.byte_add(size_of::<T>()) },
+    GrowthDir::Downwards => loc,
+  };
+  loc.cast()
 }
 
 /// A pool of available storage for use as the program stacks
@@ -379,18 +340,26 @@ mod stack_tests {
     assert!(stack.bottom().is_aligned_to(page_size));
   }
 
-  /*#[test]
-  #[cfg(feature = "stack_alloc")]
-  fn contains() {
-    let stack = Stack::allocate(1 << 12);
-    assert!(stack.contains(stack.base()));
-    let last_byte = unsafe { stack.base().byte_add(stack.size().get() - 1) };
-    assert!(stack.contains(last_byte));
-    assert_eq!(
-      stack.contains(stack.bottom()),
-      GROWTH_DIR == GrowthDir::Upwards
-    );
-  }*/
+  #[test]
+  fn push_() {
+    let stack = Stack::allocate(10);
+    let mut sp = stack.bottom();
+    let offset = |ptr: StackPtr| unsafe { ptr.byte_offset_from(stack.bottom()) };
+
+    let upwards = GROWTH_DIR == GrowthDir::Upwards;
+
+    let ptr = unsafe { push::<u8>(&mut sp) };
+    assert_eq!(offset(sp), if upwards { 1 } else { -1 });
+    assert_eq!(offset(ptr.cast()), if upwards { 0 } else { -1 });
+
+    let ptr = unsafe { push::<u16>(&mut sp) };
+    assert_eq!(offset(sp), if upwards { 4 } else { -4 });
+    assert_eq!(offset(ptr.cast()), if upwards { 2 } else { -4 });
+
+    let ptr = unsafe { push::<u32>(&mut sp) };
+    assert_eq!(offset(sp), if upwards { 8 } else { -8 });
+    assert_eq!(offset(ptr.cast()), if upwards { 4 } else { -8 });
+  }
 }
 
 #[cfg(all(test, feature = "stack_alloc"))]

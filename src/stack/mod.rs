@@ -140,6 +140,7 @@ impl Stack {
       #[cfg(feature = "valgrind")]
       valgrind_id: crate::arch::valgrind_register_stack(
         base.as_ptr(),
+        // SAFETY: The stack covers the memory range `base..base+size`.
         unsafe { base.byte_add(size.get()) }.as_ptr(),
       ),
     }

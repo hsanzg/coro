@@ -2,7 +2,7 @@
 
 use crate::stack::StackPtr;
 use crate::unwind::abort;
-use core::cell::UnsafeCell;
+use core::cell::Cell;
 use core::mem::MaybeUninit;
 use core::ptr;
 use uw::{_Unwind_Exception, _Unwind_Exception_Class, _Unwind_RaiseException, _Unwind_Reason_Code};
@@ -25,16 +25,15 @@ pub extern "sysv64-unwind" fn start_unwind(caller: StackPtr) -> ! {
   }
 
   #[thread_local]
-  static EX: UnsafeCell<MaybeUninit<_Unwind_Exception>> = UnsafeCell::new(MaybeUninit::uninit());
-  unsafe {
-    EX.get().write(MaybeUninit::new(_Unwind_Exception {
-      exception_class: CORO_UW,
-      exception_cleanup: Some(cleanup),
-      private: [ptr::null(); _],
-    }))
-  };
+  static EX: Cell<MaybeUninit<_Unwind_Exception>> = Cell::new(MaybeUninit::uninit());
 
-  let ex_ptr = EX.get().cast();
+  EX.set(MaybeUninit::new(_Unwind_Exception {
+    exception_class: CORO_UW,
+    exception_cleanup: Some(cleanup),
+    private: [ptr::null(); _],
+  }));
+
+  let ex_ptr = EX.as_ptr().cast();
   let code = unsafe { _Unwind_RaiseException(ex_ptr) };
   abort(match code {
     _Unwind_Reason_Code::_URC_END_OF_STACK => "no handler caught the coroutine unwind",

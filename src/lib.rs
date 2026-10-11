@@ -50,18 +50,21 @@
 #![feature(ptr_alignment_type)]
 #![feature(likely_unlikely)]
 #![feature(abort_immediate)]
+#![feature(ptr_metadata)]
+#![feature(box_into_inner)]
+#![feature(allocator_ext)]
+#![feature(pointer_is_aligned_to)]
 #![cfg_attr(target_arch = "x86_64", feature(panic_unwind))]
 #![expect(
   internal_features,
   reason = "we unwind coroutine stacks by throwing a non-Rust exception type, and need `core::intrinsics::catch_unwind` to catch it"
 )]
-#![cfg_attr(all(test, feature = "stack_alloc"), feature(pointer_is_aligned_to))]
 #![no_std]
 
 #[cfg(target_arch = "x86_64")]
 extern crate unwind as uw;
 
-#[cfg(feature = "stack_alloc")]
+#[cfg(feature = "stack_alloc")] // todo: also if unwind.
 extern crate alloc;
 
 mod arch;
@@ -69,11 +72,11 @@ pub mod stack;
 mod unwind;
 
 use crate::stack::{Stack, StackPtr};
-use crate::unwind::Exception;
+use crate::unwind::{CatchResult, Completion, Exception, Moved};
 use core::cell::Cell;
 use core::hint::{cold_path, unreachable_unchecked};
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
 use core::ptr;
@@ -299,6 +302,8 @@ impl<R> Coro<R> {
     !self.has_finished() && !self.has_panicked()
   }
 
+  #[inline]
+  #[must_use]
   fn poison_target(&self) -> Option<PoisonTarget> {
     unsafe { arch::poison_target(self.cont_sp) }
   }
@@ -306,7 +311,10 @@ impl<R> Coro<R> {
   /// Checks if the coroutine has completely finished its execution
   /// without panicking.
   #[must_use]
-  #[inline]
+  #[expect(
+    unpredictable_function_pointer_comparisons,
+    reason = "set and read from same codegen"
+  )]
   pub fn has_finished(&self) -> bool {
     self.poison_target() == Some(finished)
   }
@@ -318,6 +326,10 @@ impl<R> Coro<R> {
   /// [`panic!`]: panic
   /// [`resume`]: Self::resume
   #[must_use]
+  #[expect(
+    unpredictable_function_pointer_comparisons,
+    reason = "set and read from same codegen"
+  )]
   pub fn has_panicked(&self) -> bool {
     self.poison_target() == Some(panicked)
   }
@@ -336,10 +348,48 @@ impl<R> Coro<R> {
   /// [panicking]: Self::has_panicked
   pub fn resume(&mut self) -> CoroutineState<(), R> {
     let prev_caller = CALLER.get();
-    let res = unwind::catch(|| unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr) });
+    let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr) };
     CALLER.set(prev_caller);
 
-    match res.map(NonNull::new) {
+    if let Some(ret_addr) = comp.ret_addr() {
+      CoroutineState::Complete(unsafe { ret_addr.cast::<R>().read() })
+    } else {
+      CoroutineState::Yielded(())
+    }
+
+    /*#[cold]
+    unsafe fn handle_exception<R>(coro: &mut Coro<R>, res: unwind::Result<*mut ()>) -> ! {
+      debug_assert!(res.is_ok());
+      match unsafe { res.exception() } {
+        Exception::Panic(payload) => {
+          unsafe { arch::poison(&mut coro.cont_sp, coro.fn_ptr, panicked) };
+          unwind::resume(payload.into_box())
+        }
+        Exception::ForcedUnwind => unsafe { unreachable_unchecked() },
+      }
+    }
+
+    let prev_caller = CALLER.get();
+    let res = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr) };
+    CALLER.set(prev_caller);
+
+    if res.is_ok() {
+      let ret_addr = unsafe { res.ret_val() };
+      if ret_addr.is_null() {
+        CoroutineState::Yielded(())
+      } else {
+        // The computation finished. Copy the return value to the current
+        // stack, because the stack of the coroutine might be about to get
+        // dropped.
+        let ret_val = unsafe { ret_addr.cast::<R>().read() };
+        unsafe { arch::poison(&mut self.cont_sp, self.fn_ptr, finished) };
+        CoroutineState::Complete(ret_val)
+      }
+    } else {
+      unsafe { handle_exception(self, res) }
+    }*/
+
+    /*match res.map(NonNull::new) {
       Ok(None) => CoroutineState::Yielded(()),
       Ok(Some(ret_addr)) => {
         // The computation finished. Copy the return value to the current
@@ -356,7 +406,8 @@ impl<R> Coro<R> {
       }
       // Forced unwinds are always caught by `arch::force_unwind`.
       Err(Exception::ForcedUnwind) => unsafe { unreachable_unchecked() },
-    }
+    }*/
+
     /*// Push ourselves to the stack of active coroutines.
     let ctrl = self.control_mut();
     //ctrl.caller = ACTIVE.replace(ctrl);
@@ -435,11 +486,22 @@ where
   let f = unsafe { fn_ptr.cast().as_mut() };
   let f: F = unsafe { ManuallyDrop::take(f) };
 
-  let ret_val = ManuallyDrop::new(f());
-  let ret_val = NonNull::from_ref(&ret_val).cast();
+  #[repr(align(2))] // see `unwind::Result`.
+  struct RetVal<R>(R);
+
+  let mut ret_val = MaybeUninit::uninit();
+  let res = unwind::catch(|| {
+    let ret_val = ret_val.write(RetVal(f()));
+    NonNull::from_mut(ret_val).cast::<()>()
+  });
+
+  let poison_target = if res.is_ok() { finished } else { panicked };
+  let new_sp = unsafe { arch::poison(fn_ptr, poison_target) };
+  let comp = Completion::from(res);
+
   // The coroutine caller may have changed since its first resumption.
   let caller = unsafe { NonNull::new_unchecked(CALLER.get().cast_mut()) };
-  unsafe { arch::return_control(caller, ret_val) }
+  unsafe { arch::return_control(caller, new_sp, comp) }
 
   /*debug_assert_eq!(ACTIVE.get(), ptr::from_mut(ctrl));
   // SAFETY: `arch::transfer_control` passes the address of the control
@@ -538,8 +600,22 @@ unsafe fn drop_<R>(coro: &mut Coro<R>) -> DropReturn {
   if coro.has_started() {
     if coro.is_paused() {
       let prev_caller = CALLER.get();
-      unsafe { arch::force_unwind(coro.cont_sp, coro.fn_ptr) };
+      let comp = unsafe { arch::force_unwind(&mut coro.cont_sp, coro.fn_ptr) };
+      // let res = unwind::catch(|| unsafe { arch::force_unwind(coro.cont_sp, coro.fn_ptr) });
       CALLER.set(prev_caller);
+
+      if comp.is_ok() {
+        panic!("coroutine did not unwind");
+      }
+      comp.try_rethrow();
+      /*match unsafe { res.into_inner::<CatchResult<NonNull<()>>>() } {
+        Ok(_) => panic!("coroutine did not unwind"),
+        Err(Exception::ForcedUnwind) => {}
+        Err(Exception::Panic(payload)) => {
+          cold_path();
+          unwind::resume(payload);
+        }
+      }*/
     }
   } else {
     cold_path();

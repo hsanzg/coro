@@ -1,7 +1,9 @@
 use crate::stack::StackPtr;
+use crate::unwind::{Completion, Exception, Moved};
 use crate::{PoisonTarget, unwind};
 use core::arch::{asm, naked_asm};
 use core::hint::{cold_path, unlikely};
+use core::mem;
 use core::ptr::NonNull;
 
 // Byte offsets of various fields from the bottom of a coroutine stack.
@@ -34,9 +36,9 @@ unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
 }
 
 // #[inline(never)] // todo: https://github.com/rust-lang/rust/issues/161490
-pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
+pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> Completion {
+  let comp;
   let sus_sp;
-  let ret_addr;
   unsafe {
     asm!(
       // Preserve the contents of the reserved register `rbx`;
@@ -46,7 +48,8 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
       // coroutine stack, and jump to it. Note that `suspend_coro`
       // and `init_coro` read `rsi` in order to update the "caller
       // reference" at the bottom of the coroutine's stack.
-      "call [rdi]",
+      "call [rax]",
+      // todo: update comment about `rax`.
       // The coroutine has returned control to us. At this point `rsi`
       // contains the new stack pointer of the coroutine; and if it
       // finished via `return_control`, `rax` contains the address of
@@ -54,16 +57,15 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> *mut () {
       // is to restore the contents of `rbx`, since `rbp` was already
       // restored by `suspend_coro` or `return_control`.
       "pop rbx",
-      in("rdi") (*sp).as_ptr(),
+      inlateout("rax") (*sp).as_ptr() => comp,
       inlateout("rsi") caller_ref_loc(bot).as_ptr() => sus_sp,
-      lateout("rax") ret_addr,
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
       options(may_unwind),
     )
   };
   *sp = unsafe { NonNull::new_unchecked(sus_sp) };
-  ret_addr
+  unsafe { Completion::from_raw(comp) }
 }
 
 /*// Define the LSDA of the `init_coro` subroutine.
@@ -157,7 +159,7 @@ pub unsafe fn suspend_coro(caller: StackPtr) -> *const () {
       // Record the stack pointer of the caller program.
       "mov [rsi], rsp",
       // Switch to the coroutine stack.
-      "lea rsp, [rdi + 8]", // skip resumption program address.
+      "lea rsp, [rax + 8]", // skip resumption program address.
       // Restore the contents of the reserved registers.
       "pop rbp",
       "pop rbx",
@@ -172,72 +174,68 @@ pub unsafe fn suspend_coro(caller: StackPtr) -> *const () {
   new_caller.as_ptr()
 }
 
-pub unsafe fn return_control(caller: StackPtr, ret_val: NonNull<()>) -> ! {
+pub unsafe fn return_control(caller: StackPtr, final_sp: StackPtr, comp: Completion) -> ! {
   unsafe {
     asm!(
       // Switch to the caller stack.
-      "mov rsi, rsp", // needed by `resume_coro`.
       "mov rsp, rdi",
       // Restore the previous contents of `rbp`.
       "pop rbp",
       // Return control to `resume_coro`.
       "ret",
       in("rdi") caller.as_ptr(),
-      in("rax") ret_val.as_ptr(),
+      in("rsi") final_sp.as_ptr(), // needed by `resume_coro`.
+      in("rax") comp.into_raw(), // ditto.
       options(noreturn)
     )
   }
 }
 
-pub unsafe fn force_unwind(sp: StackPtr, bot: StackPtr) {
-  let res = unwind::catch(move || {
-    let caller_ref = unsafe { caller_ref_loc(bot) };
-    unsafe {
-      asm!(
-        // Emulate the "resumption" part of `resume_coro`.
-        "push rbx",
-        "lea rax, [rip + 2f]",
-        "push rax",
-        // And the "resumption" part of `suspend_coro`.
-        "push rbp",
-        "mov [rsi], rsp",
-        // Switch to the coroutine stack.
-        "mov rsp, rdi",
-        "pop rax", // the previous resumption address.
-        "pop rbp",
-        "pop rbx",
-        // Begin the unwinding.
-        "push rax", // preserve the resumption address.
-        "jmp {start_unwind}",
-        // If the coroutine program catches the exception itself,
-        // `suspend_coro` will return control to the following
-        // section of code. Emulate the "suspension" part of
-        // `resume_coro`, i.e. those instructions after `call`.
-        "2:",
-        "pop rbx",
-        in("rdi") sp.as_ptr(),
-        in("rsi") caller_ref.as_ptr(),
-        clobber_abi("sysv64"),
-        lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
-        options(may_unwind),
-        start_unwind = sym crate::unwind::start_unwind,
-      )
-    };
-  });
-  match res {
-    Err(Exception::ForcedUnwind) => {}
-    Err(Exception::Panic(payload)) => {
-      cold_path();
-      unwind::resume(payload);
-    }
-    Ok(_) => panic!("coroutine did not unwind"),
-  }
+pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr) -> Completion {
+  let comp;
+  let final_sp;
+  unsafe {
+    asm!(
+      // Emulate the "resumption" part of `resume_coro`.
+      "push rbx",
+      "lea rbx, [rip + 2f]",
+      "push rbx",
+      // And the "resumption" part of `suspend_coro`.
+      "push rbp",
+      "mov [rsi], rsp",
+      // Switch to the coroutine stack.
+      "mov rsp, rax",
+      "pop rax", // the previous resumption address.
+      "pop rbp",
+      "pop rbx",
+      // Begin the unwinding.
+      "push rax", // preserve the resumption address.
+      "jmp {start_unwind}",
+      // todo: this is outdated; the coroutine trampoline always
+      //       catches the exception now.
+      // If the coroutine program catches the exception itself,
+      // `suspend_coro` will return control to the following
+      // section of code. Emulate the "suspension" part of
+      // `resume_coro`, i.e. those instructions after `call`.
+      "2:",
+      "pop rbx",
+      inlateout("rax") (*sp).as_ptr() => comp,
+      inlateout("rsi") caller_ref_loc(bot).as_ptr() => final_sp,
+      clobber_abi("sysv64"),
+      lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
+      options(may_unwind),
+      start_unwind = sym crate::unwind::start_unwind,
+    )
+  };
+  *sp = unsafe { NonNull::new_unchecked(final_sp) };
+  unsafe { Completion::from_raw(comp) }
 }
 
-pub unsafe fn poison(sp: &mut StackPtr, bot: StackPtr, target_fn: PoisonTarget) {
-  *sp = unsafe { prepare_stack(bot, crate::poison_trampoline as *const _) };
-  // Overwrite the regular target function of the coroutine.
+#[must_use]
+pub unsafe fn poison(bot: StackPtr, target_fn: PoisonTarget) -> StackPtr {
+  // Overwrite the original target function of the coroutine.
   unsafe { bot.cast().write(target_fn) };
+  unsafe { prepare_stack(bot, crate::poison_trampoline as *const _) }
 }
 
 pub unsafe fn poison_target(cont_sp: StackPtr) -> Option<PoisonTarget> {
@@ -884,7 +882,6 @@ fn valgrind_client_req(default: usize, args: &[usize; 6]) -> usize {
 
 #[cfg(feature = "valgrind")]
 use crate::stack::ValgrindStackId;
-use crate::unwind::{Exception, abort};
 
 #[cfg(feature = "valgrind")]
 pub fn valgrind_register_stack(start: *mut (), end: *mut ()) -> ValgrindStackId {

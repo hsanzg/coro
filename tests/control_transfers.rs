@@ -86,7 +86,6 @@ fn resume_via_trait_method() {
 }
 
 #[test]
-#[ignore] // todo: re-enable.
 fn many_control_transfers() {
   const COUNT: u32 = 100;
   let mut coro = new_coro(|| {
@@ -106,10 +105,9 @@ fn many_control_transfers() {
   assert!(!in_coro());
 }
 
-// todo: remove this or adapt; its purpose is to reproduce the failure observed
-//  in the benchmark.
 #[test]
 fn non_terminating_coro() {
+  // Used to reproduce a failure observed in the benchmarks.
   let mut coro = new_coro(|| {
     loop {
       suspend();

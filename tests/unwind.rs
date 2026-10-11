@@ -387,7 +387,6 @@ fn catch_unwind_of_inner_coro_within_coro() {
 struct SuspendOnDrop;
 impl Drop for SuspendOnDrop {
   fn drop(&mut self) {
-    println!("suspend from drop");
     suspend();
   }
 }

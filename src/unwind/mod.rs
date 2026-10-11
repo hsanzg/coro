@@ -201,7 +201,7 @@ unsafe impl PtrRepr for Exception {
   }
 }*/
 
-#[repr(transparent)]
+/*#[repr(transparent)]
 pub struct Moved(MaybeUninit<*mut ()>);
 
 impl Moved {
@@ -235,10 +235,10 @@ impl Moved {
       unsafe { self.0.assume_init().cast::<T>().read() }
     }
   }
-}
+}*/
 
-pub enum Exception {
-  ForcedUnwind,
+pub enum Unwind {
+  Forced,
   Panic(Box<dyn Any + Send + 'static>),
 }
 
@@ -404,25 +404,35 @@ impl Completion {
 
   #[cold]
   #[inline(never)]
-  pub fn try_rethrow(self) {
-    let this = ManuallyDrop::new(self);
-    if this.is_ok() {
-      return;
-    }
-    let ptr = this
+  unsafe fn rethrow(self) {
+    let ptr = ManuallyDrop::new(self)
       .0
       .map_addr(|a| a & !Self::UNWIND)
       .cast::<PanicPayload>();
     if !ptr.is_null() {
+      cold_path();
       let payload = *unsafe { Box::from_raw(ptr) };
       resume(payload);
     }
   }
 
+  pub fn try_rethrow(self) {
+    if !self.is_ok() {
+      unsafe { self.rethrow() };
+    }
+  }
+
+  #[inline]
   pub fn ret_addr(self) -> Option<StackPtr> {
     let ptr = self.0;
-    self.try_rethrow();
-    StackPtr::new(ptr)
+    if self.is_ok() {
+      let _ = ManuallyDrop::new(self);
+      StackPtr::new(ptr)
+    } else {
+      cold_path();
+      unsafe { self.rethrow() };
+      unsafe { unreachable_unchecked() };
+    }
   }
 
   /*fn panic_payload(&self) -> Option<NonNull<PanicPayload>> {
@@ -460,8 +470,8 @@ impl From<CatchResult<StackPtr>> for Completion {
         debug_assert_eq!(ret_addr.addr().get() & Self::UNWIND, 0);
         ret_addr.as_ptr()
       }
-      Err(Exception::ForcedUnwind) => ptr::without_provenance_mut(Self::UNWIND),
-      Err(Exception::Panic(payload)) => {
+      Err(Unwind::Forced) => ptr::without_provenance_mut(Self::UNWIND),
+      Err(Unwind::Panic(payload)) => {
         cold_path();
         const {
           assert!(align_of::<PanicPayload>() > Self::UNWIND);
@@ -477,7 +487,7 @@ impl From<CatchResult<StackPtr>> for Completion {
 impl Drop for Completion {
   fn drop(&mut self) {
     let ptr = self.0;
-    if ptr.addr() & Self::UNWIND != 0 {
+    if !self.is_ok() {
       let ptr = ptr.map_addr(|a| a & !Self::UNWIND).cast::<PanicPayload>();
       if !ptr.is_null() {
         drop(unsafe { Box::from_raw(ptr) });
@@ -486,13 +496,13 @@ impl Drop for Completion {
   }
 }
 
-pub type CatchResult<R> = Result<R, Exception>;
+pub type CatchResult<R> = Result<R, Unwind>;
 
 pub fn catch<F: FnOnce() -> R, R>(f: F) -> CatchResult<R> {
   union Data<F, T> {
     f: ManuallyDrop<F>,
     ok: ManuallyDrop<T>,
-    err: ManuallyDrop<Exception>,
+    err: ManuallyDrop<Unwind>,
   }
 
   let mut data = Data {
@@ -518,9 +528,9 @@ pub fn catch<F: FnOnce() -> R, R>(f: F) -> CatchResult<R> {
   #[rustc_nounwind]
   fn do_catch<F: FnOnce() -> T, T>(data: *mut Data<F, T>, payload: *mut u8) {
     let err = if unsafe { is_unwind_exception(payload) } {
-      Exception::ForcedUnwind
+      Unwind::Forced
     } else {
-      Exception::Panic(unsafe { __rust_panic_cleanup(payload) })
+      Unwind::Panic(unsafe { __rust_panic_cleanup(payload) })
     };
     unsafe { (*data).err = ManuallyDrop::new(err) };
   }

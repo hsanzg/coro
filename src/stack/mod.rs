@@ -3,7 +3,6 @@
 #[cfg_attr(unix, path = "unix.rs")]
 mod os;
 
-use core::alloc::Layout;
 use core::num::NonZero;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;

@@ -50,7 +50,7 @@
 #![feature(likely_unlikely)]
 #![feature(abort_immediate)]
 #![feature(ptr_metadata)] // todo: can we remove?
-#![cfg_attr(target_arch = "x86_64", feature(panic_unwind))]
+#![cfg_attr(all(panic = "unwind", target_arch = "x86_64"), feature(panic_unwind))]
 #![expect(
   internal_features,
   reason = "we unwind coroutine stacks by throwing a non-Rust exception type, and need `core::intrinsics::catch_unwind` to catch it"
@@ -58,10 +58,10 @@
 #![cfg_attr(all(test, feature = "stack_alloc"), feature(pointer_is_aligned_to))]
 #![no_std]
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(panic = "unwind", target_arch = "x86_64"))]
 extern crate unwind as uw;
 
-#[cfg(feature = "stack_alloc")] // todo: also if unwind.
+#[cfg(any(panic = "unwind", feature = "stack_alloc"))]
 extern crate alloc;
 
 mod arch;
@@ -510,9 +510,10 @@ unsafe fn drop_<R>(coro: &mut Coro<R>) -> DropReturn {
       CALLER.set(prev_caller);
 
       if comp.is_ok() {
-        // Some frame between the last suspension point and the
-        // trampoline caught the exception thrown to unwind the
-        // stack, and forgot to clean it up.
+        // Either (a) the coroutine suspended itself when being
+        // dropped; or (b) some frame between the last suspension
+        // point and the trampoline caught the exception thrown
+        // to unwind the stack, and forgot to clean it up.
         panic!("coroutine did not unwind");
       }
       // SAFETY: todo.

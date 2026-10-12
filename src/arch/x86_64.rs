@@ -27,10 +27,9 @@ unsafe fn initial_sp(bot: StackPtr) -> StackPtr {
 /// For convenience, the [initial stack pointer](initial_sp) of
 /// the coroutine is returned.
 pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) -> StackPtr {
-  // The `init_coro` subroutine obeys a custom calling convention
-  // where its *own* address appears at `rsp` immediately after the
-  // call.
-  // todo: improve wording.
+  // Ask `resume_coro` to call `init_coro` on the first resumption
+  // of the coroutine. Location `ip` also serves as the (invalid)
+  // return address slot for the stack frame of `init_coro`.
   let ip = unsafe { bot.byte_offset(INIT_SP_OFF).cast() };
   unsafe { ip.write(init_coro as *const ()) };
   // Write the address of the trampoline function immediately
@@ -42,7 +41,13 @@ pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) -> StackPtr {
   unsafe { initial_sp(bot) }
 }
 
-// todo: document.
+/// Returns the location of the "previous frame pointer" slot in
+/// the bottommost frame of the coroutine stack starting at `bot`.
+///
+/// When the coroutine is active, this location points to the top
+/// of the stack of its last caller. This allows unwinders that
+/// do not understand DWARF CFI instructions follow the System V
+/// ABI to walk from the coroutine's stack back to the caller's.
 unsafe fn prev_frame_ptr_loc(bot: StackPtr) -> NonNull<StackPtr> {
   unsafe { bot.byte_offset(PREV_FRAME_PTR_OFF) }.cast()
 }
@@ -111,16 +116,6 @@ pub unsafe extern "sysv64-unwind" fn init_coro(
     "mov [rsi], rsp",
     // - at the bottom of the coroutine stack.
     "mov [rdi], rsp",
-    // todo: put comment above.
-    // debuggers and profilers without DWARF CFI support can
-    // can walk from the coroutine's back to the caller's stack.
-    // the caller's frame pointer at the bottom
-    // of the coroutine's stack.
-
-    // The latter is required only to form a valid chain of
-    // frame pointers for debuggers that do not support DWARF
-    // CFI information; see `init_coro` for details.
-
     // Switch to the coroutine stack.
     "mov rsp, rdi", // skip initial resumption address.
     "mov rbp, rdi",

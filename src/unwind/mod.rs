@@ -492,6 +492,7 @@ impl Drop for Completion {
     if !self.is_ok() {
       let ptr = ptr.map_addr(|a| a & !Self::UNWIND).cast::<PanicPayload>();
       if !ptr.is_null() {
+        cold_path();
         drop(unsafe { Box::from_raw(ptr) });
       }
     }
@@ -532,6 +533,7 @@ pub fn catch<F: FnOnce() -> R, R>(f: F) -> CatchResult<R> {
     let err = if unsafe { is_unwind_exception(payload) } {
       Unwind::Forced
     } else {
+      cold_path();
       Unwind::Panic(unsafe { __rust_panic_cleanup(payload) })
     };
     unsafe { (*data).err = ManuallyDrop::new(err) };
@@ -543,14 +545,6 @@ pub fn catch<F: FnOnce() -> R, R>(f: F) -> CatchResult<R> {
     Err(ManuallyDrop::into_inner(unsafe { data.err }))
   }
 }
-
-// Coroutine returns a NonNull<()>.
-// In the case of a panic, we also need to return *const u8 for payload.
-// This last payload pointer is aligned. Tag the most significant bit to
-// indicate which variant of pointer?
-
-// In `force_unwind`, we normally return `()` but on panic we also
-// need a *const u8 for the payload.
 
 /*pub trait PtrRepr {
   // the returned pointer has its least significant bit unset.

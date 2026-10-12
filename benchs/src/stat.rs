@@ -33,5 +33,7 @@ fn call(c: &mut Criterion) {
   });
 }
 
+// todo: add `panic` and `paused_drop` benchmarks.
+
 criterion_group!(benchs, switch, call);
 criterion_main!(benchs);

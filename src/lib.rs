@@ -276,14 +276,15 @@ impl<R> Coro<R> {
     let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr, CALLER.as_ptr()) };
     CALLER.set(prev_caller);
 
-    if let Some(ret_addr) = comp.ret_addr() {
-      // The computation finished. Copy the return value to the current
-      // stack, because the stack of the coroutine might be about to get
-      // dropped.
-      // SAFETY: todo.
-      CoroutineState::Complete(unsafe { ret_addr.cast::<R>().read() })
-    } else {
-      CoroutineState::Yielded(())
+    match comp.ret_addr() {
+      None => CoroutineState::Yielded(()),
+      Some(ret_addr) => {
+        // The computation finished. Copy the return value to the current
+        // stack, because the stack of the coroutine might be about to get
+        // dropped.
+        // SAFETY: todo.
+        CoroutineState::Complete(unsafe { ret_addr.cast::<R>().read() })
+      }
     }
   }
 

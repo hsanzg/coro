@@ -236,7 +236,6 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller
       inlateout("rax") (*sp).as_ptr() => comp,
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
-      options(may_unwind),
       start_unwind = sym crate::unwind::start_unwind,
     )
   };

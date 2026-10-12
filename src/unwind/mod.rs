@@ -402,6 +402,7 @@ impl Completion {
     ManuallyDrop::new(self).0.expose_provenance()
   }
 
+  #[inline(always)]
   pub unsafe fn from_raw(raw: usize) -> Self {
     Self(ptr::with_exposed_provenance_mut(raw))
   }

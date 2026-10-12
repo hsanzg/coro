@@ -1,6 +1,5 @@
 #![allow(non_camel_case_types)]
 
-use crate::stack::StackPtr;
 use crate::unwind::abort;
 use core::cell::Cell;
 use core::mem::MaybeUninit;
@@ -11,11 +10,8 @@ use uw::{_Unwind_Exception, _Unwind_Exception_Class, _Unwind_RaiseException, _Un
 /// and foreign exceptions.
 const CORO_UW: _Unwind_Exception_Class = u64::from_ne_bytes(*b"CORORUST");
 
-/// Unwinds the stack of a coroutine from its last suspension point,
-/// given a pointer `caller` to the top of its caller's stack.
-pub extern "sysv64-unwind" fn start_unwind(caller: StackPtr) -> ! {
-  crate::CALLER.set(caller.as_ptr());
-
+/// Unwinds the stack of the active coroutine.
+pub extern "sysv64-unwind" fn start_unwind() -> ! {
   // What follows is essentially a version of `uw::__rust_start_panic`
   // that avoids heap allocation; see https://github.com/rust-lang/rust/blob/main/library/panic_unwind/src/gcc.rs.
 

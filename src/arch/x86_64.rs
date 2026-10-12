@@ -1,6 +1,6 @@
-use crate::PoisonTarget;
 use crate::stack::StackPtr;
 use crate::unwind::Completion;
+use crate::{Caller, PoisonTarget};
 use core::arch::{asm, naked_asm};
 use core::hint::unlikely;
 use core::ptr::NonNull;
@@ -8,6 +8,7 @@ use core::ptr::NonNull;
 // Byte offsets of various fields from the bottom of a coroutine stack.
 const INIT_SP_OFF: isize = -8; // initial stack pointer.
 const CALLER_REF_OFF: isize = -16; // caller chain pointer.
+const PREV_FRAME_PTR_OFF: isize = -16; // link to last caller's frame.
 const TRAMP_PTR_OFF: isize = -24; // trampoline jump address.
 
 /// Returns the initial stack pointer of the coroutine whose stack
@@ -41,8 +42,9 @@ pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) -> StackPtr {
   unsafe { initial_sp(bot) }
 }
 
-unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
-  unsafe { bot.byte_offset(CALLER_REF_OFF) }
+// todo: document.
+unsafe fn prev_frame_ptr_loc(bot: StackPtr) -> NonNull<StackPtr> {
+  unsafe { bot.byte_offset(PREV_FRAME_PTR_OFF) }.cast()
 }
 
 /// Transfers control to the coroutine whose stack starts at `bot`,
@@ -51,9 +53,8 @@ unsafe fn caller_ref_loc(bot: StackPtr) -> NonNull<()> {
 /// coroutine transfers control back via [`suspend_coro`] or
 /// [`return_control`].
 #[inline(always)]
-pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> Completion {
-  let comp;
-  let sus_sp;
+pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller) -> Completion {
+  let (comp, sus_sp);
   unsafe {
     asm!(
       // Preserve the contents of the reserved register `rbx`;
@@ -61,19 +62,21 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> Completion {
       "push rbx",
       // Read the resumption program address from the top of the
       // coroutine stack, and jump to it. Note that `suspend_coro`
-      // and `init_coro` read `rsi` in order to update the "caller
-      // reference" at the bottom of the coroutine's stack.
+      // and `init_coro` read `rdi` and `rsi` in order to update
+      // the thread-local `caller`, and to store a pointer to the
+      // caller's frame at the bottom of the coroutine's stack.
       "call [rax]",
       // The coroutine has returned control to us. At this point `rsi`
-      // contains the new stack pointer of the coroutine, and `rax` is
+      // contains the new stack pointer of the coroutine; and `rax` is
       // the tagged pointer that tells whether the coroutine finished
       // completely or not, and if its stack was unwound forcibly or
       // due to a panic. All that remains is to restore the contents
       // of `rbx`, since `rbp` was already restored by `suspend_coro`
       // or `return_control`.
       "pop rbx",
+      in("rdi") prev_frame_ptr_loc(bot).as_ptr(),
+      inlateout("rsi") caller => sus_sp,
       inlateout("rax") (*sp).as_ptr() => comp,
-      inlateout("rsi") caller_ref_loc(bot).as_ptr() => sus_sp,
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
       options(may_unwind),
@@ -88,8 +91,10 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr) -> Completion {
 ///
 /// See [`crate::trampoline`] for some ABI-related considerations.
 #[unsafe(naked)]
-pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: StackPtr) -> ! {
-  // Invariant: `_init_sp - INIT_SP_OFF == _caller_ref - CALLER_REF_OFF`.
+pub unsafe extern "sysv64-unwind" fn init_coro(
+  _prev_frame_ptr: StackPtr,
+  _caller: &mut Caller,
+) -> ! {
   naked_asm!(
     ".cfi_startproc simple",
     // Place this frame on the caller's stack.
@@ -99,18 +104,28 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
     ".cfi_offset rip, -16",
     ".cfi_offset rbp, -24",
     // Preserve the contents of `rbp`. After this step, the top of
-    // the caller stack has a valid frame to which we will soon link.
+    // the caller stack has a valid frame to which we will link next.
     "push rbp",
-    // Record the stack pointer of the caller program at the bottom
-    // of the coroutine stack.
+    // Record the stack pointer of the caller program
+    // - in the thread-local `caller` variable; and
     "mov [rsi], rsp",
-    // Prepare the first argument for the trampoline.
-    "mov rdi, rsp",
+    // - at the bottom of the coroutine stack.
+    "mov [rdi], rsp",
+    // todo: put comment above.
+    // debuggers and profilers without DWARF CFI support can
+    // can walk from the coroutine's back to the caller's stack.
+    // the caller's frame pointer at the bottom
+    // of the coroutine's stack.
+
+    // The latter is required only to form a valid chain of
+    // frame pointers for debuggers that do not support DWARF
+    // CFI information; see `init_coro` for details.
+
     // Switch to the coroutine stack.
-    "mov rsp, rsi", // skip initial resumption address.
-    "mov rbp, rsi",
-    // Prepare the second argument for the trampoline.
-    "add rsi, {fn_off}",
+    "mov rsp, rdi", // skip initial resumption address.
+    "mov rbp, rdi",
+    // Prepare the argument for the trampoline.
+    "add rdi, {fn_off}",
     // Bounce into the architecture-independent trampoline.
     // The stack pointer is properly aligned for a `sysv64` call,
     // since `rsp - CALLER_REF_OFFSET` (the bottom of the stack)
@@ -118,7 +133,7 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
     "call [rsp + {tramp_off}]",
     "ud2",
     ".cfi_endproc",
-    // These two offsets are relative to `caller_ref`.
+    // These two offsets are relative to `_prev_frame_ptr`.
     fn_off = const -CALLER_REF_OFF,
     tramp_off = const TRAMP_PTR_OFF - CALLER_REF_OFF,
   )
@@ -126,10 +141,8 @@ pub unsafe extern "sysv64-unwind" fn init_coro(_init_sp: StackPtr, _caller_ref: 
 
 /// Jumps to the instruction immediately after the [`resume_coro`]
 /// call that last activated the current coroutine.
-#[must_use]
 #[inline(always)]
-pub unsafe fn suspend_coro(caller: StackPtr) -> *const () {
-  let new_caller: *const ();
+pub unsafe fn suspend_coro(caller: Caller) {
   unsafe {
     asm!(
       // Preserve the contents of the reserved registers on the
@@ -154,19 +167,18 @@ pub unsafe fn suspend_coro(caller: StackPtr) -> *const () {
       "push rbp",
       // Record the stack pointer of the caller program.
       "mov [rsi], rsp",
-      "mov rdi, rsp",
+      "mov [rdi], rsp",
       // Switch to the coroutine stack.
       "lea rsp, [rax + 8]", // skip resumption program address.
       // Restore the contents of the reserved registers.
       "pop rbp",
       "pop rbx",
-      inlateout("rdi") caller.as_ptr() => new_caller,
+      in("rdi") caller,
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
       options(may_unwind),
     )
   };
-  new_caller
 }
 
 /// A variant of [`suspend_coro`] for the case when the current
@@ -198,9 +210,8 @@ pub unsafe fn return_control(caller: StackPtr, final_sp: StackPtr, comp: Complet
 ///
 /// [paused]: crate::Coro::is_paused
 /// [poisoned]: poison
-pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr) -> Completion {
-  let comp;
-  let final_sp;
+pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller) -> Completion {
+  let (comp, final_sp);
   unsafe {
     asm!(
       // Emulate the "resumption" part of `resume_coro`.
@@ -210,8 +221,7 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr) -> Completion {
       // And the "resumption" part of `suspend_coro`.
       "push rbp",
       "mov [rsi], rsp",
-      // Prepare the argument for `start_unwind`.
-      "mov rdi, rsp",
+      "mov [rdi], rsp",
       // Switch to the coroutine stack.
       "mov rsp, rax",
       "pop rax", // the previous resumption address.
@@ -226,8 +236,9 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr) -> Completion {
       // i.e. those instructions after the resumption `call`.
       "2:",
       "pop rbx",
+      in("rdi") prev_frame_ptr_loc(bot).as_ptr(),
+      inlateout("rsi") caller => final_sp,
       inlateout("rax") (*sp).as_ptr() => comp,
-      inlateout("rsi") caller_ref_loc(bot).as_ptr() => final_sp,
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
       options(may_unwind),

@@ -81,10 +81,12 @@ use core::ptr::NonNull;
 #[allow(unused_imports)] // false positive depending on platform.
 use coro_macros::abi;
 
+type Caller = *const ();
+
 /// The stack pointer of the program that last resumed the currently
 /// active coroutine, or null if no coroutine is active.
 #[thread_local]
-static CALLER: Cell<*const ()> = Cell::new(ptr::null_mut());
+static CALLER: Cell<Caller> = Cell::new(ptr::null());
 
 /// Returns whether this subroutine is being called from
 /// within a [coroutine](Coro) or the main program.
@@ -269,10 +271,11 @@ impl<R> Coro<R> {
   /// [normally]: Self::has_finished
   /// [panicking]: Self::has_panicked
   pub fn resume(&mut self) -> CoroutineState<(), R> {
-    let prev_caller = CALLER.get();
+    let caller = CALLER.as_ptr();
+    let prev_caller = unsafe { *caller };
     // SAFETY: The coroutine has exclusive access to its stack at this point.
-    let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr) };
-    CALLER.set(prev_caller);
+    let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr, caller) };
+    unsafe { *caller = prev_caller };
 
     if let Some(ret_addr) = comp.ret_addr() {
       // The computation finished. Copy the return value to the current
@@ -283,87 +286,6 @@ impl<R> Coro<R> {
     } else {
       CoroutineState::Yielded(())
     }
-
-    /*#[cold]
-    unsafe fn handle_exception<R>(coro: &mut Coro<R>, res: unwind::Result<*mut ()>) -> ! {
-      debug_assert!(res.is_ok());
-      match unsafe { res.exception() } {
-        Exception::Panic(payload) => {
-          unsafe { arch::poison(&mut coro.cont_sp, coro.fn_ptr, panicked) };
-          unwind::resume(payload.into_box())
-        }
-        Exception::ForcedUnwind => unsafe { unreachable_unchecked() },
-      }
-    }
-
-    let prev_caller = CALLER.get();
-    let res = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr) };
-    CALLER.set(prev_caller);
-
-    if res.is_ok() {
-      let ret_addr = unsafe { res.ret_val() };
-      if ret_addr.is_null() {
-        CoroutineState::Yielded(())
-      } else {
-        // The computation finished. Copy the return value to the current
-        // stack, because the stack of the coroutine might be about to get
-        // dropped.
-        let ret_val = unsafe { ret_addr.cast::<R>().read() };
-        unsafe { arch::poison(&mut self.cont_sp, self.fn_ptr, finished) };
-        CoroutineState::Complete(ret_val)
-      }
-    } else {
-      unsafe { handle_exception(self, res) }
-    }*/
-
-    /*match res.map(NonNull::new) {
-      Ok(None) => CoroutineState::Yielded(()),
-      Ok(Some(ret_addr)) => {
-        // The computation finished. Copy the return value to the current
-        // stack, because the stack of the coroutine might be about to get
-        // dropped.
-        let ret_val = unsafe { ret_addr.cast::<R>().read() };
-        unsafe { arch::poison(&mut self.cont_sp, self.fn_ptr, finished) };
-        CoroutineState::Complete(ret_val)
-      }
-      Err(Exception::Panic(payload)) => {
-        cold_path();
-        unsafe { arch::poison(&mut self.cont_sp, self.fn_ptr, panicked) };
-        unwind::resume(payload);
-      }
-      // Forced unwinds are always caught by `arch::force_unwind`.
-      Err(Exception::ForcedUnwind) => unsafe { unreachable_unchecked() },
-    }*/
-
-    /*// Push ourselves to the stack of active coroutines.
-    let ctrl = self.control_mut();
-    //ctrl.caller = ACTIVE.replace(ctrl);
-    extern crate std;
-    std::println!(
-      "resume: set active to {:?}, with caller {:?}",
-      ptr::from_mut(ctrl),
-      ctrl.caller
-    );
-    let act_parent = ActivateOnDrop(ACTIVE.replace(ctrl));
-    // SAFETY: The coroutine has exclusive access to its stack at this point.
-    unsafe { arch::resume_coro(ctrl) };
-    drop(act_parent);
-    // The coroutine's computation has transferred control back.
-    if ctrl.ret_val.is_null() {
-      CoroutineState::Yielded(())
-    } else {
-      // The computation finished. Copy the return value to the current stack,
-      // because the stack of the coroutine might be about to get dropped.
-      // let ret_val_addr = NonNull::new(ctrl.ret_val).unwrap().cast();
-      // SAFETY: The `trampoline` function links the `stack_ptr` control field
-      //         to the return value of the coroutine, which was declared to be
-      //         of type `ManuallyDrop<R>` and was _not_ manually dropped. Thus
-      //         it is valid to read the value from `ret_val_addr` once, even
-      //         after the coroutine terminates.
-      let ret_val = unsafe { ctrl.ret_val.cast::<R>().read() };
-      unsafe { arch::poison(self.control_mut(), finished) };
-      CoroutineState::Complete(ret_val)
-    }*/
   }
 
   /// Consumes the (suspended) coroutine, and returns its program stack.
@@ -396,12 +318,10 @@ impl<R> Coroutine for Coro<R> {
 // Note that `arch::resume_coro` expects this function to follow the
 // System V ABI on all x86-64 systems, including those running Windows.
 #[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
-extern "C-unwind" fn trampoline<R, F>(caller: *const (), fn_ptr: NonNull<()>) -> !
+extern "C-unwind" fn trampoline<R, F>(fn_ptr: NonNull<()>) -> !
 where
   F: FnOnce() -> R + Unpin,
 {
-  CALLER.set(caller);
-
   // SAFETY: `arch::resume_coro` passes the address of the target
   //  function at the bottom of the stack of a coroutine. We have
   //  exclusive access to the stack, so it is sound to convert `fn_ptr`
@@ -452,21 +372,21 @@ where
 /// This function panics if it is called from outside a coroutine.
 #[inline(always)]
 pub fn suspend() {
-  let Some(caller) = NonNull::new(CALLER.get().cast_mut()) else {
+  let caller = CALLER.get();
+  if caller.is_null() {
     #[cold]
     #[inline(never)]
     fn suspend_from_outside() -> ! {
       panic!("cannot suspend from outside a coroutine")
     }
     suspend_from_outside();
-  };
-  CALLER.set(unsafe { arch::suspend_coro(caller) });
+  }
+  unsafe { arch::suspend_coro(caller) };
 }
 
 #[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
 #[allow(improper_ctypes_definitions, reason = "written and read from Rust")]
-extern "C-unwind" fn poison_trampoline(caller: *const (), target_loc: NonNull<PoisonTarget>) -> ! {
-  CALLER.set(caller);
+extern "C-unwind" fn poison_trampoline(target_loc: NonNull<PoisonTarget>) -> ! {
   (unsafe { target_loc.read() })();
 }
 
@@ -504,10 +424,11 @@ unsafe fn drop_<R>(coro: &mut Coro<R>) -> DropReturn {
   if coro.has_started() {
     if coro.is_paused() {
       // The coroutine was left in progress; unwind its stack manually.
-      let prev_caller = CALLER.get();
+      let caller = CALLER.as_ptr();
+      let prev_caller = unsafe { *caller };
       // SAFETY: We just tested that the coroutine is paused.
-      let comp = unsafe { arch::force_unwind(&mut coro.cont_sp, coro.fn_ptr) };
-      CALLER.set(prev_caller);
+      let comp = unsafe { arch::force_unwind(&mut coro.cont_sp, coro.fn_ptr, caller) };
+      unsafe { *caller = prev_caller };
 
       if comp.is_ok() {
         // Either (a) the coroutine suspended itself when being

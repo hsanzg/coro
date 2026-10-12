@@ -271,11 +271,10 @@ impl<R> Coro<R> {
   /// [normally]: Self::has_finished
   /// [panicking]: Self::has_panicked
   pub fn resume(&mut self) -> CoroutineState<(), R> {
-    let caller = CALLER.as_ptr();
-    let prev_caller = unsafe { *caller };
+    let prev_caller = CALLER.get();
     // SAFETY: The coroutine has exclusive access to its stack at this point.
-    let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr, caller) };
-    unsafe { *caller = prev_caller };
+    let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr, CALLER.as_ptr()) };
+    CALLER.set(prev_caller);
 
     if let Some(ret_addr) = comp.ret_addr() {
       // The computation finished. Copy the return value to the current
@@ -424,11 +423,10 @@ unsafe fn drop_<R>(coro: &mut Coro<R>) -> DropReturn {
   if coro.has_started() {
     if coro.is_paused() {
       // The coroutine was left in progress; unwind its stack manually.
-      let caller = CALLER.as_ptr();
-      let prev_caller = unsafe { *caller };
+      let prev_caller = CALLER.get();
       // SAFETY: We just tested that the coroutine is paused.
-      let comp = unsafe { arch::force_unwind(&mut coro.cont_sp, coro.fn_ptr, caller) };
-      unsafe { *caller = prev_caller };
+      let comp = unsafe { arch::force_unwind(&mut coro.cont_sp, coro.fn_ptr, CALLER.as_ptr()) };
+      CALLER.set(prev_caller);
 
       if comp.is_ok() {
         // Either (a) the coroutine suspended itself when being

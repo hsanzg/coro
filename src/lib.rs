@@ -276,15 +276,18 @@ impl<R> Coro<R> {
     let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr, CALLER.as_ptr()) };
     CALLER.set(prev_caller);
 
-    match comp.ret_addr() {
-      None => CoroutineState::Yielded(()),
-      Some(ret_addr) => {
-        // The computation finished. Copy the return value to the current
-        // stack, because the stack of the coroutine might be about to get
-        // dropped.
-        // SAFETY: todo.
-        CoroutineState::Complete(unsafe { ret_addr.cast::<R>().read() })
-      }
+    if comp.is_suspended() {
+      core::mem::forget(comp); // no panic payload to destroy.
+      CoroutineState::Yielded(())
+    } else {
+      // Read the return address of the coroutine program,
+      // or resume unwinding if the coroutine panicked.
+      let ret_addr = comp.ret_addr().cast::<R>();
+      // The computation finished normally. Copy the return value to
+      // the current stack, because the stack of the coroutine might
+      // be about to get dropped.
+      // SAFETY: todo.
+      CoroutineState::Complete(unsafe { ret_addr.read() })
     }
   }
 
@@ -437,7 +440,7 @@ unsafe fn drop_<R>(coro: &mut Coro<R>) -> DropReturn {
         panic!("coroutine did not unwind");
       }
       // SAFETY: todo.
-      unsafe { comp.rethrow() };
+      unsafe { comp.maybe_rethrow() };
     }
   } else {
     // The coroutine was never activated, so `self.func`

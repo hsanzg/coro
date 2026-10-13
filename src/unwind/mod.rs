@@ -411,9 +411,17 @@ impl Completion {
     self.0.addr() & Self::UNWIND == 0
   }
 
+  pub fn is_suspended(&self) -> bool {
+    self.0.is_null()
+  }
+
+  /// # Safety
+  ///
+  /// Assumes that `self.is_ok()` is `false`.
   #[cold]
   #[inline(never)]
-  pub unsafe fn rethrow(self) {
+  pub unsafe fn maybe_rethrow(self) {
+    debug_assert!(!self.is_ok());
     let ptr = ManuallyDrop::new(self)
       .0
       .map_addr(|a| a & !Self::UNWIND)
@@ -426,14 +434,14 @@ impl Completion {
   }
 
   #[inline]
-  pub fn ret_addr(self) -> Option<StackPtr> {
+  pub fn ret_addr(self) -> *mut () {
     let ptr = self.0;
     if self.is_ok() {
       core::mem::forget(self);
-      StackPtr::new(ptr)
+      ptr
     } else {
       cold_path();
-      unsafe { self.rethrow() };
+      unsafe { self.maybe_rethrow() };
       unsafe { unreachable_unchecked() };
     }
   }

@@ -52,6 +52,13 @@ unsafe fn prev_frame_ptr_loc(bot: StackPtr) -> NonNull<StackPtr> {
   unsafe { bot.byte_offset(PREV_FRAME_PTR_OFF) }.cast()
 }
 
+/// The distance from a stack pointer value stored in the
+/// thread-local variable `crate::CALLER` to the [CFA] of
+/// the frame containing it, in bytes.
+///
+/// [CFA]: https://www.imperialviolet.org/2017/01/18/cfi.html
+const CALLER_CFA_OFFSET: isize = 24;
+
 /// Transfers control to the coroutine whose stack starts at `bot`,
 /// resuming it where it was last suspended (or starting it, if it
 /// has not yet begun execution). This subroutine returns once the
@@ -62,14 +69,21 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller)
   let (comp, sus_sp);
   unsafe {
     asm!(
+      // Record the value that the stack pointer will have immediately
+      // before `init_coro` or `suspend_coro` switch to the coroutine
+      // stack. The latter subroutine restores the stack pointer to
+      // this value before returning control to us.
+      "lea rdx, [rsp - {caller_cfa_off}]",
+      "mov [rsi], rdx",
+      // To keep the chain of frame pointers valid, store that same
+      // value at the bottom of the coroutine stack; see `init_coro`.
+      "mov [rdi], rdx",
       // Preserve the contents of the reserved register `rbx`;
       // `init_coro` and `suspend_coro` take care of the rest.
       "push rbx",
       // Read the resumption program address from the top of the
-      // coroutine stack, and jump to it. Note that `suspend_coro`
-      // and `init_coro` read `rdi` and `rsi` in order to update
-      // the thread-local `caller`, and to store a pointer to the
-      // caller's frame at the bottom of the coroutine's stack.
+      // coroutine stack, and jump to it. Note that `init_coro`
+      // uses `rdi` to locate the bottom of the coroutine stack.
       "call [rax]",
       // The coroutine has returned control to us. At this point `rsi`
       // contains the new stack pointer of the coroutine; and `rax` is
@@ -85,6 +99,7 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller)
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
       options(may_unwind),
+      caller_cfa_off = const CALLER_CFA_OFFSET,
     )
   };
   *sp = unsafe { NonNull::new_unchecked(sus_sp) };
@@ -96,26 +111,20 @@ pub unsafe fn resume_coro(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller)
 ///
 /// See [`crate::trampoline`] for some ABI-related considerations.
 #[unsafe(naked)]
-pub unsafe extern "sysv64-unwind" fn init_coro(
-  _prev_frame_ptr: StackPtr,
-  _caller: &mut Caller,
-) -> ! {
+pub unsafe extern "sysv64-unwind" fn init_coro(_prev_frame_ptr: StackPtr) -> ! {
   naked_asm!(
     ".cfi_startproc simple",
     // Place this frame on the caller's stack.
     // DW_CFA_def_cfa_expression DW_FORM_exprloc(len=5, DW_OP_breg6/rbp 0 DW_OP_deref DW_OP_plus_uconst 24)
-    ".cfi_escape 0x0f, 5, 0x76, 0, 0x06, 0x23, 24",
+    ".cfi_escape 0x0f, 5, 0x76, 0, 0x06, 0x23, {caller_cfa_off}",
     ".cfi_offset rbx, -8",
     ".cfi_offset rip, -16",
     ".cfi_offset rbp, -24",
     // Preserve the contents of `rbp`. After this step, the top of
-    // the caller stack has a valid frame to which we will link next.
+    // the caller stack contains a valid frame. The `resume_coro`
+    // subroutine modified the thread-local `caller` variable so
+    // that a future call to `suspend_coro` goes back to this frame.
     "push rbp",
-    // Record the stack pointer of the caller program
-    // - in the thread-local `caller` variable; and
-    "mov [rsi], rsp",
-    // - at the bottom of the coroutine stack.
-    "mov [rdi], rsp",
     // Switch to the coroutine stack.
     "mov rsp, rdi", // skip initial resumption address.
     "mov rbp, rdi",
@@ -128,6 +137,7 @@ pub unsafe extern "sysv64-unwind" fn init_coro(
     "call [rsp + {tramp_off}]",
     "ud2",
     ".cfi_endproc",
+    caller_cfa_off = const CALLER_CFA_OFFSET,
     // These two offsets are relative to `_prev_frame_ptr`.
     fn_off = const -CALLER_REF_OFF,
     tramp_off = const TRAMP_PTR_OFF - CALLER_REF_OFF,
@@ -160,9 +170,6 @@ pub unsafe fn suspend_coro(caller: Caller) {
       "2:",
       // Preserve the caller's `rbp` value.
       "push rbp",
-      // Record the stack pointer of the caller program.
-      "mov [rsi], rsp",
-      "mov [rdi], rsp",
       // Switch to the coroutine stack.
       "lea rsp, [rax + 8]", // skip resumption program address.
       // Restore the contents of the reserved registers.
@@ -191,7 +198,7 @@ pub unsafe fn return_control(caller: StackPtr, final_sp: StackPtr, comp: Complet
       in("rdi") caller.as_ptr(),
       in("rsi") final_sp.as_ptr(), // needed by `resume_coro`.
       in("rax") comp.into_raw(), // ditto.
-      options(noreturn)
+      options(noreturn),
     )
   }
 }
@@ -210,14 +217,14 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller
   unsafe {
     asm!(
       // Emulate the "resumption" part of `resume_coro`.
+      "lea rdx, [rsp - {caller_cfa_off}]",
+      "mov [rsi], rdx",
+      "mov [rdi], rdx",
       "push rbx",
       "lea rbx, [rip + 2f]",
       "push rbx",
       // And the "resumption" part of `suspend_coro`.
       "push rbp",
-      "mov [rsi], rsp",
-      "mov [rdi], rsp",
-      // Switch to the coroutine stack.
       "mov rsp, rax",
       "pop rax", // the previous resumption address.
       "pop rbp",
@@ -236,6 +243,7 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller
       inlateout("rax") (*sp).as_ptr() => comp,
       clobber_abi("sysv64"),
       lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
+      caller_cfa_off = const CALLER_CFA_OFFSET,
       start_unwind = sym crate::unwind::start_unwind,
     )
   };

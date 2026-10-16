@@ -118,8 +118,11 @@ pub struct Coro<R> {
   ///   unwound (forcibly or because of a panic), the pointer returned
   ///   by [`arch::poison`].
   cont_sp: StackPtr,
-  /// The bottom of the stack.
+  /// The bottom of the stack, as returned by after pushing the coroutine function to the stack.
   stack_bot: StackPtr,
+  /// A type-erased pointer to a generic function for destroying
+  /// the coroutine function given `stack_bot`, provided that
+  /// the coroutine has not started execution.
   /// calling this function does not require external knowledge about
   /// the type of the function, only its location in memory.
   drop_fn: unsafe fn(StackPtr),

@@ -57,6 +57,18 @@ fn resume_after_panicking_panics() {
 }
 
 #[test]
+#[should_panic]
+fn double_resume_after_panicking_panics() {
+  let mut coro = new_coro(|| panic!());
+  let mut coro_ref = AssertUnwindSafe(&mut coro);
+  let _ = catch_unwind(move || coro_ref.resume());
+  let mut coro_ref = AssertUnwindSafe(&mut coro);
+  let _ = catch_unwind(move || coro_ref.resume());
+  assert!(!in_coro());
+  coro.resume();
+}
+
+#[test]
 fn resume_suspend_resume() {
   let mut coro = new_coro(|| {
     let ret = 456;

@@ -28,6 +28,11 @@ pub fn page_size() -> NonZeroUsize {
   unsafe { NonZeroUsize::new_unchecked(val) }
 }
 
+/// Reserves an area of at least `size` bytes of memory for use as
+/// the stack of a coroutine. In particular, the topmost page of
+/// this area (in the [direction of stack growth]) is protected.
+///
+/// [direction of stack growth]: GROWTH_DIR
 pub fn alloc_stack(size: NonZeroUsize) -> NonNull<()> {
   let page_size = page_size().get();
   assert!(

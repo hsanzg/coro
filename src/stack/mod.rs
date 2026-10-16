@@ -46,10 +46,8 @@ pub type StackPtr = NonNull<()>;
 /// of the stack, but we must be careful to consider it when doing
 /// size calculations.
 ///
-/// [`resume`]: crate::Coro::resume
-/// [`suspend`]: crate::suspend
 /// [coroutine]: crate::Coro
-/// [stack growth direction]: GROWTH_DIR
+/// [stack growth convention]: GROWTH_DIR
 /// [_guard page_]: https://devblogs.microsoft.com/oldnewthing/20220203-00/?p=106215
 pub struct Stack {
   base: NonNull<()>,

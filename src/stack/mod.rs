@@ -198,6 +198,9 @@ impl Drop for Stack {
   }
 }
 
+/// Stacks can be allocated and deallocated by different threads.
+unsafe impl Send for Stack {}
+
 /// Reserves space for an aligned `T` immediately [above] `sp`.
 ///
 /// More precisely, moves the stack pointer and returns an aligned
@@ -253,6 +256,18 @@ impl StackPool {
   }
 
   /// Reserves a program stack that can hold at least `min_size` bytes.
+  ///
+  /// # Example
+  ///
+  /// ```
+  /// use coro::stack::StackPool;
+  ///
+  /// let mut pool = StackPool::new();
+  /// let min_size = 1 << 13; // 8 kilobytes.
+  /// let stack = pool.take(min_size);
+  ///
+  /// assert!(stack.size().get() >= min_size);
+  /// ```
   #[must_use]
   pub fn take(&mut self, min_size: usize) -> Stack {
     self
@@ -271,6 +286,16 @@ impl StackPool {
   /// Returns a stack back to the pool of available storage.
   ///
   /// Note that this pool need not have allocated the given stack.
+  ///
+  /// # Example
+  ///
+  /// ```
+  /// use coro::stack::StackPool;
+  ///
+  /// let mut pool = StackPool::new();
+  /// let stack = pool.take(1);
+  /// pool.give(stack);
+  /// ```
   pub fn give(&mut self, stack: Stack) {
     self.0.push(stack);
   }
@@ -359,25 +384,5 @@ mod stack_tests {
     let ptr = unsafe { push::<u32>(&mut sp) };
     assert_eq!(offset(sp), if upwards { 8 } else { -8 });
     assert_eq!(offset(ptr.cast()), if upwards { 4 } else { -8 });
-  }
-}
-
-#[cfg(all(test, feature = "stack_alloc"))]
-mod pool_tests {
-  use super::*;
-
-  #[test]
-  fn take_from_pool() {
-    let mut pool = StackPool::new();
-    let min_size = 1 << 13;
-    let stack = pool.take(min_size);
-    assert!(stack.size.get() >= min_size);
-  }
-
-  #[test]
-  fn give_back_to_pool() {
-    let mut pool = StackPool::new();
-    let stack = pool.take(1);
-    pool.give(stack);
   }
 }

@@ -49,7 +49,6 @@
 #![feature(thread_local)]
 #![feature(likely_unlikely)]
 #![feature(abort_immediate)]
-#![feature(ptr_metadata)] // todo: can we remove?
 #![cfg_attr(all(panic = "unwind", target_arch = "x86_64"), feature(panic_unwind))]
 #![expect(
   internal_features,

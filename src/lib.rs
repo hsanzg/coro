@@ -139,7 +139,7 @@ pub struct Coro<R> {
   /// object of the coroutine. The subroutine is safe to call only
   /// if the coroutine has not and will never begin execution.
   ///
-  /// The subroutine itself is defined in [`Coro::with_stack`], which
+  /// The subroutine itself is always [`CoroFn::raw_drop`], which
   /// is generic over the function type `F`. Storing a pointer to it
   /// allows [`Coro`] to not depend on `F`, thus avoiding needless
   /// monomorphization. The disadvantage is that the size of each
@@ -178,7 +178,7 @@ impl<F: Unpin> CoroFn<F> {
   /// whose `stack_bot` field equals `bot`.
   ///
   /// [coroutine]: Coro
-  fn addr(bot: StackPtr) -> NonNull<F> {
+  fn addr(bot: StackPtr) -> NonNull<Self> {
     match stack::GROWTH_DIR {
       // SAFETY: The function object occupies all locations
       //  within the stack allocation immediately below `bot`,
@@ -234,11 +234,11 @@ impl<R> Coro<R> {
   pub fn with_stack<F: FnOnce() -> R + Unpin>(f: F, stack: Stack) -> Self {
     // Make a bitwise copy of `f` on the new stack, in order to pin
     // it to a fixed memory location. The actual stack contents will
-    // appear on top of this copy. See `coro_fn_ptr` for details.
+    // appear on top of this copy. See `CoroFn` for details.
     let mut bot = stack.bottom();
     let fn_ptr = stack.push(&mut bot);
+    // SAFETY: `Stack::push` returns a pointer valid for writes.
     unsafe {
-      // SAFETY: `Stack::push` returns a pointer valid for writes.
       fn_ptr.write(CoroFn {
         normal: ManuallyDrop::new(f),
       })
@@ -378,7 +378,7 @@ where
   //  calls `arch::resume_coro`, which borrows the `cont_sp` field
   //  of the `Coro` mutably and jumps to the trampoline from assembly
   //  code.
-  let f = unsafe { CoroFn::addr(bot).as_mut() };
+  let f = &mut unsafe { CoroFn::addr(bot).read().normal };
   // SAFETY: The destructor of `Coro` drops the `F` instance at
   //  `fn_ptr` only if the coroutine is never activated (that is,
   //  if this trampoline function is never invoked). And this

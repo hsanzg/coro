@@ -68,7 +68,7 @@ mod arch;
 pub mod stack;
 mod unwind;
 
-use crate::stack::{Stack, StackPtr};
+use crate::stack::{GrowthDir, Stack, StackPtr};
 use crate::unwind::{CatchResult, Completion};
 use core::cell::Cell;
 use core::hint::cold_path;
@@ -118,21 +118,25 @@ pub struct Coro<R> {
   ///   unwound (forcibly or because of a panic), the pointer returned
   ///   by [`arch::poison`].
   cont_sp: StackPtr,
-  ///
-  /// Type-erased pointer to the
-  ///
-  /// Importantly, this coincides with the bottom of the stack
-  /// in platforms where the stack grows downwards.
-  fn_ptr: NonNull<()>,
+  /// The bottom of the stack.
+  stack_bot: StackPtr,
   /// calling this function does not require external knowledge about
   /// the type of the function, only its location in memory.
-  drop_fn: unsafe fn(NonNull<()>),
+  drop_fn: unsafe fn(StackPtr),
   /// The program stack of the coroutine.
   stack: ManuallyDrop<Stack>,
   /// This object acts as though it points to the return value
   /// of the coroutine.
   // todo: talk about covariance.
   _phantom: PhantomData<*mut R>,
+}
+
+// todo: document.
+const fn fn_ptr<F>(bot: StackPtr) -> NonNull<F> {
+  match stack::GROWTH_DIR {
+    GrowthDir::Upwards => unsafe { bot.cast().sub(1) },
+    GrowthDir::Downwards => bot.cast(),
+  }
 }
 
 impl<R> Coro<R> {
@@ -184,20 +188,21 @@ impl<R> Coro<R> {
     // SAFETY: The stack is at least one page long, so it can definitely
     //  fit `f` without overflowing.
     // todo: actually check that this doesn't overflow.
-    let fn_ptr = unsafe { stack::push(&mut stack.bottom()) };
+    let mut bot = stack.bottom();
+    let fn_ptr = unsafe { stack::push(&mut bot) };
     unsafe {
       // SAFETY: `stack::push` returns a pointer valid for writes.
       fn_ptr.write(Fn {
         normal: ManuallyDrop::new(f),
       })
     };
-    unsafe fn drop_fn<F>(ptr: NonNull<()>) {
+
+    unsafe fn drop_fn<F>(bot: StackPtr) {
       // SAFETY: `drop_` is the only caller of this function,
-      //  and it promises that `ptr` is valid for dropping.
-      unsafe { ptr.cast::<F>().drop_in_place() };
+      //  and it promises that `fn_ptr` is valid for dropping.
+      unsafe { crate::fn_ptr::<F>(bot).drop_in_place() };
     }
 
-    let bot = fn_ptr.cast();
     Self {
       // Arrange things so that the coroutine begins its execution at
       // the first instruction of the trampoline function defined below.
@@ -205,7 +210,7 @@ impl<R> Coro<R> {
       // off a smaller trampoline before reaching `crate::trampoline` to
       // e.g. have good backtrace information.
       cont_sp: unsafe { arch::prepare_stack(bot, trampoline::<R, F> as *const _) },
-      fn_ptr: fn_ptr.cast(),
+      stack_bot: bot,
       drop_fn: drop_fn::<F>,
       stack: ManuallyDrop::new(stack),
       _phantom: PhantomData,
@@ -273,7 +278,7 @@ impl<R> Coro<R> {
   pub fn resume(&mut self) -> CoroutineState<(), R> {
     let prev_caller = CALLER.get();
     // SAFETY: The coroutine has exclusive access to its stack at this point.
-    let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.fn_ptr, CALLER.as_ptr()) };
+    let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.stack_bot, CALLER.as_ptr()) };
     CALLER.set(prev_caller);
 
     if comp.is_suspended() {
@@ -298,7 +303,7 @@ impl<R> Coro<R> {
   #[cfg(all(feature = "stack_alloc", not(feature = "common_pool")))]
   pub unsafe fn drop_and_take_stack(mut self) -> Stack {
     // SAFETY: We forget `self` immediately after calling `drop_`.
-    let stack = unsafe { drop_(&mut self) };
+    let stack = unsafe { self.inner_drop() };
     core::mem::forget(self);
     stack
   }
@@ -321,7 +326,7 @@ impl<R> Coroutine for Coro<R> {
 // Note that `arch::resume_coro` expects this function to follow the
 // System V ABI on all x86-64 systems, including those running Windows.
 #[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
-extern "C-unwind" fn trampoline<R, F>(fn_ptr: NonNull<()>) -> !
+extern "C-unwind" fn trampoline<R, F>(bot: NonNull<()>) -> !
 where
   F: FnOnce() -> R + Unpin,
 {
@@ -333,7 +338,7 @@ where
   //  calls `arch::resume_coro`, which borrows the `cont_sp` field
   //  of the `Coro` mutably and jumps to the trampoline from assembly
   //  code.
-  let f = unsafe { fn_ptr.cast().as_mut() };
+  let f = unsafe { fn_ptr(bot).as_mut() };
   // SAFETY: The destructor of `Coro` drops the `F` instance at
   //  `fn_ptr` only if the coroutine is never activated (that is,
   //  if this trampoline function is never invoked). And this
@@ -355,16 +360,16 @@ where
   // Variable `f` has been destroyed, because an `FnOnce` consumes
   // itself when executed.
 
-  unsafe fn return_control(res: CatchResult<NonNull<()>>, fn_ptr: NonNull<()>) -> ! {
+  unsafe fn return_control(res: CatchResult<NonNull<()>>, bot: NonNull<()>) -> ! {
     let poison_target = if res.is_ok() { finished } else { panicked };
-    let new_sp = unsafe { arch::poison(fn_ptr, poison_target) };
+    let new_sp = unsafe { arch::poison(bot, poison_target) };
     let comp = Completion::from(res);
 
     // The coroutine caller may have changed since its first resumption.
     let caller = unsafe { NonNull::new_unchecked(CALLER.get().cast_mut()) };
     unsafe { arch::return_control(caller, new_sp, comp) }
   }
-  unsafe { return_control(res, fn_ptr) };
+  unsafe { return_control(res, bot) };
 }
 
 /// Transfers control back to the program that last resumed the active
@@ -416,47 +421,50 @@ type DropReturn = cfg_select! {
   _ => (),
 };
 
-/// # Safety
-///
-/// This function is sound to call only once with the same coroutine.
-/// Such coroutine may not be used again, and that includes calling
-/// its destructor. Thus, the only safe way to proceed after calling
-/// `drop_(&mut coro)` is to do `core::mem::forget(coro)`.
-#[cfg_attr(feature = "common_pool", inline(always))]
-unsafe fn drop_<R>(coro: &mut Coro<R>) -> DropReturn {
-  if coro.has_started() {
-    if coro.is_paused() {
-      // The coroutine was left in progress; unwind its stack manually.
-      let prev_caller = CALLER.get();
-      // SAFETY: We just tested that the coroutine is paused.
-      let comp = unsafe { arch::force_unwind(&mut coro.cont_sp, coro.fn_ptr, CALLER.as_ptr()) };
-      CALLER.set(prev_caller);
+impl<R> Coro<R> {
+  /// # Safety
+  ///
+  /// This function is sound to call only once with the same coroutine.
+  /// Such coroutine may not be used again, and that includes calling
+  /// its destructor. Thus, the only safe way to proceed after calling
+  /// `drop_(&mut coro)` is to do `core::mem::forget(coro)`.
+  // #[cfg_attr(feature = "common_pool", inline(always))]
+  unsafe fn inner_drop(&mut self) -> DropReturn {
+    if self.has_started() {
+      if self.is_paused() {
+        // The coroutine was left in progress; unwind its stack manually.
+        let prev_caller = CALLER.get();
+        // SAFETY: We just tested that the coroutine is paused.
+        let comp =
+          unsafe { arch::force_unwind(&mut self.cont_sp, self.stack_bot, CALLER.as_ptr()) };
+        CALLER.set(prev_caller);
 
-      if comp.is_ok() {
-        // Either (a) the coroutine suspended itself when being
-        // dropped; or (b) some frame between the last suspension
-        // point and the trampoline caught the exception thrown
-        // to unwind the stack, and forgot to clean it up.
-        panic!("coroutine did not unwind");
+        if comp.is_ok() {
+          // Either (a) the coroutine suspended itself when being
+          // dropped; or (b) some frame between the last suspension
+          // point and the trampoline caught the exception thrown
+          // to unwind the stack, and forgot to clean it up.
+          panic!("coroutine did not unwind");
+        }
+        // SAFETY: todo.
+        unsafe { comp.maybe_rethrow() };
       }
-      // SAFETY: todo.
-      unsafe { comp.maybe_rethrow() };
+    } else {
+      // The coroutine was never activated, so `self.func`
+      // still holds the coroutine's program. Drop it now.
+      cold_path();
+      unsafe { (self.drop_fn)(self.stack_bot) };
     }
-  } else {
-    // The coroutine was never activated, so `self.func`
-    // still holds the coroutine's program. Drop it now.
-    cold_path();
-    unsafe { (coro.drop_fn)(coro.fn_ptr) };
-  }
-  // SAFETY: `self.stack` is not used again.
-  let stack = unsafe { ManuallyDrop::take(&mut coro.stack) };
-  cfg_select! {
-    feature = "common_pool" => {
-      // SAFETY: We have exclusive access to the thread-local pool.
-      unsafe { stack::borrow_common_pool(|pool| pool.give(stack)) };
+    // SAFETY: `self.stack` is not used again.
+    let stack = unsafe { ManuallyDrop::take(&mut self.stack) };
+    cfg_select! {
+      feature = "common_pool" => {
+        // SAFETY: We have exclusive access to the thread-local pool.
+        unsafe { stack::borrow_common_pool(|pool| pool.give(stack)) };
+      }
+      feature = "stack_alloc" => stack,
+      _ => {}
     }
-    feature = "stack_alloc" => stack,
-    _ => {}
   }
 }
 
@@ -469,6 +477,6 @@ impl<R> Drop for Coro<R> {
   fn drop(&mut self) {
     // SAFETY: This is the only exception to the rule, since we are
     // already inside `Coro`'s destructor.
-    unsafe { drop_(self) };
+    unsafe { self.inner_drop() };
   }
 }

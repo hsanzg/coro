@@ -45,6 +45,6 @@ pub extern "sysv64-unwind" fn start_unwind() -> ! {
 ///
 /// `ptr` must point to a valid [`_Unwind_Exception`].
 pub unsafe fn is_unwind_exception(ptr: *mut u8) -> bool {
-  let ex = ptr as *mut _Unwind_Exception;
+  let ex = ptr.cast::<_Unwind_Exception>();
   unsafe { (*ex).exception_class == CORO_UW }
 }

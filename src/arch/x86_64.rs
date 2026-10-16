@@ -291,6 +291,7 @@ pub unsafe fn poison_target(cont_sp: StackPtr) -> Option<PoisonTarget> {
 /// This is the architecture-specific part of [`Coro::has_started`].
 ///
 /// [`Coro::has_started`]: crate::Coro::has_started
+#[inline(always)]
 pub unsafe fn has_started(cont_sp: StackPtr) -> bool {
   // Either the instruction pointer has moved, or the coroutine is poisoned.
   let ip: *const () = unsafe { cont_sp.cast().read() };
@@ -306,19 +307,19 @@ pub unsafe fn has_started(cont_sp: StackPtr) -> bool {
 
 #[cfg(feature = "valgrind")]
 fn valgrind_client_req(default: usize, args: &[usize; 6]) -> usize {
-  let result: usize;
+  let res: usize;
   unsafe {
     asm!(
       "rol rdi, 3; rol rdi, 13",
       "rol rdi, 61; rol rdi, 51",
       "xchg rbx, rbx",
-      inlateout("rdx") default => result,
+      inlateout("rdx") default => res,
       in("rax") args,
       // The sum of the rotation offsets is 128, so
       // the original contents of `rdi` are left intact.
     )
   };
-  result
+  res
 }
 
 #[cfg(feature = "valgrind")]

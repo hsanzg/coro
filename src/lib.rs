@@ -87,8 +87,19 @@ type Caller = *const ();
 #[thread_local]
 static CALLER: Cell<Caller> = Cell::new(ptr::null());
 
-/// Returns whether this subroutine is being called from
-/// within a [coroutine](Coro) or the main program.
+/// Returns whether this subroutine is being called from within
+/// a [coroutine](Coro) or the main program.
+///
+/// # Example
+///
+/// ```
+/// use coro::{in_coro, Coro};
+///
+/// assert!(!in_coro());
+///
+/// let mut coro = Coro::new(|| assert!(in_coro()));
+/// coro.resume();
+/// ```
 pub fn in_coro() -> bool {
   !CALLER.get().is_null()
 }
@@ -117,37 +128,83 @@ pub struct Coro<R> {
   ///   unwound (forcibly or because of a panic), the pointer returned
   ///   by [`arch::poison`].
   cont_sp: StackPtr,
-  /// The bottom of the stack, as returned by after pushing the coroutine function to the stack.
+  /// The bottom location of the deepest stack frame of the coroutine's
+  /// program. For reasons given below, this frame appears immediately
+  /// above [a copy] of the coroutine's function object. It follows
+  /// that `stack_bot != stack.bottom()` in general.
+  ///
+  /// [a copy]: CoroFn
   stack_bot: StackPtr,
-  /// A type-erased pointer to a generic function for destroying
-  /// the coroutine function given `stack_bot`, provided that
-  /// the coroutine has not started execution.
-  /// calling this function does not require external knowledge about
-  /// the type of the function, only its location in memory.
+  /// A subroutine that, given `stack_bot`, destroys the function
+  /// object of the coroutine. The subroutine is safe to call only
+  /// if the coroutine has not and will never begin execution.
+  ///
+  /// The subroutine itself is defined in [`Coro::with_stack`], which
+  /// is generic over the function type `F`. Storing a pointer to it
+  /// allows [`Coro`] to not depend on `F`, thus avoiding needless
+  /// monomorphization. The disadvantage is that the size of each
+  /// coroutine increases by that of a pointer variable.
   drop_fn: unsafe fn(StackPtr),
   /// The program stack of the coroutine.
   stack: ManuallyDrop<Stack>,
-  /// This object acts as though it points to the return value
-  /// of the coroutine.
-  // todo: talk about covariance.
-  _phantom: PhantomData<*mut R>,
+  /// Make [`Coro`] covariant over its return type.
+  _phantom: PhantomData<fn() -> R>,
 }
 
-// todo: document.
-const fn fn_ptr<F>(bot: StackPtr) -> NonNull<F> {
-  match stack::GROWTH_DIR {
-    GrowthDir::Upwards => unsafe { bot.cast().sub(1) },
-    GrowthDir::Downwards => bot.cast(),
+/// A record at the bottom of a coroutine stack containing a copy
+/// of its function object or, if the coroutine has been poisoned,
+/// the address of its [new target].
+///
+/// For ergonomic reasons, [`Coro`] should ideally be [`Unpin`] so
+/// that it can be moved freely in memory. A coroutine program needs
+/// its function object to remain valid at the same memory location
+/// during its lifetime, so it cannot be stored in [`Coro`] itself.
+/// We instead copy the object to the bottom of the coroutine's stack,
+/// where its address is fixed. For this move to be sound, `F` must
+/// be [`Unpin`].
+///
+/// [new target]: Coro::poison_target
+#[repr(C)]
+// Make sure that the stack frame on top of this record is
+// 16-byte-aligned on x86-64, as the System V ABI dictates.
+#[cfg_attr(target_arch = "x86_64", repr(align(16)))]
+union CoroFn<F: Unpin> {
+  normal: ManuallyDrop<F>,
+  poison: PoisonTarget,
+}
+
+impl<F: Unpin> CoroFn<F> {
+  /// Returns a pointer to the function object of a [coroutine]
+  /// whose `stack_bot` field equals `bot`.
+  ///
+  /// [coroutine]: Coro
+  fn addr(bot: StackPtr) -> NonNull<F> {
+    match stack::GROWTH_DIR {
+      // SAFETY: The function object occupies all locations
+      //  within the stack allocation immediately below `bot`,
+      //  or so the caller says.
+      GrowthDir::Upwards => unsafe { bot.cast().sub(1) },
+      GrowthDir::Downwards => bot.cast(),
+    }
+  }
+
+  /// Destroys the function object of a [coroutine] whose
+  /// `stack_bot` field equals `bot`.
+  ///
+  /// # Safety
+  ///
+  /// This operation is safe to apply only to coroutines
+  /// that have never [started] execution and never will.
+  ///
+  /// [coroutine]: Coro
+  /// [started]: Coro::has_started
+  unsafe fn raw_drop(bot: StackPtr) {
+    // SAFETY: All conditions must be upheld by the caller.
+    unsafe { Self::addr(bot).drop_in_place() };
   }
 }
 
 impl<R> Coro<R> {
-  // It is important that the coroutine function object is not address-sensitive,
-  // because it needs to be moved to the coroutine's stack, and that is why we
-  // require its type `F` to implement `Unpin`. It follows that `Coro` is `Unpin`.
-  // Another way to say this: for ergonomic reasons, we would like `Coro` to be
-  // `Unpin`, i.e. not address-sensitive.
-
   /// Creates a new coroutine that is to execute the given [`FnOnce`]
   /// instance on a separate [stack] of size [`DEFAULT_STACK_SIZE`].
   ///
@@ -175,45 +232,27 @@ impl<R> Coro<R> {
   /// [`drop_and_take_stack`]: Self::drop_and_take_stack
   #[must_use = "method creates a coroutine but does not begin its execution"]
   pub fn with_stack<F: FnOnce() -> R + Unpin>(f: F, stack: Stack) -> Self {
-    #[repr(C)]
-    #[cfg_attr(target_arch = "x86_64", repr(align(16)))]
-    union Fn<F> {
-      normal: ManuallyDrop<F>,
-      poison: PoisonTarget,
-    }
-
-    assert!(size_of::<Fn<F>>() <= stack.size().get());
-
     // Make a bitwise copy of `f` on the new stack, in order to pin
-    // it to a fixed memory location. The actual stack contents appear
-    // on top of this copy.
-    // SAFETY: The stack is at least one page long, so it can definitely
-    //  fit `f` without overflowing.
-    // todo: actually check that this doesn't overflow.
+    // it to a fixed memory location. The actual stack contents will
+    // appear on top of this copy. See `coro_fn_ptr` for details.
     let mut bot = stack.bottom();
-    let fn_ptr = unsafe { stack::push(&mut bot) };
+    let fn_ptr = stack.push(&mut bot);
     unsafe {
-      // SAFETY: `stack::push` returns a pointer valid for writes.
-      fn_ptr.write(Fn {
+      // SAFETY: `Stack::push` returns a pointer valid for writes.
+      fn_ptr.write(CoroFn {
         normal: ManuallyDrop::new(f),
       })
     };
-
-    unsafe fn drop_fn<F>(bot: StackPtr) {
-      // SAFETY: `drop_` is the only caller of this function,
-      //  and it promises that `fn_ptr` is valid for dropping.
-      unsafe { crate::fn_ptr::<F>(bot).drop_in_place() };
-    }
 
     Self {
       // Arrange things so that the coroutine begins its execution at
       // the first instruction of the trampoline function defined below.
       // Actually, in some architectures the coroutine must first bounce
-      // off a smaller trampoline before reaching `crate::trampoline` to
-      // e.g. have good backtrace information.
+      // off a smaller trampoline before reaching `crate::trampoline` in
+      // order to support stack unwinding.
       cont_sp: unsafe { arch::prepare_stack(bot, trampoline::<R, F> as *const _) },
       stack_bot: bot,
-      drop_fn: drop_fn::<F>,
+      drop_fn: CoroFn::<F>::raw_drop,
       stack: ManuallyDrop::new(stack),
       _phantom: PhantomData,
     }
@@ -239,8 +278,9 @@ impl<R> Coro<R> {
   }
 
   /// Checks if the coroutine has completely finished its execution
-  /// without panicking. In that case, calling [`resume`] on the
-  /// coroutine will cause a panic.
+  /// without panicking.
+  ///
+  /// [`resume`]: Self::resume
   #[must_use]
   #[expect(
     unpredictable_function_pointer_comparisons,
@@ -251,11 +291,9 @@ impl<R> Coro<R> {
   }
 
   /// Checks if the coroutine has panicked via the [`panic!`] macro
-  /// or a similar standard library mechanism. In that case, calling
-  /// [`resume`] on the coroutine will cause a panic.
+  /// or a similar standard library mechanism.
   ///
   /// [`panic!`]: panic
-  /// [`resume`]: Self::resume
   #[must_use]
   #[expect(
     unpredictable_function_pointer_comparisons,
@@ -279,12 +317,12 @@ impl<R> Coro<R> {
   /// [panicking]: Self::has_panicked
   pub fn resume(&mut self) -> CoroutineState<(), R> {
     let prev_caller = CALLER.get();
-    // SAFETY: The coroutine has exclusive access to its stack at this point.
+    // SAFETY: The coroutine has exclusive access to its stack.
     let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.stack_bot, CALLER.as_ptr()) };
     CALLER.set(prev_caller);
 
     if comp.is_suspended() {
-      core::mem::forget(comp); // no panic payload to destroy.
+      core::mem::forget(comp); // there's no panic payload to destroy.
       CoroutineState::Yielded(())
     } else {
       // Read the return address of the coroutine program,
@@ -304,7 +342,7 @@ impl<R> Coro<R> {
   /// passed to [`Coro::with_stack`] to construct a new coroutine.
   #[cfg(all(feature = "stack_alloc", not(feature = "common_pool")))]
   pub unsafe fn drop_and_take_stack(mut self) -> Stack {
-    // SAFETY: We forget `self` immediately after calling `drop_`.
+    // SAFETY: We forget `self` immediately after calling `inner_drop`.
     let stack = unsafe { self.inner_drop() };
     core::mem::forget(self);
     stack
@@ -340,7 +378,7 @@ where
   //  calls `arch::resume_coro`, which borrows the `cont_sp` field
   //  of the `Coro` mutably and jumps to the trampoline from assembly
   //  code.
-  let f = unsafe { fn_ptr(bot).as_mut() };
+  let f = unsafe { CoroFn::addr(bot).as_mut() };
   // SAFETY: The destructor of `Coro` drops the `F` instance at
   //  `fn_ptr` only if the coroutine is never activated (that is,
   //  if this trampoline function is never invoked). And this
@@ -364,6 +402,8 @@ where
 
   unsafe fn return_control(res: CatchResult<NonNull<()>>, bot: NonNull<()>) -> ! {
     let poison_target = if res.is_ok() { finished } else { panicked };
+    // SAFETY: The coroutine was started, so it is safe to overwrite
+    //  its function object with the poison target address.
     let new_sp = unsafe { arch::poison(bot, poison_target) };
     let comp = Completion::from(res);
 
@@ -427,10 +467,9 @@ impl<R> Coro<R> {
   /// # Safety
   ///
   /// This function is sound to call only once with the same coroutine.
-  /// Such coroutine may not be used again, and that includes calling
+  /// Such a coroutine may not be used again, and that includes calling
   /// its destructor. Thus, the only safe way to proceed after calling
-  /// `drop_(&mut coro)` is to do `core::mem::forget(coro)`.
-  // #[cfg_attr(feature = "common_pool", inline(always))]
+  /// `coro.inner_drop()` is to do `core::mem::forget(coro)`.
   unsafe fn inner_drop(&mut self) -> DropReturn {
     if self.has_started() {
       if self.is_paused() {

@@ -184,6 +184,10 @@ impl Stack {
       GrowthDir::Downwards => unsafe { self.base.byte_add(self.size.get()) },
     }
   }
+
+  pub(crate) fn push<T>(&self, sp: &mut StackPtr) -> NonNull<T> {
+    todo!()
+  }
 }
 
 #[cfg(feature = "stack_alloc")]

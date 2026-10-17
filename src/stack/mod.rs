@@ -185,8 +185,43 @@ impl Stack {
     }
   }
 
-  pub(crate) fn push<T>(&self, sp: &mut StackPtr) -> NonNull<T> {
-    todo!()
+  /// Reserves space for an aligned `T` immediate [above] `sp`,
+  /// which must be in bounds of this stack region.
+  ///
+  /// More precisely, moves the stack pointer and returns an aligned
+  /// pointer to the reserved stack slot. The slot may overlap the
+  /// guard page of the stack.
+  ///
+  /// # Panics
+  ///
+  /// This method panics if the slot would extend past the end of
+  /// this stack.
+  pub(crate) unsafe fn push<T>(&self, sp: &mut StackPtr) -> NonNull<T> {
+    let (s, m) = (size_of::<T>(), align_of::<T>() - 1);
+    let (a, b, ss) = (sp.addr().get(), self.base.addr().get(), self.size.get());
+    let (loc, new_sp) = match GROWTH_DIR {
+      GrowthDir::Upwards => {
+        let loc = a.wrapping_add(m) & !m;
+        let end = loc.wrapping_add(s);
+        assert!(end.wrapping_sub(a) <= b + ss - a, "stack overflow");
+        (loc, end)
+      }
+      GrowthDir::Downwards => {
+        let loc = (a & !m).wrapping_sub(s);
+        assert!(a.wrapping_sub(loc) <= a - b, "stack overflow");
+        (loc, loc)
+      }
+    };
+    // SAFETY: `sp` changes by at most `m+s`, which fits in a `usize`;
+    //  so the wrapping subtractions in the assertions above are exact
+    //  (nonnegative) distances. After the assertions, both `loc` and
+    //  `new_sp` therefore lie in the range `[a, b+ss]` or `[b, a]`,
+    //  depending on whether stacks grow upwards or downwards. Since
+    //  `a` and `b` are locations within the stack region, they are
+    //  nonzero.
+    *sp = sp.with_addr(unsafe { NonZero::new_unchecked(new_sp) });
+    // SAFETY: See above.
+    sp.with_addr(unsafe { NonZero::new_unchecked(loc) }).cast()
   }
 }
 
@@ -202,42 +237,6 @@ impl Drop for Stack {
 
 /// Stacks can be allocated and deallocated by different threads.
 unsafe impl Send for Stack {}
-
-/// Reserves space for an aligned `T` immediately [above] `sp`.
-///
-/// More precisely, moves the stack pointer and returns an aligned
-/// pointer to the reserved stack slot.
-///
-/// # Safety
-///
-/// Let `c..d` be the memory range of the allocation that `sp` is
-/// derived from. The conditions `c <= next_multiple(sp, a) <= b - s`
-/// and `c <= prev_multiple(sp, a) - s <= d - s` must hold if stacks
-/// grow [upwards] and [downwards], respectively. Here `s` and `a`
-/// are shorthand for `size_of::<T>()` and `align_of::<T>()`, resp.
-///
-/// [above]: GrowthDir
-pub(crate) unsafe fn push<T>(sp: &mut StackPtr) -> NonNull<T> {
-  let align_mask = align_of::<T>() - 1;
-  let loc = sp.map_addr(|a| {
-    let a = match GROWTH_DIR {
-      GrowthDir::Upwards => (a.get() + align_mask) & !align_mask,
-      GrowthDir::Downwards => (a.get() & !align_mask) - size_of::<T>(),
-    };
-    // SAFETY: The caller promises that rounding `sp` up, or rounding
-    //  it down and subtracting `size_of::<T>()`, keeps it within its
-    //  allocation. In particular, it cannot become zero nor overflow
-    //  a `usize`.
-    unsafe { NonZero::new_unchecked(a) }
-  });
-  // Advance the stack pointer.
-  *sp = match GROWTH_DIR {
-    // SAFETY: See above.
-    GrowthDir::Upwards => unsafe { loc.byte_add(size_of::<T>()) },
-    GrowthDir::Downwards => loc,
-  };
-  loc.cast()
-}
 
 /// A pool of available storage for use as the program stacks
 /// of [coroutines].
@@ -368,23 +367,34 @@ mod stack_tests {
   }
 
   #[test]
-  fn push_() {
+  fn push() {
     let stack = Stack::allocate(10);
     let mut sp = stack.bottom();
     let offset = |ptr: StackPtr| unsafe { ptr.byte_offset_from(stack.bottom()) };
 
     let upwards = GROWTH_DIR == GrowthDir::Upwards;
 
-    let ptr = unsafe { push::<u8>(&mut sp) };
+    let ptr = unsafe { stack.push::<u8>(&mut sp) };
     assert_eq!(offset(sp), if upwards { 1 } else { -1 });
     assert_eq!(offset(ptr.cast()), if upwards { 0 } else { -1 });
 
-    let ptr = unsafe { push::<u16>(&mut sp) };
+    let ptr = unsafe { stack.push::<u16>(&mut sp) };
     assert_eq!(offset(sp), if upwards { 4 } else { -4 });
     assert_eq!(offset(ptr.cast()), if upwards { 2 } else { -4 });
 
-    let ptr = unsafe { push::<u32>(&mut sp) };
+    let ptr = unsafe { stack.push::<u32>(&mut sp) };
     assert_eq!(offset(sp), if upwards { 8 } else { -8 });
     assert_eq!(offset(ptr.cast()), if upwards { 4 } else { -8 });
+  }
+
+  #[test]
+  #[should_panic]
+  fn push_panics_on_overflow() {
+    let stack = Stack::allocate(1);
+    let mut sp = match GROWTH_DIR {
+      GrowthDir::Upwards => unsafe { stack.base().byte_add(stack.size().get()) },
+      GrowthDir::Downwards => stack.base(),
+    };
+    unsafe { stack.push::<u8>(&mut sp) };
   }
 }

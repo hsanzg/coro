@@ -236,7 +236,8 @@ impl<R> Coro<R> {
     // it to a fixed memory location. The actual stack contents will
     // appear on top of this copy. See `CoroFn` for details.
     let mut bot = stack.bottom();
-    let fn_ptr = stack.push(&mut bot);
+    // SAFETY: `bot` is derived from the stack allocation.
+    let fn_ptr = unsafe { stack.push(&mut bot) };
     // SAFETY: `Stack::push` returns a pointer valid for writes.
     unsafe {
       fn_ptr.write(CoroFn {
@@ -250,7 +251,7 @@ impl<R> Coro<R> {
       // Actually, in some architectures the coroutine must first bounce
       // off a smaller trampoline before reaching `crate::trampoline` in
       // order to support stack unwinding.
-      cont_sp: unsafe { arch::prepare_stack(bot, trampoline::<R, F> as *const _) },
+      cont_sp: unsafe { arch::prepare_stack(bot, trampoline::<R, F>) },
       stack_bot: bot,
       drop_fn: CoroFn::<F>::raw_drop,
       stack: ManuallyDrop::new(stack),
@@ -284,7 +285,7 @@ impl<R> Coro<R> {
   #[must_use]
   #[expect(
     unpredictable_function_pointer_comparisons,
-    reason = "set and read from same codegen"
+    reason = "set and read from the same codegen"
   )]
   pub fn has_finished(&self) -> bool {
     self.poison_target() == Some(finished)
@@ -297,7 +298,7 @@ impl<R> Coro<R> {
   #[must_use]
   #[expect(
     unpredictable_function_pointer_comparisons,
-    reason = "set and read from same codegen"
+    reason = "set and read from the same codegen"
   )]
   pub fn has_panicked(&self) -> bool {
     self.poison_target() == Some(panicked)
@@ -436,8 +437,8 @@ pub fn suspend() {
 
 #[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
 #[allow(improper_ctypes_definitions, reason = "written and read from Rust")]
-extern "C-unwind" fn poison_trampoline(target_loc: NonNull<PoisonTarget>) -> ! {
-  (unsafe { target_loc.read() })();
+extern "C-unwind" fn poison_trampoline(bot: NonNull<()>) -> ! {
+  (unsafe { bot.cast::<PoisonTarget>().read() })();
 }
 
 /// The target function of a [poisoned coroutine].

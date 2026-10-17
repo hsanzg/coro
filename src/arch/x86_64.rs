@@ -20,13 +20,16 @@ unsafe fn initial_sp(bot: StackPtr) -> StackPtr {
   unsafe { bot.byte_offset(INIT_SP_OFF) }
 }
 
+// todo: move to `lib.rs` and document.
+type TrampolineFn = extern "sysv64-unwind" fn(NonNull<()>) -> !;
+
 /// Restores the coroutine stack starting at `bot` to its initial
 /// state, so that the next call to [`resume_coro`] on it enters
-/// [`init_coro`] and jumps to `tramp_fn`.
+/// [`init_coro`] and jumps to `tramp`.
 ///
 /// For convenience, the [initial stack pointer](initial_sp) of
 /// the coroutine is returned.
-pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) -> StackPtr {
+pub unsafe fn prepare_stack(bot: StackPtr, tramp: TrampolineFn) -> StackPtr {
   // Ask `resume_coro` to call `init_coro` on the first resumption
   // of the coroutine. Location `ip` also serves as the (invalid)
   // return address slot for the stack frame of `init_coro`.
@@ -36,7 +39,7 @@ pub unsafe fn prepare_stack(bot: StackPtr, tramp_fn: *const ()) -> StackPtr {
   // above the bottommost frame of the coroutine. The address
   // will be read and jumped to by `init_coro`.
   let tp = unsafe { bot.byte_offset(TRAMP_PTR_OFF) }.cast();
-  unsafe { tp.write(tramp_fn) };
+  unsafe { tp.write(tramp) };
   // Leave the caller reference field uninitialized.
   unsafe { initial_sp(bot) }
 }
@@ -264,7 +267,7 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller
 #[must_use]
 pub unsafe fn poison(bot: StackPtr, target_fn: PoisonTarget) -> StackPtr {
   unsafe { bot.cast().write(target_fn) };
-  unsafe { prepare_stack(bot, crate::poison_trampoline as *const _) }
+  unsafe { prepare_stack(bot, crate::poison_trampoline) }
 }
 
 /// Returns the target function of a poisoned coroutine,

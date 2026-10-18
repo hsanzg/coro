@@ -79,7 +79,6 @@ impl Completion {
       core::mem::forget(self);
       ptr
     } else {
-      cold_path();
       unsafe { self.maybe_rethrow() };
       unsafe { unreachable_unchecked() };
     }

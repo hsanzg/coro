@@ -262,8 +262,15 @@ pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller
 /// A poisoned coroutine can return control back only by panicking
 /// or [forcibly unwinding] its stack.
 ///
+/// # Safety
+///
+/// This subroutine may overwrite any of the information in the stack
+/// [below] the frame of the original trampoline. The remaining data
+/// are left intact.
+///
 /// [`poison_trampoline`]: crate::poison_trampoline
 /// [forcibly unwinding]: force_unwind
+/// [below]: crate::stack::GROWTH_DIR
 #[must_use]
 pub unsafe fn poison(bot: StackPtr, target_fn: PoisonTarget) -> StackPtr {
   unsafe { bot.cast().write(target_fn) };

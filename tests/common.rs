@@ -15,21 +15,21 @@ pub fn new_coro<R, F: FnOnce() -> R + Unpin>(f: F) -> Coro<R> {
 
 pub fn assert_unstarted<R>(coro: &Coro<R>) {
   assert!(!coro.has_started());
-  assert!(coro.is_paused());
+  assert!(coro.is_resumable());
   assert!(!coro.has_finished());
   assert!(!coro.has_panicked());
 }
 
 pub fn assert_paused<R>(coro: &Coro<R>) {
   assert!(coro.has_started());
-  assert!(coro.is_paused());
+  assert!(coro.is_resumable());
   assert!(!coro.has_finished());
   assert!(!coro.has_panicked());
 }
 
 pub fn assert_complete<R>(coro: &Coro<R>, panicked: bool) {
   assert!(coro.has_started());
-  assert!(!coro.is_paused());
+  assert!(!coro.is_resumable());
   assert_eq!(coro.has_finished(), !panicked);
   assert_eq!(coro.has_panicked(), panicked);
 }

@@ -250,7 +250,8 @@ impl<R> Coro<R> {
       // the first instruction of the trampoline function defined below.
       // Actually, in some architectures the coroutine must first bounce
       // off a smaller trampoline before reaching `crate::trampoline` in
-      // order to support stack unwinding.
+      // order to support stack unwinding. See the `arch` module for
+      // details.
       cont_sp: unsafe { arch::prepare_stack(bot, trampoline::<R, F>) },
       stack_bot: bot,
       drop_fn: CoroFn::<F>::raw_drop,
@@ -259,29 +260,57 @@ impl<R> Coro<R> {
     }
   }
 
-  #[must_use]
-  fn poison_target(&self) -> Option<PoisonTarget> {
-    unsafe { arch::poison_target(self.cont_sp) }
-  }
-
   /// Checks whether the coroutine has begun execution.
+  ///
+  /// # Example
+  ///
+  /// ```
+  /// use coro::{suspend, Coro};
+  ///
+  /// let mut coro = Coro::new(|| suspend());
+  /// assert!(!coro.has_started());
+  ///
+  /// coro.resume(); // suspended.
+  /// assert!(coro.has_started());
+  ///
+  /// coro.resume(); // finished.
+  /// assert!(coro.has_started());
+  /// ```
   #[must_use]
   pub fn has_started(&self) -> bool {
+    // SAFETY: `cont_sp` is the current stack pointer of this coroutine.
     unsafe { arch::has_started(self.cont_sp) }
   }
 
-  // todo: find better name? `is_suspended`? not good enough, since
-  //  this method returns `true` for a coroutine that has not yet
-  //  begun execution.
+  /// If this coroutine has been poisoned, returns the function to
+  /// which [`Coro::resume`] will jump. Otherwise returns [`None`].
+  ///
+  /// When a coroutine can no longer run normally (e.g. because its
+  /// program finished normally or due to a panic), [`arch::poison`]
+  /// rearranges its stack so that resuming the coroutine calls a
+  /// target function that never returns normally. This saves us
+  /// from having to check for invalid states on every call to
+  /// [`Coro::resume`].
   #[must_use]
-  pub fn is_paused(&self) -> bool {
-    !self.has_finished() && !self.has_panicked()
+  fn poison_target(&self) -> Option<PoisonTarget> {
+    // SAFETY: `cont_sp` is the current stack pointer of this coroutine.
+    unsafe { arch::poison_target(self.cont_sp) }
   }
 
   /// Checks if the coroutine has completely finished its execution
   /// without panicking.
   ///
-  /// [`resume`]: Self::resume
+  /// # Example
+  ///
+  /// ```
+  /// use coro::Coro;
+  ///
+  /// let mut coro = Coro::new(|| {});
+  /// assert!(!coro.has_finished());
+  ///
+  /// coro.resume();
+  /// assert!(coro.has_finished());
+  /// ```
   #[must_use]
   #[expect(
     unpredictable_function_pointer_comparisons,
@@ -294,6 +323,23 @@ impl<R> Coro<R> {
   /// Checks if the coroutine has panicked via the [`panic!`] macro
   /// or a similar standard library mechanism.
   ///
+  /// # Example
+  ///
+  /// ```
+  /// # extern crate std;
+  /// use std::panic::AssertUnwindSafe;
+  /// use coro::Coro;
+  ///
+  /// let mut coro = Coro::new(|| panic!());
+  /// assert!(!coro.has_panicked());
+  ///
+  /// let mut coro_ref = AssertUnwindSafe(&mut coro);
+  /// std::panic::catch_unwind(move || {
+  ///   coro_ref.resume();
+  /// });
+  /// assert!(coro.has_panicked());
+  /// ```
+  ///
   /// [`panic!`]: panic
   #[must_use]
   #[expect(
@@ -302,6 +348,37 @@ impl<R> Coro<R> {
   )]
   pub fn has_panicked(&self) -> bool {
     self.poison_target() == Some(panicked)
+  }
+
+  // todo: find better name? `is_suspended`? not good enough, since
+  //  this method returns `true` for a coroutine that has not yet
+  //  begun execution.
+
+  /// Returns whether this coroutine can be resumed by calling
+  /// [`Coro::resume`]; that is, whether its program has either
+  /// not yet [begun execution] or is suspended at one of its
+  /// [suspension points].
+  ///
+  /// # Example
+  ///
+  /// ```
+  /// use coro::{suspend, Coro};
+  ///
+  /// let mut coro = Coro::new(|| suspend());
+  /// assert!(coro.is_resumable());
+  ///
+  /// coro.resume();
+  /// assert!(coro.is_resumable());
+  ///
+  /// coro.resume();
+  /// assert!(!coro.is_resumable());
+  /// ```
+  ///
+  /// [begun execution]: Coro::has_started
+  /// [suspension points]: suspend
+  #[must_use]
+  pub fn is_resumable(&self) -> bool {
+    !self.has_finished() && !self.has_panicked()
   }
 
   /// Resumes execution of this coroutine's program where it last left off.
@@ -320,19 +397,21 @@ impl<R> Coro<R> {
     let prev_caller = CALLER.get();
     // SAFETY: The coroutine has exclusive access to its stack.
     let comp = unsafe { arch::resume_coro(&mut self.cont_sp, self.stack_bot, CALLER.as_ptr()) };
+    // The coroutine's computation has transferred control back.
     CALLER.set(prev_caller);
-
     if comp.is_suspended() {
       core::mem::forget(comp); // there's no panic payload to destroy.
       CoroutineState::Yielded(())
     } else {
-      // Read the return address of the coroutine program,
-      // or resume unwinding if the coroutine panicked.
+      // Find out where the coroutine program stored its return value,
+      // or resume unwinding if it panicked.
       let ret_addr = comp.ret_addr().cast::<R>();
-      // The computation finished normally. Copy the return value to
+      // The computation finished normally. Move the return value to
       // the current stack, because the stack of the coroutine might
       // be about to get dropped.
-      // SAFETY: todo.
+      // SAFETY: The trampoline function leaves the return value at
+      //  `ret_addr` as a `ManuallyDrop<R>` object that has not been
+      //  dropped. Thus, reading once from `ret_addr` is valid.
       CoroutineState::Complete(unsafe { ret_addr.read() })
     }
   }
@@ -341,6 +420,23 @@ impl<R> Coro<R> {
   ///
   /// The stack is filled with undefined information, but it can be
   /// passed to [`Coro::with_stack`] to construct a new coroutine.
+  ///
+  /// # Example
+  ///
+  /// ```
+  /// use coro::{suspend, Coro};
+  /// use coro::stack::Stack;
+  ///
+  /// let stack = Stack::allocate(1 << 13); // 8 kilobytes.
+  /// let coro = Coro::with_stack(|| suspend(), stack);
+  /// coro.resume();
+  ///
+  /// // Unwind the stack of the coroutine, and reuse it as the stack
+  /// // of a new coroutine.
+  /// let stack = coro.drop_and_take_stack();
+  /// let mut coro = Coro::with_stack(|| {}, stack);
+  /// coro.resume();
+  /// ```
   #[cfg(all(feature = "stack_alloc", not(feature = "common_pool")))]
   pub unsafe fn drop_and_take_stack(mut self) -> Stack {
     // SAFETY: We forget `self` immediately after calling `inner_drop`.
@@ -359,11 +455,16 @@ impl<R> Coroutine for Coro<R> {
   }
 }
 
-// The default ABI of Rust does not define the set of registers a caller
-// needs to save before invoking a function. For this reason, the first
-// call to `Coro::resume` jumps through the following trampoline function
-// with an explicit calling convention.
-//
+/// The function that takes control on the first [resumption] of a
+/// coroutine, and that immediately invokes the coroutine's program.
+///
+/// The coroutine program is a function of type `F` that follows the
+/// default ABI of Rust, which does not define the set of registers
+/// that one needs to save before calling it. That's why the first
+/// call to [`Coro::resume`] must go through this trampoline with
+/// an explicit calling convention.
+///
+/// [resumption]: Coro::resume
 // Note that `arch::resume_coro` expects this function to follow the
 // System V ABI on all x86-64 systems, including those running Windows.
 #[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
@@ -383,7 +484,7 @@ where
   // SAFETY: The destructor of `Coro` drops the `F` instance at
   //  `fn_ptr` only if the coroutine is never activated (that is,
   //  if this trampoline function is never invoked). And this
-  //  trampoline is called only once, hence there's no risk of
+  //  trampoline is called only once, so there's no risk of
   //  moving out `f` from the coroutine twice.
   let f: F = unsafe { ManuallyDrop::take(f) };
 
@@ -408,7 +509,6 @@ where
     let new_sp = unsafe { arch::poison(bot, poison_target) };
     let comp = Completion::from(res);
 
-    // The coroutine caller may have changed since its first resumption.
     let caller = unsafe { NonNull::new_unchecked(CALLER.get().cast_mut()) };
     unsafe { arch::return_control(caller, new_sp, comp) }
   }
@@ -427,6 +527,7 @@ pub fn suspend() {
   if caller.is_null() {
     #[cold]
     #[inline(never)]
+    #[track_caller]
     fn suspend_from_outside() -> ! {
       panic!("cannot suspend from outside a coroutine")
     }
@@ -473,7 +574,7 @@ impl<R> Coro<R> {
   /// `coro.inner_drop()` is to do `core::mem::forget(coro)`.
   unsafe fn inner_drop(&mut self) -> DropReturn {
     if self.has_started() {
-      if self.is_paused() {
+      if self.is_resumable() {
         // The coroutine was left in progress; unwind its stack manually.
         let prev_caller = CALLER.get();
         // SAFETY: We just tested that the coroutine is paused.

@@ -213,7 +213,7 @@ pub unsafe fn return_control(caller: StackPtr, final_sp: StackPtr, comp: Complet
 /// Note that a poisoned coroutine is never paused, and so its stack
 /// cannot be unwound.
 ///
-/// [paused]: crate::Coro::is_paused
+/// [paused]: crate::Coro::is_resumable
 /// [poisoned]: poison
 pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller) -> Completion {
   let (comp, final_sp);

@@ -472,47 +472,55 @@ extern "C-unwind" fn trampoline<R, F>(bot: NonNull<()>) -> !
 where
   F: FnOnce() -> R + Unpin,
 {
-  // SAFETY: `arch::resume_coro` passes the address of the target
-  //  function at the bottom of the stack of a coroutine. We have
-  //  exclusive access to the stack, so it is sound to convert `fn_ptr`
-  //  into a unique reference. To see why, notice that calling `Coro::resume`
-  //  is the only way to reach this trampoline function; that function
-  //  calls `arch::resume_coro`, which borrows the `cont_sp` field
-  //  of the `Coro` mutably and jumps to the trampoline from assembly
-  //  code.
-  let f = &mut unsafe { CoroFn::addr(bot).read().normal };
-  // SAFETY: The destructor of `Coro` drops the `F` instance at
-  //  `fn_ptr` only if the coroutine is never activated (that is,
-  //  if this trampoline function is never invoked). And this
-  //  trampoline is called only once, so there's no risk of
-  //  moving out `f` from the coroutine twice.
-  let f: F = unsafe { ManuallyDrop::take(f) };
+  // Take ownership of the function object, which `Coro::with_stack`
+  // placed at the bottom of the stack. The original object must not
+  // be accessed again; `Coro::inner_drop` is careful not to drop it
+  // after the coroutine has begun execution.
+  let f_ptr = CoroFn::<F>::addr(bot).as_ptr();
+  // Read only the `normal` field of `*f_ptr` rather than the whole
+  // union, to avoid some copying `PoisonTarget` is bigger than `F`.
+  // SAFETY: This is a field projection on a valid pointer.
+  let f_ptr = unsafe { &raw const (*f_ptr).normal };
+  // SAFETY: This trampoline is the only subroutine that reads the
+  //  contents of `f_ptr`, and it runs at most once per coroutine.
+  let f = ManuallyDrop::into_inner(unsafe { f_ptr.read() });
 
-  #[repr(align(2))] // see `unwind::Result`.
+  /// The return value of the coroutine, to be read by [`Coro::resume`].
+  #[repr(align(2))] // required by `unwind::Result`.
   struct RetVal<R>(R);
 
+  // Since the present subroutine cannot return normally, its frame
+  // is never popped off the stack. So we can conveniently store the
+  // return value in a local variable. This gives the last program
+  // that activated the coroutine a chance to move the return value
+  // from there into its own stack before the coroutine is activated
+  // again (at which point the poison target may overwrite its frame).
   let mut ret_val = MaybeUninit::uninit();
   let res = unwind::catch(|| {
     // Execute the actual coroutine's program.
-    let ret_val = ret_val.write(RetVal(f()));
-    NonNull::from_mut(ret_val).cast::<()>()
+    NonNull::from_mut(ret_val.write(RetVal(f()))).cast()
   });
 
-  // At this point the coroutine has almost finished its execution.
-  // Variable `f` has been destroyed, because an `FnOnce` consumes
-  // itself when executed.
-
-  unsafe fn return_control(res: CatchResult<NonNull<()>>, bot: NonNull<()>) -> ! {
+  fn return_control(res: CatchResult<NonNull<()>>, bot: NonNull<()>) -> ! {
+    // Force any future attempt to resume this coroutine to trigger
+    // an immediate panic instead of returning back here. The panic
+    // message depends on how the coroutine finished execution.
     let poison_target = if res.is_ok() { finished } else { panicked };
-    // SAFETY: The coroutine was started, so it is safe to overwrite
-    //  its function object with the poison target address.
+    // SAFETY: The function object is no longer alive, so we may store
+    //  the address of the poison target in the bottom `CoroFn` record.
     let new_sp = unsafe { arch::poison(bot, poison_target) };
     let comp = Completion::from(res);
 
+    // Before transferring control to us, `arch::resume_coro` saved
+    // the stack pointer of its caller in `CALLER`. Load and pass
+    // that value to `arch::return_control`, so that it can switch
+    // back to the caller's stack.
+    // SAFETY: This coroutine is active, so its caller is nonnull.
     let caller = unsafe { NonNull::new_unchecked(CALLER.get().cast_mut()) };
+    // SAFETY: We have poisoned the coroutine already.
     unsafe { arch::return_control(caller, new_sp, comp) }
   }
-  unsafe { return_control(res, bot) };
+  return_control(res, bot)
 }
 
 /// Transfers control back to the program that last resumed the active
@@ -533,11 +541,16 @@ pub fn suspend() {
     }
     suspend_from_outside();
   }
+  // SAFETY: `caller` is the stack pointer the last invocation of
+  //  `arch::resume_coro` saved.
+
+  // the main program or a coroutine had before transferring control
+  // to the active coroutine; see `arch::resume_coro`. The former coroutine is currently
+  // suspended, so it is valid to pass control back to it.
   unsafe { arch::suspend_coro(caller) };
 }
 
 #[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
-#[allow(improper_ctypes_definitions, reason = "written and read from Rust")]
 extern "C-unwind" fn poison_trampoline(bot: NonNull<()>) -> ! {
   (unsafe { bot.cast::<PoisonTarget>().read() })();
 }
@@ -549,12 +562,14 @@ type PoisonTarget = fn() -> !;
 
 #[cold]
 #[inline(never)]
+#[track_caller]
 fn finished() -> ! {
   panic!("coroutine resumed after completion")
 }
 
 #[cold]
 #[inline(never)]
+#[track_caller]
 fn panicked() -> ! {
   panic!("coroutine resumed after panicking")
 }
@@ -587,7 +602,13 @@ impl<R> Coro<R> {
           // dropped; or (b) some frame between the last suspension
           // point and the trampoline caught the exception thrown
           // to unwind the stack, and forgot to clean it up.
-          panic!("coroutine did not unwind");
+          #[cold]
+          #[inline(never)]
+          #[track_caller]
+          fn did_not_unwind() -> ! {
+            panic!("coroutine did not unwind");
+          }
+          did_not_unwind();
         }
         // SAFETY: todo.
         unsafe { comp.maybe_rethrow() };

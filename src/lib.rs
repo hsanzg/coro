@@ -170,7 +170,12 @@ pub struct Coro<R> {
 #[cfg_attr(target_arch = "x86_64", repr(align(16)))]
 union CoroFn<F: Unpin> {
   normal: ManuallyDrop<F>,
-  poison: PoisonTarget,
+  // todo: document hack for upwards-growing stacks.
+  // Unions can hold arbitrary data; validity only needs to be guaranteed
+  // when a specific field is read. We make sure to read the poison
+  // using pointer arithmetic. This field is here only to guarantee
+  // that the poison target pointer can fit at the bottom of the stack.
+  _poison_pad: PoisonTarget, // only if `GROWTH_DIR == Downwards`; see `poison_trampoline`
 }
 
 impl<F: Unpin> CoroFn<F> {
@@ -188,13 +193,13 @@ impl<F: Unpin> CoroFn<F> {
     }
   }
 
-  /// Destroys the function object of a [coroutine] whose
-  /// `stack_bot` field equals `bot`.
+  /// Destroys the function object of a [coroutine] whose `stack_bot`
+  /// field equals `bot`.
   ///
   /// # Safety
   ///
-  /// This operation is safe to apply only to coroutines
-  /// that have never [started] execution and never will.
+  /// This operation is safe to apply only to coroutines that have
+  /// never [started] execution and never will.
   ///
   /// [coroutine]: Coro
   /// [started]: Coro::has_started
@@ -381,6 +386,8 @@ impl<R> Coro<R> {
     !self.has_finished() && !self.has_panicked()
   }
 
+  // Control transfers.
+
   /// Resumes execution of this coroutine's program where it last left off.
   ///
   /// This method is equivalent to [`Coroutine::resume`],
@@ -415,35 +422,6 @@ impl<R> Coro<R> {
       CoroutineState::Complete(unsafe { ret_addr.read() })
     }
   }
-
-  /// Consumes the (suspended) coroutine, and returns its program stack.
-  ///
-  /// The stack is filled with undefined information, but it can be
-  /// passed to [`Coro::with_stack`] to construct a new coroutine.
-  ///
-  /// # Example
-  ///
-  /// ```
-  /// use coro::{suspend, Coro};
-  /// use coro::stack::Stack;
-  ///
-  /// let stack = Stack::allocate(1 << 13); // 8 kilobytes.
-  /// let coro = Coro::with_stack(|| suspend(), stack);
-  /// coro.resume();
-  ///
-  /// // Unwind the stack of the coroutine, and reuse it as the stack
-  /// // of a new coroutine.
-  /// let stack = coro.drop_and_take_stack();
-  /// let mut coro = Coro::with_stack(|| {}, stack);
-  /// coro.resume();
-  /// ```
-  #[cfg(all(feature = "stack_alloc", not(feature = "common_pool")))]
-  pub unsafe fn drop_and_take_stack(mut self) -> Stack {
-    // SAFETY: We forget `self` immediately after calling `inner_drop`.
-    let stack = unsafe { self.inner_drop() };
-    core::mem::forget(self);
-    stack
-  }
 }
 
 impl<R> Coroutine for Coro<R> {
@@ -455,7 +433,7 @@ impl<R> Coroutine for Coro<R> {
   }
 }
 
-/// The function that takes control on the first [resumption] of a
+/// The routine that takes control on the first [resumption] of a
 /// coroutine, and that immediately invokes the coroutine's program.
 ///
 /// The coroutine program is a function of type `F` that follows the
@@ -541,19 +519,14 @@ pub fn suspend() {
     }
     suspend_from_outside();
   }
-  // SAFETY: `caller` is the stack pointer the last invocation of
-  //  `arch::resume_coro` saved.
-
-  // the main program or a coroutine had before transferring control
-  // to the active coroutine; see `arch::resume_coro`. The former coroutine is currently
-  // suspended, so it is valid to pass control back to it.
+  // SAFETY: `caller` is the stack pointer a coroutine or the main
+  //  program had before transferring control to the active coroutine;
+  //  see `arch::resume_coro`. That caller is currently suspended, so
+  //  we are allowed to pass control back to it.
   unsafe { arch::suspend_coro(caller) };
 }
 
-#[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
-extern "C-unwind" fn poison_trampoline(bot: NonNull<()>) -> ! {
-  (unsafe { bot.cast::<PoisonTarget>().read() })();
-}
+// Poisoning.
 
 /// The target function of a [poisoned coroutine].
 ///
@@ -573,6 +546,25 @@ fn finished() -> ! {
 fn panicked() -> ! {
   panic!("coroutine resumed after panicking")
 }
+
+/// The routine that takes control whenever a [poisoned] coroutine
+/// is [resumed].
+///
+/// This routine has the same calling conventions as [`trampoline`].
+///
+/// [poisoned]: Coro::poison_target
+/// [resumed]: Coro::resume
+#[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
+extern "C-unwind" fn poison_trampoline(bot: NonNull<()>) -> ! {
+  // todo: document.
+  let target_ptr = match stack::GROWTH_DIR {
+    GrowthDir::Upwards => unsafe { bot.cast::<PoisonTarget>().sub(1) },
+    GrowthDir::Downwards => bot.cast(),
+  };
+  (unsafe { target_ptr.read() })();
+}
+
+// Destruction.
 
 type DropReturn = cfg_select! {
   feature = "common_pool" => (),
@@ -629,6 +621,35 @@ impl<R> Coro<R> {
       feature = "stack_alloc" => stack,
       _ => {}
     }
+  }
+
+  /// Consumes the (suspended) coroutine, and returns its program stack.
+  ///
+  /// The stack is filled with undefined information, but it can be
+  /// passed to [`Coro::with_stack`] to construct a new coroutine.
+  ///
+  /// # Example
+  ///
+  /// ```
+  /// use coro::{suspend, Coro};
+  /// use coro::stack::Stack;
+  ///
+  /// let stack = Stack::allocate(1 << 13); // 8 kilobytes.
+  /// let coro = Coro::with_stack(|| suspend(), stack);
+  /// coro.resume();
+  ///
+  /// // Unwind the stack of the coroutine, and reuse it as the stack
+  /// // of a new coroutine.
+  /// let stack = coro.drop_and_take_stack();
+  /// let mut coro = Coro::with_stack(|| {}, stack);
+  /// coro.resume();
+  /// ```
+  #[cfg(all(feature = "stack_alloc", not(feature = "common_pool")))]
+  pub unsafe fn drop_and_take_stack(mut self) -> Stack {
+    // SAFETY: We forget `self` immediately after calling `inner_drop`.
+    let stack = unsafe { self.inner_drop() };
+    core::mem::forget(self);
+    stack
   }
 }
 

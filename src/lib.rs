@@ -242,10 +242,10 @@ impl<R> Coro<R> {
     // appear on top of this copy. See `CoroFn` for details.
     let mut bot = stack.bottom();
     // SAFETY: `bot` is derived from the stack allocation.
-    let fn_ptr = unsafe { stack.push(&mut bot) };
+    let f_ptr = unsafe { stack.push(&mut bot) };
     // SAFETY: `Stack::push` returns a pointer valid for writes.
     unsafe {
-      fn_ptr.write(CoroFn {
+      f_ptr.write(CoroFn {
         normal: ManuallyDrop::new(f),
       })
     };
@@ -455,8 +455,8 @@ where
   // be accessed again; `Coro::inner_drop` is careful not to drop it
   // after the coroutine has begun execution.
   let f_ptr = CoroFn::<F>::addr(bot).as_ptr();
-  // Read only the `normal` field of `*f_ptr` rather than the whole
-  // union, to avoid some copying `PoisonTarget` is bigger than `F`.
+  // Read the `normal` field of `*f_ptr` rather than the whole union,
+  // to avoid some copying when `PoisonTarget` is bigger than `F`.
   // SAFETY: This is a field projection on a valid pointer.
   let f_ptr = unsafe { &raw const (*f_ptr).normal };
   // SAFETY: This trampoline is the only subroutine that reads the
@@ -535,14 +535,12 @@ type PoisonTarget = fn() -> !;
 
 #[cold]
 #[inline(never)]
-#[track_caller]
 fn finished() -> ! {
   panic!("coroutine resumed after completion")
 }
 
 #[cold]
 #[inline(never)]
-#[track_caller]
 fn panicked() -> ! {
   panic!("coroutine resumed after panicking")
 }

@@ -42,12 +42,11 @@
 //! [`libfringe`]: https://github.com/edef1c/libfringe
 
 #![feature(asm_unwind)]
-#![feature(core_intrinsics)] // todo: document purpose.
-#![feature(std_internals)] // for `PanicPayload`.
+#![feature(core_intrinsics)] // `catch_unwind`.
+#![feature(std_internals)] // `PanicPayload`.
 #![feature(coroutine_trait)]
-#![feature(rustc_attrs)] // todo: document purpose.
+#![feature(rustc_attrs)] // `rustc_nounwind`.
 #![feature(thread_local)]
-#![feature(likely_unlikely)]
 #![feature(abort_immediate)]
 #![cfg_attr(all(panic = "unwind", target_arch = "x86_64"), feature(panic_unwind))]
 #![expect(
@@ -67,7 +66,7 @@ mod arch;
 pub mod stack;
 mod unwind;
 
-use crate::stack::{GrowthDir, Stack, StackPtr};
+use crate::stack::{Stack, StackPtr};
 use crate::unwind::{CatchResult, Completion};
 use core::cell::Cell;
 use core::hint::cold_path;
@@ -164,18 +163,32 @@ pub struct Coro<R> {
 /// be [`Unpin`].
 ///
 /// [new target]: Coro::poison_target
+// Insist that all fields start at offset 0 from the beginning of the union.
 #[repr(C)]
 // Make sure that the stack frame on top of this record is
 // 16-byte-aligned on x86-64, as the System V ABI dictates.
 #[cfg_attr(target_arch = "x86_64", repr(align(16)))]
 union CoroFn<F: Unpin> {
+  /// The coroutine program; valid until it begins execution.
   normal: ManuallyDrop<F>,
-  // todo: document hack for upwards-growing stacks.
-  // Unions can hold arbitrary data; validity only needs to be guaranteed
-  // when a specific field is read. We make sure to read the poison
-  // using pointer arithmetic. This field is here only to guarantee
-  // that the poison target pointer can fit at the bottom of the stack.
-  _poison_pad: PoisonTarget, // only if `GROWTH_DIR == Downwards`; see `poison_trampoline`
+  /// The new program of the coroutine after it becomes [poisoned].
+  ///
+  /// # Safety
+  ///
+  /// We want [`poison_trampoline`] to be capable of determining
+  /// this target from the coroutine's `stack_bot` pointer alone,
+  /// without knowledge of `F`. For that reason, this field holds
+  /// the target only when stacks grow [downward]. Otherwise
+  /// [`arch::poison`] places the target address just before the
+  /// end of the union, so it must instead be accessed through a
+  /// raw pointer. (This is safe, because a union may contain
+  /// arbitrary data.) In the latter case, this field merely
+  /// ensures that the union is sufficiently large and aligned
+  /// to hold a [`PoisonTarget`] instance.
+  ///
+  /// [poisoned]: Coro::poison_target
+  /// [downward]: GrowthDir::Downwards
+  poison: PoisonTarget,
 }
 
 impl<F: Unpin> CoroFn<F> {
@@ -183,14 +196,11 @@ impl<F: Unpin> CoroFn<F> {
   /// whose `stack_bot` field equals `bot`.
   ///
   /// [coroutine]: Coro
-  fn addr(bot: StackPtr) -> NonNull<Self> {
-    match stack::GROWTH_DIR {
-      // SAFETY: The function object occupies all locations
-      //  within the stack allocation immediately below `bot`,
-      //  or so the caller says.
-      GrowthDir::Upwards => unsafe { bot.cast().sub(1) },
-      GrowthDir::Downwards => bot.cast(),
-    }
+  unsafe fn addr(bot: StackPtr) -> NonNull<Self> {
+    // SAFETY: The function object occupies all locations
+    //  within the stack allocation immediately below `bot`,
+    //  or so the caller says.
+    unsafe { stack::adjacent(bot) }
   }
 
   /// Destroys the function object of a [coroutine] whose `stack_bot`
@@ -454,7 +464,8 @@ where
   // placed at the bottom of the stack. The original object must not
   // be accessed again; `Coro::inner_drop` is careful not to drop it
   // after the coroutine has begun execution.
-  let f_ptr = CoroFn::<F>::addr(bot).as_ptr();
+  // SAFETY: `bot` is the `stack_bot` value of the active coroutine.
+  let f_ptr = unsafe { CoroFn::<F>::addr(bot).as_ptr() };
   // Read the `normal` field of `*f_ptr` rather than the whole union,
   // to avoid some copying when `PoisonTarget` is bigger than `F`.
   // SAFETY: This is a field projection on a valid pointer.
@@ -554,29 +565,41 @@ fn panicked() -> ! {
 /// [resumed]: Coro::resume
 #[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
 extern "C-unwind" fn poison_trampoline(bot: NonNull<()>) -> ! {
-  // todo: document.
-  let target_ptr = match stack::GROWTH_DIR {
-    GrowthDir::Upwards => unsafe { bot.cast::<PoisonTarget>().sub(1) },
-    GrowthDir::Downwards => bot.cast(),
-  };
+  // SAFETY: `arch::poison` stores the address of the new target at
+  //  whichever end of the coroutine's `CoroFn` lies next to `bot`,
+  //  namely the beginning when stacks grow downward, and the end
+  //  when they grow upward.
+  let target_ptr = unsafe { stack::adjacent::<PoisonTarget>(bot) };
+  // SAFETY: The pointer is valid for reads, because
+  //  1. it is aligned: the size of `CoroFn<F>` is a multiple
+  //     of the alignment of `PoisonTarget`; and
+  //  2. we have exclusive access to the coroutine.
   (unsafe { target_ptr.read() })();
 }
 
 // Destruction.
 
+/// The value returned by [`Coro::inner_drop`].
+// todo: Move inside the following `impl` block once Rust allows
+//  declaring associated types in inherent impls.
 type DropReturn = cfg_select! {
+  // The stack is returned to the common pool.
   feature = "common_pool" => (),
+  // The caller must dispose of the stack.
   feature = "stack_alloc" => Stack,
+  // The stack is deallocated immediately.
   _ => (),
 };
 
 impl<R> Coro<R> {
+  /// Destroys this coroutine and releases its stack.
+  ///
   /// # Safety
   ///
-  /// This function is sound to call only once with the same coroutine.
-  /// Such a coroutine may not be used again, and that includes calling
-  /// its destructor. Thus, the only safe way to proceed after calling
-  /// `coro.inner_drop()` is to do `core::mem::forget(coro)`.
+  /// This method is sound to call at most once on a given coroutine.
+  /// The coroutine must not be used in any way afterward, and that
+  /// includes dropping it. Thus, the only way to proceed after
+  /// `coro.inner_drop()` is to pass `coro` to [`core::mem::forget`].
   unsafe fn inner_drop(&mut self) -> DropReturn {
     if self.has_started() {
       if self.is_resumable() {
@@ -588,10 +611,11 @@ impl<R> Coro<R> {
         CALLER.set(prev_caller);
 
         if comp.is_ok() {
-          // Either (a) the coroutine suspended itself when being
-          // dropped; or (b) some frame between the last suspension
-          // point and the trampoline caught the exception thrown
-          // to unwind the stack, and forgot to clean it up.
+          // Unwinding didn't reach the trampoline. This will happen
+          // if the coroutine suspends itself while being dropped, or
+          // if some frame catches the unwinding exception and forgets
+          // to clean it up. (Any attempt to call the cleanup function
+          // of the exception aborts the process.)
           #[cold]
           #[inline(never)]
           #[track_caller]
@@ -600,13 +624,15 @@ impl<R> Coro<R> {
           }
           did_not_unwind();
         }
-        // SAFETY: todo.
+        // SAFETY: The completion was not successful, as just checked.
         unsafe { comp.maybe_rethrow() };
       }
     } else {
-      // The coroutine was never activated, so `self.func`
-      // still holds the coroutine's program. Drop it now.
+      // The coroutine never started, so its program still lies intact
+      // at the bottom of its stack (see `CoroFn`). Drop it now.
       cold_path();
+      // SAFETY: The coroutine has never run, and the caller promises
+      //  that it never will.
       unsafe { (self.drop_fn)(self.stack_bot) };
     }
     // SAFETY: `self.stack` is not used again.
@@ -617,7 +643,7 @@ impl<R> Coro<R> {
         unsafe { stack::borrow_common_pool(|pool| pool.give(stack)) };
       }
       feature = "stack_alloc" => stack,
-      _ => {}
+      _ => drop(stack),
     }
   }
 
@@ -652,14 +678,20 @@ impl<R> Coro<R> {
 }
 
 impl<R> Drop for Coro<R> {
-  // todo: complete with details: (or document these in `drop`)
-  /// first unwinds the stack if necessary, destroys the coroutine.
+  /// Destroys the coroutine and [disposes] of its stack.
   ///
-  /// if unwinding is disabled, then the live variables in the stack
-  /// are leaked.
+  /// If the coroutine has [never started], its program is dropped.
+  /// Otherwise, if it has [not completely finished] execution, its
+  /// stack is unwound as though the coroutine were to panic at its
+  /// current [suspension point].
+  ///
+  /// [disposes]: Self::with_stack
+  /// [never started]: Self::has_started
+  /// [not completely finished]: Self::is_resumable
+  /// [suspension point]: suspend
   fn drop(&mut self) {
-    // SAFETY: This is the only exception to the rule, since we are
-    // already inside `Coro`'s destructor.
+    // SAFETY: This method runs at most once, and the coroutine
+    //  cannot be used after it runs.
     unsafe { self.inner_drop() };
   }
 }

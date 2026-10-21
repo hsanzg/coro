@@ -331,6 +331,20 @@ pub(crate) struct ValgrindStackId(pub libc::c_uint);
 // The implementation of `valgrind_stack_{,de}register` is
 // architecture-specific, hence it appears in `crate::arch`.
 
+/// Returns a (possibly unaligned) pointer to the `T` that immediately
+/// precedes `bot` in the direction of [stack growth] on the current
+/// platform.
+///
+/// [stack growth]: GROWTH_DIR
+pub const unsafe fn adjacent<T>(bot: StackPtr) -> NonNull<T> {
+  match GROWTH_DIR {
+    // SAFETY: The caller guarantees that the allocation from
+    //  which `bot` is derived contains a `T` just below it.
+    GrowthDir::Upwards => unsafe { bot.cast().sub(1) },
+    GrowthDir::Downwards => bot.cast(),
+  }
+}
+
 #[cfg(test)]
 mod stack_tests {
   use super::*;
@@ -396,5 +410,21 @@ mod stack_tests {
       GrowthDir::Downwards => stack.base(),
     };
     unsafe { stack.push::<u8>(&mut sp) };
+  }
+
+  #[test]
+  fn adjacent_precedes_bot_in_stack_growth_dir() {
+    type T = [u8; 3]; // non-power-of-2 size.
+    let xs: [T; 4] = Default::default();
+    let bot = NonNull::from(&xs[2]).cast();
+
+    let x_ptr = unsafe { adjacent::<T>(bot) };
+    assert_eq!(
+      x_ptr,
+      NonNull::from(match GROWTH_DIR {
+        GrowthDir::Upwards => &xs[1],
+        GrowthDir::Downwards => &xs[2],
+      })
+    );
   }
 }

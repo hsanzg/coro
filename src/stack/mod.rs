@@ -3,6 +3,7 @@
 #[cfg_attr(unix, path = "unix.rs")]
 mod os;
 
+use alloc::alloc::dealloc;
 use core::num::NonZero;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
@@ -354,19 +355,25 @@ mod stack_tests {
   fn from_raw() {
     extern crate alloc;
     use alloc::alloc::*;
+    use core::alloc::Layout;
 
     let size = NonZeroUsize::new(1 << 12).unwrap();
     let page_size = os::page_size().get();
     let layout = Layout::from_size_align(size.get(), page_size).unwrap();
+    // SAFETY: `size` is positive.
     let Some(base) = NonNull::new(unsafe { alloc(layout) }) else {
       handle_alloc_error(layout);
     };
-    let stack = unsafe { Stack::from_raw(base, size) };
+    // SAFETY: `base` points to a `size`-byte page-aligned allocation
+    //  that outlives `stack`.
+    let stack = unsafe { Stack::from_raw(base.cast(), size) };
 
-    assert_eq!(stack.base(), base);
+    assert_eq!(stack.base(), base.cast());
     assert_eq!(stack.size(), size);
 
     drop(stack);
+    // SAFETY: `base` was allocated by `alloc` with `layout`,
+    //  and the only reference to it has been dropped already.
     unsafe { dealloc(base.as_ptr(), layout) };
   }
 
@@ -381,6 +388,7 @@ mod stack_tests {
   }
 
   #[test]
+  #[cfg(feature = "stack_alloc")]
   fn push() {
     let stack = Stack::allocate(10);
     let mut sp = stack.bottom();
@@ -403,6 +411,7 @@ mod stack_tests {
 
   #[test]
   #[should_panic]
+  #[cfg(feature = "stack_alloc")]
   fn push_panics_on_overflow() {
     let stack = Stack::allocate(1);
     let mut sp = match GROWTH_DIR {

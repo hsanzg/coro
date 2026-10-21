@@ -2,7 +2,7 @@ use crate::stack::StackPtr;
 use crate::unwind::Completion;
 use crate::{Caller, PoisonTarget};
 use core::arch::{asm, naked_asm};
-use core::hint::unlikely;
+use core::hint::cold_path;
 use core::ptr::NonNull;
 
 // Byte offsets of various fields from the bottom of a coroutine stack.
@@ -309,7 +309,12 @@ pub unsafe fn has_started(cont_sp: StackPtr) -> bool {
     return true;
   }
   let tp = unsafe { cont_sp.byte_offset(TRAMP_PTR_OFF - INIT_SP_OFF) };
-  unlikely(crate::poison_trampoline as *const () == unsafe { tp.cast().read() })
+  if crate::poison_trampoline as *const () == unsafe { tp.cast().read() } {
+    cold_path();
+    true
+  } else {
+    false
+  }
 }
 
 // Rust translation of the client request macros in `valgrind.h`. See

@@ -9,7 +9,7 @@ publish = false
 edition = "2024"
 
 [dependencies]
-coro = { path = ".." }
+coro = { path = "..", features = ["common_pool"] }
 corosensei = "0.3"
 criterion = "0.8"
 gungraun = "0.20"

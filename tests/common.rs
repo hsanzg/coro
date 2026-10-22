@@ -13,6 +13,7 @@ pub fn new_coro<R, F: FnOnce() -> R + Unpin>(f: F) -> Coro<R> {
   }
 }
 
+#[allow(unused)]
 pub fn assert_unstarted<R>(coro: &Coro<R>) {
   assert!(!coro.has_started());
   assert!(coro.is_resumable());

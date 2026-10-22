@@ -240,9 +240,9 @@ impl<R> Coro<R> {
   ///
   /// If the `common_pool` feature is enabled, [`Coro::drop`] returns
   /// the stack to the thread-local storage pool when the coroutine is
-  /// no longer needed. Otherwise, if feature `alloc` is enabled, you
-  /// may use [`drop_and_take_stack`] to reclaim the stack before the
-  /// coroutine's destructor deallocates it.
+  /// no longer needed. Otherwise, if feature `stack_alloc` is enabled,
+  /// you may use [`drop_and_take_stack`] to reclaim the stack before
+  /// the coroutine's destructor deallocates it.
   ///
   /// [`drop_and_take_stack`]: Self::drop_and_take_stack
   #[must_use = "method creates a coroutine but does not begin its execution"]
@@ -443,6 +443,10 @@ impl<R> Coroutine for Coro<R> {
   }
 }
 
+/// The type of the [`trampoline`] and [`poison_trampoline`] functions.
+// todo: specify ABI properly by generalizing the `abi` proc macro.
+type TrampolineFn = unsafe extern "sysv64-unwind" fn(bot: NonNull<()>) -> !;
+
 /// The routine that takes control on the first [resumption] of a
 /// coroutine, and that immediately invokes the coroutine's program.
 ///
@@ -456,7 +460,7 @@ impl<R> Coroutine for Coro<R> {
 // Note that `arch::resume_coro` expects this function to follow the
 // System V ABI on all x86-64 systems, including those running Windows.
 #[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
-extern "C-unwind" fn trampoline<R, F>(bot: NonNull<()>) -> !
+unsafe extern "C-unwind" fn trampoline<R, F>(bot: NonNull<()>) -> !
 where
   F: FnOnce() -> R + Unpin,
 {
@@ -564,7 +568,7 @@ fn panicked() -> ! {
 /// [poisoned]: Coro::poison_target
 /// [resumed]: Coro::resume
 #[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
-extern "C-unwind" fn poison_trampoline(bot: NonNull<()>) -> ! {
+unsafe extern "C-unwind" fn poison_trampoline(bot: NonNull<()>) -> ! {
   // SAFETY: `arch::poison` stores the address of the new target at
   //  whichever end of the coroutine's `CoroFn` lies next to `bot`,
   //  namely the beginning when stacks grow downward, and the end

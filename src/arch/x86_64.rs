@@ -1,6 +1,6 @@
 use crate::stack::StackPtr;
 use crate::unwind::Completion;
-use crate::{Caller, PoisonTarget};
+use crate::{Caller, PoisonTarget, TrampolineFn};
 use core::arch::{asm, naked_asm};
 use core::hint::cold_path;
 use core::ptr::NonNull;
@@ -19,9 +19,6 @@ const TRAMP_PTR_OFF: isize = -24; // trampoline jump address.
 unsafe fn initial_sp(bot: StackPtr) -> StackPtr {
   unsafe { bot.byte_offset(INIT_SP_OFF) }
 }
-
-// todo: move to `lib.rs` and document.
-type TrampolineFn = extern "sysv64-unwind" fn(NonNull<()>) -> !;
 
 /// Restores the coroutine stack starting at `bot` to its initial
 /// state, so that the next call to [`resume_coro`] on it enters
@@ -341,8 +338,11 @@ fn valgrind_client_req(default: usize, args: &[usize; 6]) -> usize {
 use crate::stack::ValgrindStackId;
 
 #[cfg(feature = "valgrind")]
-pub fn valgrind_register_stack(start: *mut (), end: *mut ()) -> ValgrindStackId {
-  let res = valgrind_client_req(0, &[0x1501, start as _, end as _, 0, 0, 0]);
+pub unsafe fn valgrind_register_stack(base: NonNull<()>, size: usize) -> ValgrindStackId {
+  let start = base.addr().get();
+  // SAFETY: The stack covers the memory range `base..base+size`.
+  let end = unsafe { base.byte_add(size) }.addr().get();
+  let res = valgrind_client_req(0, &[0x1501, start, end, 0, 0, 0]);
   ValgrindStackId(res as _)
 }
 

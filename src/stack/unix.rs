@@ -1,4 +1,4 @@
-use super::{GROWTH_DIR, GrowthDir};
+use super::{GrowthDir, GROWTH_DIR};
 use core::num::NonZeroUsize;
 use core::ptr;
 use core::ptr::NonNull;

@@ -3,7 +3,6 @@
 #[cfg_attr(unix, path = "unix.rs")]
 mod os;
 
-use alloc::alloc::dealloc;
 use core::num::NonZero;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
@@ -94,7 +93,13 @@ impl Stack {
   /// [`ptr::write`]: core::ptr::write
   #[cfg(not(feature = "stack_alloc"))]
   pub unsafe fn from_raw(base: NonNull<()>, size: NonZeroUsize) -> Self {
-    Self { base, size }
+    Self {
+      base,
+      size,
+      #[cfg(feature = "valgrind")]
+      // SAFETY: The stack covers the memory range `base..base+size`.
+      valgrind_id: unsafe { crate::arch::valgrind_register_stack(base, size.get()) },
+    }
   }
 
   /// Reserves space for a new program stack of size at least
@@ -137,11 +142,8 @@ impl Stack {
       base,
       size,
       #[cfg(feature = "valgrind")]
-      valgrind_id: crate::arch::valgrind_register_stack(
-        base.as_ptr(),
-        // SAFETY: The stack covers the memory range `base..base+size`.
-        unsafe { base.byte_add(size.get()) }.as_ptr(),
-      ),
+      // SAFETY: The stack covers the memory range `base..base+size`.
+      valgrind_id: unsafe { crate::arch::valgrind_register_stack(base, size.get()) },
     }
   }
 
@@ -336,11 +338,15 @@ pub(crate) struct ValgrindStackId(pub libc::c_uint);
 /// precedes `bot` in the direction of [stack growth] on the current
 /// platform.
 ///
+/// # Safety
+///
+/// The allocation from which `bot` is derived must contain a `T`
+/// just below it.
+///
 /// [stack growth]: GROWTH_DIR
 pub const unsafe fn adjacent<T>(bot: StackPtr) -> NonNull<T> {
   match GROWTH_DIR {
-    // SAFETY: The caller guarantees that the allocation from
-    //  which `bot` is derived contains a `T` just below it.
+    // SAFETY: This is guaranteed by the caller.
     GrowthDir::Upwards => unsafe { bot.cast().sub(1) },
     GrowthDir::Downwards => bot.cast(),
   }

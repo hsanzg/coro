@@ -37,6 +37,50 @@
 //! put together this library for my own education, so significant
 //! improvements are likely possible.
 //!
+//! ## Example
+//!
+//! As a typical example of the use of coroutines, let us consider
+//! the problem of determining whether two ordered trees are similar.
+//! Formally speaking, a _tree_ is a set of nodes that consists of a
+//! _root_ together with $m\ge0$ disjoint trees. If the relative order
+//! of the $m$ subtrees is important, we say that the tree is _ordered_.
+//! Let $T$ and $T'$ be ordered trees with subtrees $T_1,\dots,T_m$
+//! and $T_1',\dots,T_{m'}'$, respectively. Then $T$ and $T'$ are
+//! said to be _similar_ if $m=m'$ and the subtrees $T_i$ and $T'_i$
+//! are similar for all $1\le i\le m$.
+//!
+//! ```
+//! # #![feature(coroutine_trait)]
+//! use core::cell::Cell;
+//! use core::ops::CoroutineState;
+//! use coro::{suspend, Coro};
+//!
+//! struct Node(Vec<Node>);
+//!
+//! fn similar(t: &Node, tp: &Node) -> bool {
+//!   let (m, mp) = (Cell::new(0), Cell::new(0));
+//!
+//!   fn visit(root: &Node, m: &Cell<usize>) {
+//!     m.set(root.0.len());
+//!     suspend();
+//!     for child in &root.0 {
+//!       visit(child, m);
+//!     }
+//!   }
+//!
+//!   let mut t_coro = Coro::new(|| visit(t, &m));
+//!   let mut tp_coro = Coro::new(|| visit(tp, &mp));
+//!
+//!   loop {
+//!     match (t_coro.resume(), tp_coro.resume()) {
+//!       (CoroutineState::Complete(_), CoroutineState::Complete(_)) => return true,
+//!       (CoroutineState::Yielded(_), CoroutineState::Yielded(_)) if m == mp => {},
+//!       _ => return false,
+//!     }
+//!   }
+//! }
+//! ```
+//!
 //! [`resume`]: Coro::resume
 //! [`corosensei`]: https://github.com/Amanieu/corosensei
 //! [`libfringe`]: https://github.com/edef1c/libfringe

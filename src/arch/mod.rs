@@ -19,11 +19,15 @@ pub type Trampoline = unsafe extern "sysv64-unwind" fn(bot: NonNull<()>) -> !;
 pub type Trampoline = unsafe extern "C-unwind" fn(bot: NonNull<()>) -> !;
 
 /// Makes an `unsafe fn` definition a valid [`Trampoline`].
+#[cfg(target_arch = "x86_64")]
 macro_rules! trampoline {
   attr() ($(#[$m:meta])* unsafe fn $($rest:tt)*) => {
-    #[cfg(target_arch = "x86_64")]
     $(#[$m])* unsafe extern "sysv64-unwind" fn $($rest)*
-    #[cfg(not(target_arch = "x86_64"))]
+  };
+}
+#[cfg(not(target_arch = "x86_64"))]
+macro_rules! trampoline {
+  attr() ($(#[$m:meta])* unsafe fn $($rest:tt)*) => {
     $(#[$m])* unsafe extern "C-unwind" fn $($rest)*
   };
 }

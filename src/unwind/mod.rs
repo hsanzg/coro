@@ -6,7 +6,8 @@
 //!
 //! [blog post]: https://purplesyringa.moe/blog/bringing-faster-exceptions-to-rust/
 //! [`lithium`]: https://docs.rs/lithium/latest/lithium/
-#[cfg_attr(not(windows), path = "itanium.rs")]
+#[cfg_attr(panic = "unwind", path = "itanium.rs")]
+#[cfg_attr(not(panic = "unwind"), path = "abort.rs")]
 mod imp;
 
 pub use self::imp::*;
@@ -16,7 +17,6 @@ use core::any::Any;
 use core::fmt::{Display, Formatter};
 use core::hint::{cold_path, unreachable_unchecked};
 use core::mem::ManuallyDrop;
-use core::process::abort_immediate;
 use core::ptr;
 
 /// The exception data associated with a Rust panic.
@@ -191,6 +191,6 @@ pub fn resume(payload: Box<dyn Any + Send>) -> ! {
 }
 
 #[cold]
-pub fn abort(_message: &str) -> ! {
-  abort_immediate();
+pub fn abort(msg: &'static str) -> ! {
+  core::panicking::panic_nounwind_nobacktrace(msg);
 }

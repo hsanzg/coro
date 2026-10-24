@@ -88,11 +88,11 @@
 #![feature(asm_unwind)]
 #![feature(core_intrinsics)] // `catch_unwind`.
 #![feature(std_internals)] // `PanicPayload`.
+#![feature(panic_internals)] // `panic_nounwind`.
 #![feature(coroutine_trait)]
 #![feature(rustc_attrs)] // `rustc_nounwind`.
 #![feature(thread_local)]
-#![feature(abort_immediate)]
-#![cfg_attr(all(panic = "unwind", target_arch = "x86_64"), feature(panic_unwind))]
+#![cfg_attr(panic = "unwind", feature(panic_unwind))]
 #![expect(
   internal_features,
   reason = "we unwind coroutine stacks by throwing a non-Rust exception type, and need `core::intrinsics::catch_unwind` to catch it"
@@ -100,10 +100,10 @@
 #![cfg_attr(all(test, feature = "stack_alloc"), feature(pointer_is_aligned_to))]
 #![no_std]
 
-#[cfg(all(panic = "unwind", target_arch = "x86_64"))]
+#[cfg(panic = "unwind")]
 extern crate unwind as uw;
 
-#[cfg(any(panic = "unwind", feature = "stack_alloc"))]
+#[cfg(feature = "stack_alloc")]
 extern crate alloc;
 
 mod arch;

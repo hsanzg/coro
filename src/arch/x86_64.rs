@@ -1,6 +1,7 @@
+use crate::arch::Trampoline;
 use crate::stack::StackPtr;
 use crate::unwind::Completion;
-use crate::{Caller, PoisonTarget, TrampolineFn};
+use crate::{Caller, PoisonTarget};
 use core::arch::{asm, naked_asm};
 use core::hint::cold_path;
 use core::ptr::NonNull;
@@ -26,7 +27,7 @@ unsafe fn initial_sp(bot: StackPtr) -> StackPtr {
 ///
 /// For convenience, the [initial stack pointer](initial_sp) of
 /// the coroutine is returned.
-pub unsafe fn prepare_stack(bot: StackPtr, tramp: TrampolineFn) -> StackPtr {
+pub unsafe fn prepare_stack(bot: StackPtr, tramp: Trampoline) -> StackPtr {
   // Ask `resume_coro` to call `init_coro` on the first resumption
   // of the coroutine. Location `ip` also serves as the (invalid)
   // return address slot for the stack frame of `init_coro`.

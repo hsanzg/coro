@@ -93,6 +93,7 @@
 #![feature(panic_internals)] // `panic_nounwind`.
 #![feature(rustc_attrs)] // `rustc_nounwind`.
 #![feature(thread_local)]
+#![feature(macro_attr)] // `arch::trampoline`
 #![cfg_attr(panic = "unwind", feature(panic_unwind))]
 #![expect(
   internal_features,
@@ -121,8 +122,6 @@ use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
 use core::ptr;
 use core::ptr::NonNull;
-#[cfg(target_arch = "x86_64")]
-use coro_macros::abi;
 
 type Caller = *const ();
 
@@ -497,10 +496,6 @@ impl<R> Coroutine for Coro<R> {
   }
 }
 
-/// The type of the [`trampoline`] and [`poison_trampoline`] functions.
-// todo: specify ABI properly by generalizing the `abi` proc macro.
-type TrampolineFn = unsafe extern "sysv64-unwind" fn(bot: NonNull<()>) -> !;
-
 /// The routine that takes control on the first [resumption] of a
 /// coroutine, and that immediately invokes the coroutine's program.
 ///
@@ -508,13 +503,11 @@ type TrampolineFn = unsafe extern "sysv64-unwind" fn(bot: NonNull<()>) -> !;
 /// default ABI of Rust, which does not define the set of registers
 /// that one needs to save before calling it. That's why the first
 /// call to [`Coro::resume`] must go through this trampoline with
-/// an explicit calling convention.
+/// an explicit calling convention (set by [`arch::trampoline`]).
 ///
 /// [resumption]: Coro::resume
-// Note that `arch::resume_coro` expects this function to follow the
-// System V ABI on all x86-64 systems, including those running Windows.
-#[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
-unsafe extern "C-unwind" fn trampoline<R, F>(bot: NonNull<()>) -> !
+#[arch::trampoline]
+unsafe fn trampoline<R, F>(bot: NonNull<()>) -> !
 where
   F: FnOnce() -> R + Unpin,
 {
@@ -619,12 +612,10 @@ fn panicked() -> ! {
 /// The routine that takes control whenever a [poisoned] coroutine
 /// is [resumed].
 ///
-/// This routine has the same calling conventions as [`trampoline`].
-///
 /// [poisoned]: Coro::poison_target
 /// [resumed]: Coro::resume
-#[cfg_attr(target_arch = "x86_64", abi("sysv64-unwind"))]
-unsafe extern "C-unwind" fn poison_trampoline(bot: NonNull<()>) -> ! {
+#[arch::trampoline]
+unsafe fn poison_trampoline(bot: NonNull<()>) -> ! {
   // SAFETY: `arch::poison` stores the address of the new target at
   //  whichever end of the coroutine's `CoroFn` lies next to `bot`,
   //  namely the beginning when stacks grow downward, and the end

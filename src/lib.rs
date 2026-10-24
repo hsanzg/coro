@@ -87,7 +87,6 @@
 
 #![feature(asm_unwind)]
 #![feature(core_intrinsics)] // `catch_unwind`.
-#![feature(std_internals)] // `PanicPayload`.
 #![feature(panic_internals)] // `panic_nounwind`.
 #![feature(coroutine_trait)]
 #![feature(rustc_attrs)] // `rustc_nounwind`.
@@ -388,6 +387,7 @@ impl<R> Coro<R> {
   /// # Example
   ///
   /// ```
+  /// # #[cfg(panic = "unwind")] {
   /// # extern crate std;
   /// use std::panic::AssertUnwindSafe;
   /// use coro::Coro;
@@ -400,6 +400,7 @@ impl<R> Coro<R> {
   ///   coro_ref.resume();
   /// });
   /// assert!(coro.has_panicked());
+  /// # }
   /// ```
   ///
   /// [`panic!`]: panic
@@ -565,6 +566,7 @@ where
 /// # Panics
 ///
 /// This function panics if it is called from outside a coroutine.
+#[doc(alias = "yield")]
 #[inline(always)]
 pub fn suspend() {
   let caller = CALLER.get();

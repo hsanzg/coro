@@ -1,3 +1,4 @@
+#![cfg(panic = "unwind")]
 #![feature(coroutine_trait)]
 
 mod common;

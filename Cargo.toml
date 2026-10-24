@@ -1,31 +1,26 @@
 [package]
 name = "coro"
-version = "0.1.1"
+version = "0.3.0"
 description = "Stackful, first-class asymmetric coroutines."
 authors = ["Hugo Sanz González <hugo@hgsg.me>"]
 license = "MIT"
-homepage = "https://github.com/hsanzg/coro"
 documentation = "https://docs.rs/coro"
 repository = "https://github.com/hsanzg/coro"
 keywords = ["coroutines", "stackful"]
 categories = ["concurrency"]
-readme = "README.md"
-edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+edition = "2024"
 
 [features]
-default = ["safe_yield", "std"]
-# todo: version 2.0.0-alpha.7 of smallvec will likely replace smallvec/write by smallvec/std.
-safe_yield = []
-std = ["smallvec/write", "libc/use_std"]
+default = ["common_pool"]
+stack_alloc = []
+common_pool = ["stack_alloc"]
+valgrind = []
 
 [dependencies]
-libc = { version = "0.2", default-features = false }
-smallvec = { version = "2.0.0-alpha.6", default-features = false }
+libc = "0.2"
 
-# Taken from https://docs.rs/rustdoc-katex-demo/latest/rustdoc_katex_demo/
-# To build locally, run RUSTDOCFLAGS="--html-in-header misc/katex-header.html" cargo +nightly doc -Zunstable-options -Zrustdoc-scrape-examples --no-deps
-[package.metadata.docs.rs]
-cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
-rustdoc-args = ["--html-in-header", "misc/katex-header.html"]
+[profile.bench]
+debug = true
+
+[workspace]
+members = ["benchs"]

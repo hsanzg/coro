@@ -50,6 +50,7 @@
 //! are similar for all $1\le i\le m$.
 //!
 //! ```
+//! # #[cfg(feature = "common_pool")] {
 //! # #![feature(coroutine_trait)]
 //! use core::cell::Cell;
 //! use core::ops::CoroutineState;
@@ -79,6 +80,7 @@
 //!     }
 //!   }
 //! }
+//! # }
 //! ```
 //!
 //! [`resume`]: Coro::resume
@@ -135,12 +137,14 @@ static CALLER: Cell<Caller> = Cell::new(ptr::null());
 /// # Example
 ///
 /// ```
+/// # #[cfg(feature = "common_pool")] {
 /// use coro::{in_coro, Coro};
 ///
 /// assert!(!in_coro());
 ///
 /// let mut coro = Coro::new(|| assert!(in_coro()));
 /// coro.resume();
+/// # }
 /// ```
 pub fn in_coro() -> bool {
   !CALLER.get().is_null()
@@ -326,6 +330,7 @@ impl<R> Coro<R> {
   /// # Example
   ///
   /// ```
+  /// # #[cfg(feature = "common_pool")] {
   /// use coro::{suspend, Coro};
   ///
   /// let mut coro = Coro::new(|| suspend());
@@ -336,6 +341,7 @@ impl<R> Coro<R> {
   ///
   /// coro.resume(); // finished.
   /// assert!(coro.has_started());
+  /// # }
   /// ```
   #[must_use]
   pub fn has_started(&self) -> bool {
@@ -364,6 +370,7 @@ impl<R> Coro<R> {
   /// # Example
   ///
   /// ```
+  /// # #[cfg(feature = "common_pool")] {
   /// use coro::Coro;
   ///
   /// let mut coro = Coro::new(|| {});
@@ -371,6 +378,7 @@ impl<R> Coro<R> {
   ///
   /// coro.resume();
   /// assert!(coro.has_finished());
+  /// # }
   /// ```
   #[must_use]
   #[expect(
@@ -387,7 +395,7 @@ impl<R> Coro<R> {
   /// # Example
   ///
   /// ```
-  /// # #[cfg(panic = "unwind")] {
+  /// # #[cfg(all(feature = "common_pool", panic = "unwind"))] {
   /// # extern crate std;
   /// use std::panic::AssertUnwindSafe;
   /// use coro::Coro;
@@ -421,6 +429,7 @@ impl<R> Coro<R> {
   /// # Example
   ///
   /// ```
+  /// # #[cfg(feature = "common_pool")] {
   /// use coro::{suspend, Coro};
   ///
   /// let mut coro = Coro::new(|| suspend());
@@ -431,6 +440,7 @@ impl<R> Coro<R> {
   ///
   /// coro.resume();
   /// assert!(!coro.is_resumable());
+  /// # }
   /// ```
   ///
   /// [begun execution]: Coro::has_started
@@ -717,7 +727,7 @@ impl<R> Coro<R> {
   /// use coro::stack::Stack;
   ///
   /// let stack = Stack::allocate(1 << 13); // 8 kilobytes.
-  /// let coro = Coro::with_stack(|| suspend(), stack);
+  /// let mut coro = Coro::with_stack(|| suspend(), stack);
   /// coro.resume();
   ///
   /// // Unwind the stack of the coroutine, and reuse it as the stack

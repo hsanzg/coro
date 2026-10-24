@@ -732,7 +732,7 @@ impl<R> Coro<R> {
   /// use coro::{suspend, Coro};
   /// use coro::stack::Stack;
   ///
-  /// let stack = Stack::allocate(1 << 13); // 8 kilobytes.
+  /// let stack = Stack::allocate(1 << 18); // 256 kilobytes.
   /// let mut coro = Coro::with_stack(|| suspend(), stack);
   /// coro.resume();
   ///

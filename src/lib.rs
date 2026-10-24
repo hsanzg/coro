@@ -645,41 +645,50 @@ impl<R> Coro<R> {
   /// includes dropping it. Thus, the only way to proceed after
   /// `coro.inner_drop()` is to pass `coro` to [`core::mem::forget`].
   unsafe fn inner_drop(&mut self) -> DropReturn {
-    if self.has_started() {
-      if self.is_resumable() {
-        // The coroutine was left in progress; unwind its stack manually.
-        let prev_caller = CALLER.get();
-        // SAFETY: We just tested that the coroutine is paused.
-        let comp =
-          unsafe { arch::force_unwind(&mut self.cont_sp, self.stack_bot, CALLER.as_ptr()) };
-        CALLER.set(prev_caller);
-
-        if comp.is_ok() {
-          // Unwinding didn't reach the trampoline. This will happen
-          // if the coroutine suspends itself while being dropped, or
-          // if some frame catches the unwinding exception and forgets
-          // to clean it up. (Any attempt to call the cleanup function
-          // of the exception aborts the process.)
-          #[cold]
-          #[inline(never)]
-          #[track_caller]
-          fn did_not_unwind() -> ! {
-            panic!("coroutine did not unwind");
-          }
-          did_not_unwind();
-        }
-        // SAFETY: The completion was not successful, as just checked.
-        unsafe { comp.maybe_rethrow() };
-      }
-    } else {
+    if !self.has_started() {
       // The coroutine never started, so its program still lies intact
       // at the bottom of its stack (see `CoroFn`). Drop it now.
       cold_path();
       // SAFETY: The coroutine has never run, and the caller promises
       //  that it never will.
       unsafe { (self.drop_fn)(self.stack_bot) };
+    } else if self.is_resumable() {
+      // The coroutine was left in progress.
+      cfg_select! {
+        // Unwind its stack manually.
+        panic = "unwind" => {
+          let prev_caller = CALLER.get();
+          // SAFETY: We just tested that the coroutine is paused.
+          let comp =
+            unsafe { arch::force_unwind(&mut self.cont_sp, self.stack_bot, CALLER.as_ptr()) };
+          CALLER.set(prev_caller);
+
+          if comp.is_ok() {
+            // Unwinding didn't reach the trampoline. This can happen
+            // if the coroutine suspends itself while being dropped, or
+            // if some frame catches the unwinding exception and forgets
+            // to clean it up. (Any attempt to call the cleanup function
+            // of the exception aborts the process.)
+            #[cold]
+            #[inline(never)]
+            #[track_caller]
+            fn did_not_unwind() -> ! {
+              panic!("coroutine did not unwind");
+            }
+            did_not_unwind();
+          }
+          // SAFETY: The completion was not successful, as just checked.
+          unsafe { comp.maybe_rethrow() };
+        }
+        // We have no way to run the destructors of the objects on
+        // the stack of the coroutine, so we leak them. Since some
+        // of those objects may be pinned, their memory cannot be
+        // reused; thus we must also leak the stack itself.
+        _ => return,
+      }
     }
-    // SAFETY: `self.stack` is not used again.
+    // SAFETY: `self.stack` contains no live objects, and the caller
+    //  promises that the coroutine will not use it again.
     let stack = unsafe { ManuallyDrop::take(&mut self.stack) };
     cfg_select! {
       feature = "common_pool" => {
@@ -712,7 +721,11 @@ impl<R> Coro<R> {
   /// let mut coro = Coro::with_stack(|| {}, stack);
   /// coro.resume();
   /// ```
-  #[cfg(all(feature = "stack_alloc", not(feature = "common_pool")))]
+  #[cfg(all(
+    feature = "stack_alloc",
+    not(feature = "common_pool"),
+    panic = "unwind"
+  ))]
   pub unsafe fn drop_and_take_stack(mut self) -> Stack {
     // SAFETY: We forget `self` immediately after calling `inner_drop`.
     let stack = unsafe { self.inner_drop() };
@@ -725,13 +738,16 @@ impl<R> Drop for Coro<R> {
   /// Destroys the coroutine and [disposes] of its stack.
   ///
   /// If the coroutine has [never started], its program is dropped.
-  /// Otherwise, if it has [not completely finished] execution, its
-  /// stack is unwound as though the coroutine were to panic at its
-  /// current [suspension point].
+  /// Otherwise, if it has [not completely finished] execution and
+  /// the [panic strategy] `coro` was compiled with is
+  /// - `unwind`, its stack is unwound as though the coroutine were
+  ///   to panic at its current [suspension point];
+  /// - not `unwind`, the stack and its contents are leaked.
   ///
   /// [disposes]: Self::with_stack
   /// [never started]: Self::has_started
   /// [not completely finished]: Self::is_resumable
+  /// [panic strategy]: https://doc.rust-lang.org/reference/panic.html#panic-strategy
   /// [suspension point]: suspend
   fn drop(&mut self) {
     // SAFETY: This method runs at most once, and the coroutine

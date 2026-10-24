@@ -212,6 +212,7 @@ pub unsafe fn return_control(caller: StackPtr, final_sp: StackPtr, comp: Complet
 ///
 /// [paused]: crate::Coro::is_resumable
 /// [poisoned]: poison
+#[cfg(panic = "unwind")]
 pub unsafe fn force_unwind(sp: &mut StackPtr, bot: StackPtr, caller: *mut Caller) -> Completion {
   let (comp, final_sp);
   unsafe {

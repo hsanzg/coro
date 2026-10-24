@@ -729,7 +729,8 @@ impl<R> Coro<R> {
     not(feature = "common_pool"),
     panic = "unwind"
   ))]
-  pub unsafe fn drop_and_take_stack(mut self) -> Stack {
+  #[must_use = "if you don't need the stack, drop the coroutine normally"]
+  pub fn drop_and_take_stack(mut self) -> Stack {
     // SAFETY: We forget `self` immediately after calling `inner_drop`.
     let stack = unsafe { self.inner_drop() };
     core::mem::forget(self);

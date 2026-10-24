@@ -4,10 +4,10 @@ mod common;
 
 use common::*;
 use core::cell::Cell;
+use core::mem::DropGuard;
+use core::ops::CoroutineState;
 use core::panic::AssertUnwindSafe;
 use coro::{in_coro, suspend};
-use std::mem::DropGuard;
-use std::ops::CoroutineState;
 use std::panic::{catch_unwind, resume_unwind};
 use std::thread::panicking;
 
@@ -53,6 +53,25 @@ fn unwind_on_drop_before_finished() {
   coro.resume();
   assert!(!dropped.get());
   drop(coro);
+  assert!(dropped.get());
+  assert!(!in_coro());
+}
+
+#[test]
+#[cfg(all(
+  feature = "stack_alloc",
+  not(feature = "common_pool"),
+  panic = "unwind"
+))]
+fn unwind_when_taking_stack_before_finished() {
+  let dropped = Cell::new(false);
+  let mut coro = new_coro(|| {
+    let _rec = DropRecorder(&dropped);
+    suspend();
+  });
+  coro.resume();
+
+  let _ = coro.drop_and_take_stack();
   assert!(dropped.get());
   assert!(!in_coro());
 }

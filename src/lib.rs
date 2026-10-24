@@ -57,6 +57,7 @@
 //! use core::ops::CoroutineState;
 //! use coro::{suspend, Coro};
 //!
+//! # #[derive(Clone)]
 //! struct Node(Vec<Node>);
 //!
 //! fn similar(t: &Node, tp: &Node) -> bool {
@@ -81,6 +82,18 @@
 //!     }
 //!   }
 //! }
+//! #
+//! # let t_a = Node(vec![
+//! #   Node(vec![Node(vec![])]),
+//! #   Node(vec![Node(vec![]), Node(vec![Node(vec![])]), Node(vec![])]),
+//! # ]);
+//! # let t_b = Node(vec![
+//! #   Node(vec![Node(vec![])]),
+//! #   Node(vec![Node(vec![]), Node(vec![Node(vec![])]), Node(vec![]), Node(vec![])]),
+//! # ]);
+//! #
+//! # assert!(similar(&t_a, &t_a.clone()));
+//! # assert!(!similar(&t_a, &t_b));
 //! # }
 //! ```
 //!

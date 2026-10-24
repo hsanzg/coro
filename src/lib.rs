@@ -86,9 +86,9 @@
 //! [`libfringe`]: https://github.com/edef1c/libfringe
 
 #![feature(asm_unwind)]
+#![feature(coroutine_trait)]
 #![feature(core_intrinsics)] // `catch_unwind`.
 #![feature(panic_internals)] // `panic_nounwind`.
-#![feature(coroutine_trait)]
 #![feature(rustc_attrs)] // `rustc_nounwind`.
 #![feature(thread_local)]
 #![cfg_attr(panic = "unwind", feature(panic_unwind))]

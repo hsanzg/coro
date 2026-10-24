@@ -22,7 +22,7 @@ pub extern "sysv64-unwind" fn start_unwind() -> ! {
 
   #[cold]
   extern "C" fn cleanup(_code: _Unwind_Reason_Code, _ex: *mut _Unwind_Exception) {
-    abort("coro exception was caught and discarded by foreign code");
+    abort("coroutine unwind exception was caught and discarded");
   }
 
   #[thread_local]
@@ -53,10 +53,10 @@ pub unsafe fn is_coro_unwind(ex: Exception) -> bool {
 pub unsafe fn rethrow(ex: Exception) -> ! {
   let code = unsafe { _Unwind_RaiseException(ex) };
   abort(match code {
-    _Unwind_Reason_Code::_URC_END_OF_STACK => "no handler caught the coroutine unwind",
-    _Unwind_Reason_Code::_URC_FATAL_PHASE1_ERROR => "coroutine unwind failed during search phase",
-    _Unwind_Reason_Code::_URC_FATAL_PHASE2_ERROR => "coroutine unwind failed during cleanup phase",
-    _ => "coroutine unwind failed for an unknown reason",
+    _Unwind_Reason_Code::_URC_END_OF_STACK => "no handler caught the exception",
+    _Unwind_Reason_Code::_URC_FATAL_PHASE1_ERROR => "unwind failed during search phase",
+    _Unwind_Reason_Code::_URC_FATAL_PHASE2_ERROR => "unwind failed during cleanup phase",
+    _ => "unwind failed for an unknown reason",
   })
 }
 

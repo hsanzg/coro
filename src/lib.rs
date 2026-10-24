@@ -533,7 +533,7 @@ where
   let f = ManuallyDrop::into_inner(unsafe { f_ptr.read() });
 
   /// The return value of the coroutine, to be read by [`Coro::resume`].
-  #[repr(align(2))] // required by `unwind::Result`.
+  #[repr(align(2))] // required by `Completion::from`.
   struct RetVal<R>(R);
 
   // Since the present subroutine cannot return normally, its frame
@@ -556,7 +556,8 @@ where
     // SAFETY: The function object is no longer alive, so we may store
     //  the address of the poison target in the bottom `CoroFn` record.
     let new_sp = unsafe { arch::poison(bot, poison_target) };
-    let comp = Completion::from(res);
+    // SAFETY: The return address, if any, is wyde-aligned.
+    let comp = unsafe { Completion::from(res) };
 
     // Before transferring control to us, `arch::resume_coro` saved
     // the stack pointer of its caller in `CALLER`. Load and pass

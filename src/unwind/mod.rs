@@ -57,6 +57,26 @@ pub struct Completion(*mut ());
 impl Completion {
   const UNWOUND: usize = 1;
 
+  /// # Safety
+  ///
+  /// If successful, the return address in the result must be aligned
+  /// to a multiple of 2 bytes.
+  pub unsafe fn from(res: CatchResult<StackPtr>) -> Self {
+    Self(match res {
+      Ok(ret_addr) => {
+        debug_assert_eq!(ret_addr.addr().get() & Self::UNWOUND, 0);
+        ret_addr.as_ptr()
+      }
+      Err(ex) => {
+        // The Itanium ABI requires exception objects to be double-word
+        // aligned, so the least significant bit of their addresses is
+        // always zero. We can therefore store our tag in that bit.
+        debug_assert_eq!(ex.addr() & Self::UNWOUND, 0, "misaligned exception");
+        ex.map_addr(|a| a | Self::UNWOUND).cast()
+      }
+    })
+  }
+
   pub fn into_raw(self) -> usize {
     ManuallyDrop::new(self).0.expose_provenance()
   }
@@ -100,21 +120,6 @@ impl Completion {
       unsafe { self.maybe_rethrow() };
       unsafe { unreachable_unchecked() };
     }
-  }
-}
-
-impl From<CatchResult<StackPtr>> for Completion {
-  fn from(res: CatchResult<StackPtr>) -> Self {
-    Self(match res {
-      Ok(ret_addr) => {
-        debug_assert_eq!(ret_addr.addr().get() & Self::UNWOUND, 0);
-        ret_addr.as_ptr()
-      }
-      Err(ex) => {
-        // todo: add comment about double-word alignment of exception types.
-        ex.cast::<()>().map_addr(|a| a | Self::UNWOUND)
-      }
-    })
   }
 }
 

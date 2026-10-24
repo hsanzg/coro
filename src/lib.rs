@@ -258,8 +258,11 @@ impl<F: Unpin> CoroFn<F> {
   /// [coroutine]: Coro
   /// [started]: Coro::has_started
   unsafe fn raw_drop(bot: StackPtr) {
-    // SAFETY: All conditions must be upheld by the caller.
-    unsafe { Self::addr(bot).drop_in_place() };
+    // SAFETY: The coroutine wasn't started, so the record at
+    //  the bottom of its stack still contains its program.
+    let f = unsafe { &mut Self::addr(bot).as_mut().normal };
+    // SAFETY: The caller promises not to access `f` again.
+    unsafe { ManuallyDrop::drop(f) };
   }
 }
 
@@ -509,7 +512,7 @@ where
   // be accessed again; `Coro::inner_drop` is careful not to drop it
   // after the coroutine has begun execution.
   // SAFETY: `bot` is the `stack_bot` value of the active coroutine.
-  let f_ptr = unsafe { CoroFn::<F>::addr(bot).as_ptr() };
+  let f_ptr = unsafe { CoroFn::<F>::addr(bot) }.as_ptr();
   // Read the `normal` field of `*f_ptr` rather than the whole union,
   // to avoid some copying when `PoisonTarget` is bigger than `F`.
   // SAFETY: This is a field projection on a valid pointer.

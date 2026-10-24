@@ -409,10 +409,6 @@ impl<R> Coro<R> {
     self.poison_target() == Some(panicked)
   }
 
-  // todo: find better name? `is_suspended`? not good enough, since
-  //  this method returns `true` for a coroutine that has not yet
-  //  begun execution.
-
   /// Returns whether this coroutine can be resumed by calling
   /// [`Coro::resume`]; that is, whether its program has either
   /// not yet [begun execution] or is suspended at one of its

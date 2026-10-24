@@ -4,7 +4,6 @@
 mod os;
 
 use core::num::NonZero;
-use core::num::NonZeroUsize;
 use core::ptr::NonNull;
 
 /// Describes how the stack pointer changes after a `push` instruction.
@@ -21,7 +20,7 @@ pub enum GrowthDir {
 /// The [program stack] growth convention on the current platform.
 ///
 /// [program stack]: Stack
-pub const GROWTH_DIR: GrowthDir = const { GrowthDir::Downwards };
+pub const GROWTH_DIR: GrowthDir = GrowthDir::Downwards;
 
 /// If [program stacks] are set to grow [towards zero], the address of
 /// the top entry in a stack. Otherwise (namely if program stacks grow
@@ -51,7 +50,7 @@ pub type StackPtr = NonNull<()>;
 /// [_guard page_]: https://devblogs.microsoft.com/oldnewthing/20220203-00/?p=106215
 pub struct Stack {
   base: NonNull<()>,
-  size: NonZeroUsize, // bytes.
+  size: NonZero<usize>, // bytes.
   #[cfg(feature = "valgrind")]
   valgrind_id: ValgrindStackId,
 }
@@ -136,7 +135,7 @@ impl Stack {
       .checked_next_multiple_of(page_size.get())
       .expect("stack size overflows a `usize` after page alignment");
     // SAFETY: We have `size >= 2 * page_size > 0`.
-    let size = unsafe { NonZeroUsize::new_unchecked(size) };
+    let size = unsafe { NonZero::new_unchecked(size) };
     let base = os::alloc_stack(size);
     Self {
       base,
@@ -164,7 +163,7 @@ impl Stack {
   /// Returns the number of bytes occupied by the stack, including
   /// its guard page. This value is a multiple of the system's
   /// page size.
-  pub fn size(&self) -> NonZeroUsize {
+  pub fn size(&self) -> NonZero<usize> {
     self.size
   }
 
@@ -177,8 +176,8 @@ impl Stack {
   /// This concept should not be confused with the [base address]
   /// of the stack.
   ///
+  /// [towards zero]: GrowthDir::Downwards
   /// [upwards]: GrowthDir::Upwards
-  /// [downwards]: GrowthDir::Downwards
   /// [base address]: Self::base
   pub fn bottom(&self) -> NonNull<()> {
     match GROWTH_DIR {
@@ -188,7 +187,7 @@ impl Stack {
     }
   }
 
-  /// Reserves space for an aligned `T` immediate [above] `sp`,
+  /// Reserves space for an aligned `T` immediately [above] `sp`,
   /// which must be in bounds of this stack region.
   ///
   /// More precisely, moves the stack pointer and returns an aligned
@@ -199,6 +198,8 @@ impl Stack {
   ///
   /// This method panics if the slot would extend past the end of
   /// this stack.
+  ///
+  /// [above]: GROWTH_DIR
   pub(crate) unsafe fn push<T>(&self, sp: &mut StackPtr) -> NonNull<T> {
     let (s, m) = (size_of::<T>(), align_of::<T>() - 1);
     let (a, b, ss) = (sp.addr().get(), self.base.addr().get(), self.size.get());
@@ -234,11 +235,11 @@ impl Drop for Stack {
     #[cfg(feature = "valgrind")]
     crate::arch::valgrind_deregister_stack(self.valgrind_id);
     // SAFETY: This stack was allocated by `os::alloc_stack`.
-    unsafe { os::free_stack(self.base(), self.size) };
+    unsafe { os::free_stack(self.base, self.size) };
   }
 }
 
-/// Stacks can be allocated and deallocated by different threads.
+// SAFETY: Stacks can be allocated and deallocated by different threads.
 unsafe impl Send for Stack {}
 
 /// A pool of available storage for use as the program stacks

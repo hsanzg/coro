@@ -21,6 +21,7 @@ pub fn assert_unstarted<R>(coro: &Coro<R>) {
   assert!(!coro.has_panicked());
 }
 
+#[allow(unused)]
 pub fn assert_paused<R>(coro: &Coro<R>) {
   assert!(coro.has_started());
   assert!(coro.is_resumable());
@@ -28,6 +29,7 @@ pub fn assert_paused<R>(coro: &Coro<R>) {
   assert!(!coro.has_panicked());
 }
 
+#[allow(unused)]
 pub fn assert_complete<R>(coro: &Coro<R>, panicked: bool) {
   assert!(coro.has_started());
   assert!(!coro.is_resumable());

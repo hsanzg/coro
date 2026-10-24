@@ -1,10 +1,10 @@
-use super::{GrowthDir, GROWTH_DIR};
+use super::{GROWTH_DIR, GrowthDir};
 use core::num::NonZeroUsize;
 use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Returns the default page size on the current architecture.
+/// Returns the default page size on the current platform.
 pub fn page_size() -> NonZeroUsize {
   // Try to remember the page size value across function invocations,
   // to save us the bother of making a system call in the majority of

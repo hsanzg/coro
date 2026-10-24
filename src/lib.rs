@@ -121,7 +121,7 @@ use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;
 use core::ptr;
 use core::ptr::NonNull;
-#[allow(unused_imports)] // false positive depending on platform.
+#[cfg(target_arch = "x86_64")]
 use coro_macros::abi;
 
 type Caller = *const ();
@@ -234,7 +234,7 @@ union CoroFn<F: Unpin> {
   /// to hold a [`PoisonTarget`] instance.
   ///
   /// [poisoned]: Coro::poison_target
-  /// [downward]: GrowthDir::Downwards
+  /// [downward]: stack::GrowthDir::Downwards
   poison: PoisonTarget,
 }
 
@@ -688,7 +688,7 @@ impl<R> Coro<R> {
             #[inline(never)]
             #[track_caller]
             fn did_not_unwind() -> ! {
-              panic!("coroutine did not unwind");
+              panic!("coroutine did not unwind")
             }
             did_not_unwind();
           }

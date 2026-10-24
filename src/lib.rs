@@ -50,8 +50,9 @@
 //! are similar for all $1\le i\le m$.
 //!
 //! ```
+//! #![feature(coroutine_trait)]
+//!
 //! # #[cfg(feature = "common_pool")] {
-//! # #![feature(coroutine_trait)]
 //! use core::cell::Cell;
 //! use core::ops::CoroutineState;
 //! use coro::{suspend, Coro};

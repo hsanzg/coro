@@ -67,6 +67,8 @@ said to be _similar_ if $m=m'$ and the subtrees $T_i$ and $T'_i$
 are similar for all $1\le i\le m$.
 
 ```rust
+#![feature(coroutine_trait)]
+
 use core::cell::Cell;
 use core::ops::CoroutineState;
 use coro::{suspend, Coro};

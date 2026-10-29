@@ -176,7 +176,7 @@ pub const DEFAULT_STACK_SIZE: usize = 1 << 21;
 /// The [crate-level documentation] discusses this type in more detail.
 ///
 /// [crate-level documentation]: crate
-pub struct Coro<R> {
+pub struct Coro<'a, R> {
   /// The value of the stack pointer just before the last suspension
   /// of the coroutine.
   ///
@@ -206,8 +206,9 @@ pub struct Coro<R> {
   drop_fn: unsafe fn(StackPtr),
   /// The program stack of the coroutine.
   stack: ManuallyDrop<Stack>,
-  /// Make [`Coro`] covariant over its return type.
-  _phantom: PhantomData<fn() -> R>,
+  /// Make [`Coro`] covariant over its return type and over
+  /// the lifetime of the data borrowed by its program.
+  _phantom: PhantomData<(fn() -> R, &'a ())>,
 }
 
 /// A record at the bottom of a coroutine stack containing a copy
@@ -282,7 +283,7 @@ impl<F: Unpin> CoroFn<F> {
   }
 }
 
-impl<R> Coro<R> {
+impl<'a, R> Coro<'a, R> {
   /// Creates a new coroutine that is to execute the given [`FnOnce`]
   /// instance on a separate [stack] of size [`DEFAULT_STACK_SIZE`].
   ///
@@ -292,7 +293,7 @@ impl<R> Coro<R> {
   /// [stack]: Stack
   #[cfg(feature = "common_pool")]
   #[must_use = "method creates a coroutine but does not begin its execution"]
-  pub fn new<F: FnOnce() -> R + Unpin>(f: F) -> Self {
+  pub fn new<F: FnOnce() -> R + Unpin + 'a>(f: F) -> Self {
     // SAFETY: We have exclusive access to the thread-local pool.
     let stack = unsafe { stack::borrow_common_pool(|pool| pool.take(DEFAULT_STACK_SIZE)) };
     Self::with_stack(f, stack)
@@ -309,7 +310,7 @@ impl<R> Coro<R> {
   ///
   /// [`drop_and_take_stack`]: Self::drop_and_take_stack
   #[must_use = "method creates a coroutine but does not begin its execution"]
-  pub fn with_stack<F: FnOnce() -> R + Unpin>(f: F, stack: Stack) -> Self {
+  pub fn with_stack<F: FnOnce() -> R + Unpin + 'a>(f: F, stack: Stack) -> Self {
     // Make a bitwise copy of `f` on the new stack, in order to pin
     // it to a fixed memory location. The actual stack contents will
     // appear on top of this copy. See `CoroFn` for details.
@@ -501,7 +502,7 @@ impl<R> Coro<R> {
   }
 }
 
-impl<R> Coroutine for Coro<R> {
+impl<R> Coroutine for Coro<'_, R> {
   type Yield = ();
   type Return = R;
 
@@ -656,7 +657,7 @@ type DropReturn = cfg_select! {
   _ => (),
 };
 
-impl<R> Coro<R> {
+impl<R> Coro<'_, R> {
   /// Destroys this coroutine and releases its stack.
   ///
   /// # Safety
@@ -756,7 +757,7 @@ impl<R> Coro<R> {
   }
 }
 
-impl<R> Drop for Coro<R> {
+impl<R> Drop for Coro<'_, R> {
   /// Destroys the coroutine and [disposes] of its stack.
   ///
   /// If the coroutine has [never started], its program is dropped.

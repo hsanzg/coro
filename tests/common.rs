@@ -1,6 +1,6 @@
 use coro::Coro;
 
-pub fn new_coro<R, F: FnOnce() -> R + Unpin>(f: F) -> Coro<R> {
+pub fn new_coro<'a, R, F: FnOnce() -> R + Unpin + 'a>(f: F) -> Coro<'a, R> {
   // todo: handle non-alloc case.
   cfg_select! {
     feature = "common_pool" => Coro::new(f),

@@ -6,7 +6,7 @@ use gungraun::prelude::*;
 use std::hint::black_box;
 use std::ops::CoroutineState;
 
-fn coro_switch_setup() -> Coro<()> {
+fn coro_switch_setup() -> Coro<'static, ()> {
   Coro::new(|| suspend())
 }
 

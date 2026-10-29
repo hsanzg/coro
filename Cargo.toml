@@ -1,6 +1,6 @@
 [package]
 name = "coro"
-version = "0.3.0"
+version = "0.3.1"
 description = "Stackful, first-class asymmetric coroutines."
 authors = ["Hugo Sanz González <hugo@hgsg.me>"]
 license = "MIT"
